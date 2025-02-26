@@ -1,25 +1,22 @@
 #!/usr/bin/env zsh
 set -e
-# set -x
 
 # Set variables used in the script
 ##################################################
-PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 PDF_FILE="$1"
 PAPERWORK_DIR="$HOME/Documents/Paperwork"
 
-# Get tokens and keys from 1Password
-export ***REMOVED***
-AZURE_OPENAI_ENDPOINT=$(op read -n "op://cli/aoi-martinez/url")
-AZURE_OPENAI_TOKEN=$(op read -n "op://cli/aoi-martinez/token")
-API_KEY=$(op read -n "op://cli/aoi-martinez/api-key")
+exec >$PAPERWORK_DIR/logfile.txt 2>&1
+
+
+# Source Open AI Helpers
+##################################################
+SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" &>/dev/null && pwd)"
+echo "Sourcing Open AI Helpers from $SCRIPT_DIR"
+source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
 
 # Helper functions
 ##################################################
-echo-json() {
-    echo $1 | jq . | bat --language=json --paging=never --style=numbers
-}
-
 strip-file-tags() {
     if xattr -p "com.apple.metadata:_kMDItemUserTags" "$1" >/dev/null 2>&1; then
         xattr -d "com.apple.metadata:_kMDItemUserTags" "$1"
@@ -30,50 +27,10 @@ set-finder-comments() {
     osascript -e 'on run {f, c}' -e 'tell app "Finder" to set comment of (POSIX file f as alias) to c' -e end "file://$1" "$2"
 }
 
-escape-text() {
-    echo "$1" |
-        tr -s '[:space:]' ' ' |
-        tr -cd 'A-Za-z0-9 ' |
-        tr -d '\n' |
-        tr -d '\r' |
-        awk '{for (i=1; i<=NF && i<=1000; i++) printf "%s%s", $i, (i==NF || i==1000 ? "" : " ")}'
-}
-
-sanitize-text() {
-    echo $1 | tr -cd 'A-Za-z0-9'
-}
-
 get-scanned-at() {
     echo "$1" |
         grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' |
         sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/'
-}
-
-get-folder-list() {
-    find "$1" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | tr '\n' ',' | sed 's/,$//'
-}
-
-get-pdf-text() {
-    RAW_TEXT=$(pdftotext -nopgbrk -raw "$1" -)
-    escape-text "$RAW_TEXT"
-}
-
-get-openai-response() {
-    # Send the extracted text to the Azure OpenAI endpoint
-    RESPONSE=$(curl -s -X POST "$AZURE_OPENAI_ENDPOINT" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $AZURE_OPENAI_TOKEN" \
-        -H "api-key: $API_KEY" \
-        -d "$1")
-
-    # Check if the request was successful
-    if [ $? -ne 0 ]; then
-        echo "Failed to send the text to the Azure OpenAI endpoint."
-        exit -1
-    fi
-
-    # Parse the response to get the categorization and date
-    echo "$RESPONSE" | jq -r '.choices[0].message.content'
 }
 
 # Process Functions
