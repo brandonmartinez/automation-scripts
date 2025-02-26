@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env zsh
 
 ####################################################################################
 # This script searches the passed in directory for video files (*.mp4, *.mov, *.m4v)
