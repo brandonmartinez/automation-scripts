@@ -216,15 +216,35 @@ else
 fi
 
 NEW_FILEPATH="$SUBCATEGORY_DIR/$PROPOSED_NAME"
+RENAME_FILE="$NEW_FILEPATH/RENAMES.txt"
 
 echo "**************************************************\n"
 echo "Moving $INPUT_PATH to $NEW_FILEPATH"
 
 mv "$INPUT_PATH" "$NEW_FILEPATH"
+echo "$INPUT_PATH => $NEW_FILEPATH" >> "$RENAME_FILE"
 
 echo "**************************************************\n"
 echo "Opening $NEW_FILEPATH in Finder"
 open "$NEW_FILEPATH"
+touch "$RENAME_FILE"
+
+echo "**************************************************\n"
+echo "Flattening the original folder structure of $INPUT_PATH"
+
+export NEW_FILEPATH
+export RENAME_FILE
+find "$NEW_FILEPATH" -mindepth 2 -type f -exec sh -c '
+    for file; do
+        base_file_name="$(basename "$file")"
+        relative_path="${file#$NEW_FILEPATH/}"
+        new_path="$NEW_FILEPATH/$base_file_name"
+        echo "$relative_path => $(basename "$file")" >> "$RENAME_FILE"
+        echo "Moving $file to $new_path"
+        mv "$file" "$new_path"
+    done
+' sh {} +
+find "$NEW_FILEPATH" -mindepth 1 -type d -empty -delete
 
 echo "**************************************************\n"
 echo "Creating new folder structure for files under $NEW_FILEPATH."
@@ -256,11 +276,40 @@ echo "**************************************************\n"
 echo "Renaming files in $FILES_FOLDER"
 for file in "$FILES_FOLDER"/*; do
     BASENAME=$(basename "$file")
+
     echo "Renaming $file"
+
     AI_RESPONSE=$(rename-source-file "$BASENAME" "$CATEGORY" "$SUBCATEGORY" "$PROPOSED_NAME")
     echo-json "$AI_RESPONSE"
     PROPOSED_FILENAME=$(echo "$AI_RESPONSE" | jq -r '.proposedName')
-    mv "$file" "$FILES_FOLDER/$PROPOSED_FILENAME"
+
+    if [[ "$PROPOSED_FILENAME" != "null" && ! -e "$FILES_FOLDER/$PROPOSED_FILENAME" ]]; then
+        echo "$file => $PROPOSED_FILENAME" >> "$RENAME_FILE"
+        mv "$file" "$FILES_FOLDER/$PROPOSED_FILENAME"
+    else
+        echo "Skipping rename for $file as the proposed filename is either 'null' or already exists."
+    fi
+done
+
+
+echo "**************************************************\n"
+echo "Renaming top-level README documents in $NEW_FILEPATH"
+
+for file in "$NEW_FILEPATH"/*.(txt|pdf|html|htm|md|rtf|doc); do
+    BASENAME=$(basename "$file")
+
+    LOWERCASE_BASENAME=$(echo "${BASENAME%.*}" | tr '[:upper:]' '[:lower:]')
+    if [[ "$LOWERCASE_BASENAME" != "license" && "$LOWERCASE_BASENAME" != "renames" ]]; then
+        EXTENSION="${BASENAME##*.}"
+        NEW_FILENAME="$PROPOSED_NAME.$EXTENSION"
+        if [[ ! -e "$NEW_FILEPATH/$NEW_FILENAME" ]]; then
+            echo "Renaming $file to $NEW_FILENAME"
+            echo "$file => $NEW_FILENAME" >> "$RENAME_FILE"
+            mv "$file" "$NEW_FILEPATH/$NEW_FILENAME"
+        else
+            echo "File $NEW_FILENAME already exists, skipping rename for $file"
+        fi
+    fi
 done
 
 echo "**************************************************\n"
