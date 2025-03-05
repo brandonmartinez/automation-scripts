@@ -238,7 +238,7 @@ find "$NEW_FILEPATH" -mindepth 2 -type f -exec sh -c '
     for file; do
         base_file_name="$(basename "$file")"
         relative_path="${file#$NEW_FILEPATH/}"
-        new_path="$NEW_FILEPATH/$base_file_name"
+        new_path="$NEW_FILEPATH/$(basename "$NEW_FILEPATH")_$base_file_name"
         echo "$relative_path => $(basename "$file")" >> "$RENAME_FILE"
         echo "Moving $file to $new_path"
         mv "$file" "$new_path"
