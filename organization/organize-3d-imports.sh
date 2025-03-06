@@ -264,7 +264,7 @@ echo "Moving 3D Files into $FILES_FOLDER"
 mv "$NEW_FILEPATH/"*.(stl|f3d|3mf|step|stp|scad|blend|shapr) "$FILES_FOLDER/" 2>/dev/null || true
 
 echo "Moving Images into $IMAGES_FOLDER"
-mv "$NEW_FILEPATH/"*.(jpg|jpeg|png|heic|heif|bmp|gif|webp) "$IMAGES_FOLDER/" 2>/dev/null || true
+mv "$NEW_FILEPATH/"*.(jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff) "$IMAGES_FOLDER/" 2>/dev/null || true
 
 echo "Moving GCODE into $EXPORTS_FOLDER"
 mv "$NEW_FILEPATH/"*.gcode "$EXPORTS_FOLDER/" 2>/dev/null || true
