@@ -125,7 +125,7 @@ EOF
 }
 
 rename-source-file() {
-    OPENAI_USER_MESSAGE="Please rename the file $1 to something more appropriate for the its new folder structure. The file is currently categorized under a path of $2/$3/$4. Prefix the new name with $4, separated with a hypen and spaces, and provide a name that describes what the specific part is. Please include the file extension in the proposed name, but do not duplicate the extension within the name (i.e., it should only end an extension). Keep the names short, as it will need to exist on a file system. Be succinct in the naming, for example if it is 'under_leg.step', it should be renamed '$4 - Under Leg.step'. If you are unsure of a good name, just return the original name."
+    OPENAI_USER_MESSAGE="Please rename the file $1 to something more appropriate for the its new folder structure. The file is currently categorized under a path of $2/$3/$4. Prefix the new name with $4, separated with a hyphen and spaces, and provide a name that describes what the specific part is. Please include the file extension in the proposed name, but do not duplicate the extension within the name (i.e., it should only end an extension). Keep the names short, as it will need to exist on a file system. Be succinct in the naming, for example if it is 'under_leg.step', it should be renamed '$4 - Under Leg.step'. If you are unsure of a good name, just return the original name. For additional context, here are the other sibling files in the same folder (if any): $5; keep in mind that the others will be renamed as well and aim for consistency."
     # Create the JSON payload https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/structured-outputs?tabs=rest
     JSON_PAYLOAD=$(
         cat <<EOF
@@ -187,6 +187,11 @@ PROPOSED_NAME=$(echo "$AI_RESPONSE" | jq -r '.proposedName')
 CATEGORY=$(echo "$AI_RESPONSE" | jq -r '.proposedFolder')
 CATEGORY_DIR="$BASE_PATH/$CATEGORY"
 
+if [[ -z "$PROPOSED_NAME" || "$PROPOSED_NAME" == "null" || -z "$CATEGORY" || "$CATEGORY" == "null" ]]; then
+    echo "Error: Proposed name or category is null or empty. Exiting."
+    exit 1
+fi
+
 echo "**************************************************\n"
 echo "Organizing into $CATEGORY and selecting an appropriate sub-folder."
 
@@ -208,12 +213,19 @@ echo-json "$AI_RESPONSE"
 SUBCATEGORY=$(echo "$AI_RESPONSE" | jq -r '.subfolderName')
 SUBCATEGORY_DIR="$CATEGORY_DIR/$SUBCATEGORY"
 
+if [[ -z "$SUBCATEGORY" || "$SUBCATEGORY" == "null" ]]; then
+    echo "Error: Subcategory is null or empty. Exiting."
+    exit 1
+fi
+
 if [ ! -d "$SUBCATEGORY_DIR" ]; then
     echo "Sub-category folder '$SUBCATEGORY' does not exist; creating a new folder."
     mkdir -p "$SUBCATEGORY_DIR"
 else
     echo "Sub-category folder '$SUBCATEGORY' aleady exists."
 fi
+
+# TODO: check if there's already a folder called this, if so ask for another name until it doesn't exist
 
 NEW_FILEPATH="$SUBCATEGORY_DIR/$PROPOSED_NAME"
 RENAME_FILE="$NEW_FILEPATH/RENAMES.txt"
@@ -274,12 +286,13 @@ mv "$NEW_FILEPATH/"*.!(txt|pdf|html|htm|md|rtf|doc) "$MISC_FOLDER/" 2>/dev/null 
 
 echo "**************************************************\n"
 echo "Renaming files in $FILES_FOLDER"
+ALL_SIBLING_FILES=$(ls "$FILES_FOLDER" | tr '\n' ',' | sed 's/,$//')
 for file in "$FILES_FOLDER"/*; do
     BASENAME=$(basename "$file")
 
     echo "Renaming $file"
 
-    AI_RESPONSE=$(rename-source-file "$BASENAME" "$CATEGORY" "$SUBCATEGORY" "$PROPOSED_NAME")
+    AI_RESPONSE=$(rename-source-file "$BASENAME" "$CATEGORY" "$SUBCATEGORY" "$PROPOSED_NAME" "$ALL_SIBLING_FILES")
     echo-json "$AI_RESPONSE"
     PROPOSED_FILENAME=$(echo "$AI_RESPONSE" | jq -r '.proposedName')
 
