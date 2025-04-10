@@ -272,6 +272,23 @@ mkdir -p "$IMAGES_FOLDER"
 mkdir -p "$EXPORTS_FOLDER"
 mkdir -p "$MISC_FOLDER"
 
+echo "Converting file extensions to lowercase in $FILES_FOLDER"
+for file in "$NEW_FILEPATH"/*; do
+    BASENAME=$(basename "$file")
+    EXTENSION="${BASENAME##*.}"
+    FILENAME="${BASENAME%.*}"
+    LOWERCASE_EXTENSION=$(echo "$EXTENSION" | tr '[:upper:]' '[:lower:]')
+    if [[ "$EXTENSION" != "$LOWERCASE_EXTENSION" ]]; then
+        NEW_FILENAME="$FILENAME.$LOWERCASE_EXTENSION"
+        if [[ ! -e "$FILES_FOLDER/$NEW_FILENAME" ]]; then
+            echo "Renaming $file to $NEW_FILENAME"
+            mv "$file" "$FILES_FOLDER/$NEW_FILENAME"
+        else
+            echo "File $NEW_FILENAME already exists, skipping rename for $file"
+        fi
+    fi
+done
+
 echo "Moving 3D Files into $FILES_FOLDER"
 mv "$NEW_FILEPATH/"*.(stl|f3d|3mf|step|stp|scad|blend|shapr) "$FILES_FOLDER/" 2>/dev/null || true
 
