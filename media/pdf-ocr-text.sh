@@ -1,5 +1,7 @@
 #!/usr/bin/env zsh
 
+PATH="/opt/homebrew/bin/:$PATH"
+
 # Need to set a temp directory that we can read/write to
 export TMPDIR="$HOME/.temp"
 mkdir -p "$TMPDIR"
