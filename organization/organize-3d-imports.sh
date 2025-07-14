@@ -55,6 +55,147 @@ get-file-list() {
     find "$1" -type f -exec basename {} \; | sort | tr '\n' ',' | sed 's/,$//'
 }
 
+extract-documentation-content() {
+    local folder_path="$1"
+    local content=""
+
+    echo "Extracting documentation content from folder..."
+
+    # Find README files (case insensitive)
+    for readme_file in "$folder_path"/*; do
+        if [[ -f "$readme_file" ]]; then
+            local basename=$(basename "$readme_file")
+            local lowercase_basename=$(echo "$basename" | tr '[:upper:]' '[:lower:]')
+
+            if [[ "$lowercase_basename" =~ ^readme(\.|$) ]]; then
+                echo "Found README file: $basename"
+                local readme_content=$(cat "$readme_file" 2>/dev/null | head -50)
+                if [[ -n "$readme_content" ]]; then
+                    content="$content\n\n=== README ($basename) ===\n$readme_content"
+                fi
+            fi
+        fi
+    done
+
+    # Find PDF files and extract text using pdftotext if available
+    if command -v pdftotext >/dev/null 2>&1; then
+        for pdf_file in "$folder_path"/*.pdf "$folder_path"/*.PDF; do
+            if [[ -f "$pdf_file" ]]; then
+                local basename=$(basename "$pdf_file")
+                echo "Found PDF file: $basename"
+                local pdf_content=$(pdftotext "$pdf_file" - 2>/dev/null | head -100)
+                if [[ -n "$pdf_content" ]]; then
+                    content="$content\n\n=== PDF ($basename) ===\n$pdf_content"
+                fi
+            fi
+        done
+    else
+        # Check if any PDF files exist and suggest installation
+        local pdf_count=0
+        for pdf_file in "$folder_path"/*.pdf "$folder_path"/*.PDF; do
+            if [[ -f "$pdf_file" ]]; then
+                pdf_count=$((pdf_count + 1))
+            fi
+        done
+
+        if [[ $pdf_count -gt 0 ]]; then
+            echo "Found $pdf_count PDF file(s) but pdftotext is not available."
+            echo "To extract PDF content for better organization, install poppler-utils:"
+            echo "  brew install poppler"
+
+            for pdf_file in "$folder_path"/*.pdf "$folder_path"/*.PDF; do
+                if [[ -f "$pdf_file" ]]; then
+                    local basename=$(basename "$pdf_file")
+                    content="$content\n\n=== PDF ($basename) ===\n[PDF file present but content extraction unavailable - install poppler-utils with 'brew install poppler' for text extraction]"
+                fi
+            done
+        fi
+    fi
+
+    # Find other text-based documentation files
+    for doc_file in "$folder_path"/*.txt "$folder_path"/*.md "$folder_path"/*.TXT "$folder_path"/*.MD; do
+        if [[ -f "$doc_file" ]]; then
+            local basename=$(basename "$doc_file")
+            local lowercase_basename=$(echo "$basename" | tr '[:upper:]' '[:lower:]')
+
+            # Skip README files (already processed above)
+            if [[ ! "$lowercase_basename" =~ ^readme(\.|$) ]]; then
+                echo "Found text documentation: $basename"
+                local doc_content=$(cat "$doc_file" 2>/dev/null | head -50)
+                if [[ -n "$doc_content" ]]; then
+                    content="$content\n\n=== TEXT DOC ($basename) ===\n$doc_content"
+                fi
+            fi
+        fi
+    done
+
+    if [[ -n "$content" ]]; then
+        echo -e "$content"
+    else
+        echo ""
+    fi
+}
+
+summarize-documentation() {
+    local documentation_content="$1"
+
+    if [[ -z "$documentation_content" ]]; then
+        echo ""
+        return
+    fi
+
+    echo "Summarizing documentation content for better organization context..."
+
+    local summary_system_message="You are an assistant that summarizes 3D printing documentation to extract only the most relevant information for file organization purposes."
+
+    local summary_user_message="Please analyze the following documentation content from a 3D printing project and provide a concise summary that focuses on:
+
+1. The PURPOSE of the 3D models (what they're designed for, what problem they solve)
+2. Any SPECIFIC MODEL NUMBERS, PART NUMBERS, or PRODUCT NAMES mentioned
+3. The TARGET APPLICATION or USE CASE
+4. Any BRAND NAMES or PRODUCT LINES referenced
+5. TECHNICAL SPECIFICATIONS that help identify the models (sizes, versions, compatibility)
+
+Ignore installation instructions, printing settings, licensing information, and other non-essential details for organization purposes.
+
+DOCUMENTATION CONTENT:
+$documentation_content
+
+Please provide a brief, focused summary (2-3 sentences maximum) that captures the essential purpose and context of these 3D models."
+
+    # Escape the message content for JSON
+    local escaped_summary_system=$(echo "$summary_system_message" | jq -R -s .)
+    local escaped_summary_user=$(echo "$summary_user_message" | jq -R -s .)
+
+    # Create the JSON payload for summarization
+    local summary_json_payload=$(jq -n \
+        --argjson system_msg "$escaped_summary_system" \
+        --argjson user_msg "$escaped_summary_user" \
+        '{
+            "messages": [
+                {
+                    "role": "system",
+                    "content": $system_msg
+                },
+                {
+                    "role": "user",
+                    "content": $user_msg
+                }
+            ],
+            "max_tokens": 200,
+            "temperature": 0.3
+        }')
+
+    local summary_response=$(get-openai-response "$summary_json_payload")
+
+    if [[ -n "$summary_response" && "$summary_response" != "null" ]]; then
+        echo "$summary_response"
+    else
+        echo "Failed to summarize documentation - using original content"
+        echo "$documentation_content"
+    fi
+}
+
 get-folder-structure() {
     local base_path="$1"
     local structure=""
@@ -101,6 +242,7 @@ organize-all-files() {
     FOLDER_NAME="$1"
     FOLDER_STRUCTURE="$2"
     FULL_FILE_LIST="$3"
+    DOCUMENTATION_CONTENT="$4"
 
     OPENAI_USER_MESSAGE="Please analyze and organize the following 3D print folder and its files in a single comprehensive response:
 
@@ -109,7 +251,19 @@ FOLDER TO ORGANIZE: '$FOLDER_NAME'
 ALL FILES IN FOLDER: $FULL_FILE_LIST
 
 EXISTING FOLDER STRUCTURE:
-$FOLDER_STRUCTURE
+$FOLDER_STRUCTURE"
+
+    # Add documentation content if available
+    if [[ -n "$DOCUMENTATION_CONTENT" ]]; then
+        OPENAI_USER_MESSAGE="$OPENAI_USER_MESSAGE
+
+DOCUMENTATION SUMMARY:
+$DOCUMENTATION_CONTENT
+
+Please use the above documentation summary to better understand the purpose, context, and specific details about these 3D print files when making organization decisions. Pay special attention to any model numbers, part numbers, brand names, or specific applications mentioned."
+    fi
+
+    OPENAI_USER_MESSAGE="$OPENAI_USER_MESSAGE
 
 Please provide a complete organization plan including:
 
@@ -300,10 +454,33 @@ fi
 
 echo "**************************************************\n"
 echo "Analyzing folder '$NAME' with files: $FULL_FILE_LIST"
+echo "Extracting documentation content to improve organization decisions..."
+
+# Extract content from README and PDF files
+RAW_DOCUMENTATION_CONTENT=$(extract-documentation-content "$INPUT_PATH")
+
+# Summarize the documentation content to focus on essential information
+if [[ -n "$RAW_DOCUMENTATION_CONTENT" ]]; then
+    DOCUMENTATION_CONTENT=$(summarize-documentation "$RAW_DOCUMENTATION_CONTENT")
+    echo "Documentation summarized for organization context."
+    echo ""
+    echo "DOCUMENTATION SUMMARY:"
+    echo "====================="
+    echo "$DOCUMENTATION_CONTENT"
+    echo "====================="
+    echo ""
+
+    # Save summary to SUMMARY.txt file
+    echo "$DOCUMENTATION_CONTENT" > "$INPUT_PATH/SUMMARY.txt"
+    echo "Documentation summary saved to SUMMARY.txt"
+else
+    DOCUMENTATION_CONTENT=""
+fi
+
 echo "Making comprehensive organization plan with AI..."
 
 # Make single AI call to organize everything
-AI_RESPONSE=$(organize-all-files "$NAME" "$FOLDER_STRUCTURE" "$FULL_FILE_LIST")
+AI_RESPONSE=$(organize-all-files "$NAME" "$FOLDER_STRUCTURE" "$FULL_FILE_LIST" "$DOCUMENTATION_CONTENT")
 
 # Debug: Check if we got a valid response
 if [[ -z "$AI_RESPONSE" || "$AI_RESPONSE" == "null" ]]; then
@@ -424,14 +601,14 @@ mkdir -p "$MISC_FOLDER"
 echo "**************************************************\n"
 echo "Organizing and renaming files according to AI plan"
 
-# First, handle special files (README, LICENSE) that should stay at root with original names
+# First, handle special files (README, LICENSE, SUMMARY) that should stay at root with original names
 for file in "$NEW_FILEPATH"/*; do
     if [[ -f "$file" ]]; then
         BASENAME=$(basename "$file")
         LOWERCASE_BASENAME=$(echo "$BASENAME" | tr '[:upper:]' '[:lower:]')
 
-        # Check if it's a README or LICENSE file (case insensitive)
-        if [[ "$LOWERCASE_BASENAME" =~ ^readme(\.|$) || "$LOWERCASE_BASENAME" =~ ^license(\.|$) ]]; then
+        # Check if it's a README, LICENSE, or SUMMARY file (case insensitive)
+        if [[ "$LOWERCASE_BASENAME" =~ ^readme(\.|$) || "$LOWERCASE_BASENAME" =~ ^license(\.|$) || "$LOWERCASE_BASENAME" =~ ^summary(\.|$) ]]; then
             echo "Keeping special file at root: $BASENAME"
             echo "Special file preserved: $BASENAME => root/$BASENAME" >> "$RENAME_FILE"
             # File stays where it is, no moving needed
@@ -447,9 +624,9 @@ echo "$AI_RESPONSE" | jq -r '.fileOrganization[] | @base64' | while IFS= read -r
     PROPOSED_NAME=$(echo "$FILE_INFO" | jq -r '.proposedFileName')
     TARGET_SUBFOLDER=$(echo "$FILE_INFO" | jq -r '.targetSubfolder')
 
-    # Skip README and LICENSE files - they stay at root with original names
+    # Skip README, LICENSE, and SUMMARY files - they stay at root with original names
     LOWERCASE_ORIGINAL=$(echo "$ORIGINAL_NAME" | tr '[:upper:]' '[:lower:]')
-    if [[ "$LOWERCASE_ORIGINAL" =~ ^readme(\.|$) || "$LOWERCASE_ORIGINAL" =~ ^license(\.|$) ]]; then
+    if [[ "$LOWERCASE_ORIGINAL" =~ ^readme(\.|$) || "$LOWERCASE_ORIGINAL" =~ ^license(\.|$) || "$LOWERCASE_ORIGINAL" =~ ^summary(\.|$) ]]; then
         continue
     fi
 
@@ -528,8 +705,8 @@ for file in "$NEW_FILEPATH"/*; do
         BASENAME=$(basename "$file")
         LOWERCASE_BASENAME=$(echo "$BASENAME" | tr '[:upper:]' '[:lower:]')
 
-        # Skip README and LICENSE files - they stay at root
-        if [[ "$LOWERCASE_BASENAME" =~ ^readme(\.|$) || "$LOWERCASE_BASENAME" =~ ^license(\.|$) ]]; then
+        # Skip README, LICENSE, and SUMMARY files - they stay at root
+        if [[ "$LOWERCASE_BASENAME" =~ ^readme(\.|$) || "$LOWERCASE_BASENAME" =~ ^license(\.|$) || "$LOWERCASE_BASENAME" =~ ^summary(\.|$) ]]; then
             continue
         fi
 
