@@ -113,7 +113,7 @@ extract-documentation-content() {
     fi
 
     # Find other text-based documentation files
-    for doc_file in "$folder_path"/*.txt "$folder_path"/*.md "$folder_path"/*.TXT "$folder_path"/*.MD; do
+    for doc_file in "$folder_path"/*.txt "$folder_path"/*.md "$folder_path"/*.rtf "$folder_path"/*.TXT "$folder_path"/*.MD "$folder_path"/*.RTF; do
         if [[ -f "$doc_file" ]]; then
             local basename=$(basename "$doc_file")
             local lowercase_basename=$(echo "$basename" | tr '[:upper:]' '[:lower:]')
@@ -121,7 +121,24 @@ extract-documentation-content() {
             # Skip README files (already processed above)
             if [[ ! "$lowercase_basename" =~ ^readme(\.|$) ]]; then
                 echo "Found text documentation: $basename"
-                local doc_content=$(cat "$doc_file" 2>/dev/null | head -50)
+
+                # Handle RTF files with proper text extraction
+                if [[ "$lowercase_basename" =~ \.rtf$ ]]; then
+                    local doc_content=""
+                    if command -v unrtf >/dev/null 2>&1; then
+                        echo "Extracting RTF content using unrtf: $basename"
+                        doc_content=$(unrtf --text "$doc_file" 2>/dev/null | head -50)
+                    else
+                        echo "Found RTF file but unrtf is not available: $basename"
+                        echo "To extract RTF content for better organization, install unrtf:"
+                        echo "  brew install unrtf"
+                        doc_content="[RTF file present but content extraction unavailable - install unrtf with 'brew install unrtf' for text extraction]"
+                    fi
+                else
+                    # Handle regular text files
+                    doc_content=$(cat "$doc_file" 2>/dev/null | head -50)
+                fi
+
                 if [[ -n "$doc_content" ]]; then
                     content="$content\n\n=== TEXT DOC ($basename) ===\n$doc_content"
                 fi
