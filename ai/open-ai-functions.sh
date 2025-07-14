@@ -51,6 +51,26 @@ get-openai-response() {
         exit -1
     fi
 
+    # Debug: Show the full response for troubleshooting
+    echo "Full API Response:" >&2
+    echo "$RESPONSE" | jq . >&2
+    echo "" >&2
+
+    # Check if response contains an error
+    ERROR_MESSAGE=$(echo "$RESPONSE" | jq -r '.error.message // empty')
+    if [[ -n "$ERROR_MESSAGE" ]]; then
+        echo "API Error: $ERROR_MESSAGE" >&2
+        exit -1
+    fi
+
+    # Check if response has the expected structure
+    CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+    if [[ -z "$CONTENT" ]]; then
+        echo "Error: No content found in API response" >&2
+        echo "Response structure: $(echo "$RESPONSE" | jq 'keys')" >&2
+        exit -1
+    fi
+
     # Parse the response to get the categorization and date
-    echo "$RESPONSE" | jq -r '.choices[0].message.content'
+    echo "$CONTENT"
 }
