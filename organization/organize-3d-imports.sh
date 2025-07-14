@@ -1,7 +1,8 @@
 #!/usr/bin/env zsh
 
 # Set Shell Options
-shopt -s extglob
+setopt extended_glob
+setopt null_glob
 
 set -o errexit
 set -o nounset
@@ -13,16 +14,36 @@ fi
 
 # Set variables used in the script
 ##################################################
-PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
+# Validate input argument
+if [[ $# -eq 0 ]]; then
+    echo "Usage: $0 <directory_path>"
+    echo "Error: Please provide a directory path to organize"
+    exit 1
+fi
+
 INPUT_PATH="$1"
+
+# Validate that the input path exists and is a directory
+if [[ ! -d "$INPUT_PATH" ]]; then
+    echo "Error: '$INPUT_PATH' does not exist or is not a directory"
+    exit 1
+fi
+
+PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 BASE_PATH="$HOME/Documents/3D Prints"
 NAME="$(basename "$INPUT_PATH")"
+
+# Ensure base path exists
+if [[ ! -d "$BASE_PATH" ]]; then
+    echo "Creating base organization directory: $BASE_PATH"
+    mkdir -p "$BASE_PATH"
+fi
 
 exec >$BASE_PATH/logfile.txt 2>&1
 
 # Source Open AI Helpers
 ##################################################
-SCRIPT_DIR="$(cd "$(dirname "${(%):-%N}")" &>/dev/null && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
 echo "Sourcing Open AI Helpers from $SCRIPT_DIR"
 source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
 
@@ -43,9 +64,6 @@ get-folder-structure() {
         echo "Base path does not exist: $base_path"
         return 1
     fi
-
-    # Set nullglob to handle cases where no directories match
-    setopt nullglob
 
     # Get top-level folders and their subfolders
     for category in "$base_path"/*; do
@@ -70,9 +88,6 @@ get-folder-structure() {
             structure="$structure\n"
         fi
     done
-
-    # Unset nullglob to restore default behavior
-    unsetopt nullglob
 
     if [[ -z "$structure" ]]; then
         echo "No directories found in $base_path"
@@ -229,9 +244,7 @@ BACKUP_PATH="$BASE_PATH/$BACKUP_NAME"
 
 # Create zip backup of the original folder
 cd "$(dirname "$INPUT_PATH")"
-zip -r "$BACKUP_PATH" "$(basename "$INPUT_PATH")" >/dev/null 2>&1
-
-if [ $? -eq 0 ]; then
+if zip -r "$BACKUP_PATH" "$(basename "$INPUT_PATH")" >/dev/null 2>&1; then
     echo "Backup created successfully: $BACKUP_PATH"
 else
     echo "Warning: Failed to create backup. Continuing with organization..."
@@ -256,6 +269,22 @@ find "$INPUT_PATH" -mindepth 2 -type f -exec sh -c '
         base_file_name="$(basename "$file")"
         relative_path="${file#$INPUT_PATH/}"
         new_path="$INPUT_PATH/$(basename "$INPUT_PATH")_$base_file_name"
+
+        # Handle potential filename conflicts during flattening
+        counter=1
+        original_new_path="$new_path"
+        while [ -e "$new_path" ]; do
+            extension="${base_file_name##*.}"
+            filename="${base_file_name%.*}"
+            if [ "$extension" = "$base_file_name" ]; then
+                # No extension
+                new_path="$INPUT_PATH/$(basename "$INPUT_PATH")_${filename}_${counter}"
+            else
+                new_path="$INPUT_PATH/$(basename "$INPUT_PATH")_${filename}_${counter}.${extension}"
+            fi
+            counter=$((counter + 1))
+        done
+
         echo "Flattening: $relative_path => $(basename "$new_path")"
         mv "$file" "$new_path"
     done
@@ -266,7 +295,7 @@ find "$INPUT_PATH" -mindepth 1 -type d -empty -delete
 FULL_FILE_LIST=$(get-file-list "$INPUT_PATH")
 if [ -z "$FULL_FILE_LIST" ]; then
     echo "No files found in $INPUT_PATH after flattening."
-    exit -1
+    exit 1
 fi
 
 echo "**************************************************\n"
