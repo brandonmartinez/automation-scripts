@@ -12,39 +12,46 @@ if [[ "${TRACE-0}" == "1" ]]; then
     set -o xtrace
 fi
 
-# Set variables used in the script
-##################################################
-# Validate input argument
-if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 <directory_path>"
-    echo "Error: Please provide a directory path to organize"
-    exit 1
-fi
-
-INPUT_PATH="$1"
-
-# Validate that the input path exists and is a directory
-if [[ ! -d "$INPUT_PATH" ]]; then
-    echo "Error: '$INPUT_PATH' does not exist or is not a directory"
-    exit 1
-fi
-
+# Set up base path and logging before any other imports
 PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
+SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
 BASE_PATH="$HOME/Documents/3D Prints"
+INPUT_PATH="$1"
 NAME="$(basename "$INPUT_PATH")"
 
-# Ensure base path exists
+# Ensure base path exists for logging
 if [[ ! -d "$BASE_PATH" ]]; then
-    echo "Creating base organization directory: $BASE_PATH"
     mkdir -p "$BASE_PATH"
 fi
 
-exec >$BASE_PATH/logfile.txt 2>&1
+# Initialize logging utility with automatic file output
+export LOG_LEVEL=0
+export LOG_FD=2
+export LOG_FILE="$BASE_PATH/logfile.txt"
+source "$SCRIPT_DIR/../utilities/logging.sh"
+set_log_level "${LOG_LEVEL_NAME:-INFO}"
 
+# Set variables used in the script
+##################################################
+log_info "Starting 3D print file organization script"
+
+# Validate input argument
+if [[ $# -eq 0 ]]; then
+    log_error "Usage: $0 <directory_path>"
+    log_error "Please provide a directory path to organize"
+    exit 1
+fi
+
+log_debug "Input path: $INPUT_PATH"
+
+# Validate that the input path exists and is a directory
+if [[ ! -d "$INPUT_PATH" ]]; then
+    log_error "'$INPUT_PATH' does not exist or is not a directory"
+    exit 1
+fi
 # Source Open AI Helpers
 ##################################################
-SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
-echo "Sourcing Open AI Helpers from $SCRIPT_DIR"
+log_debug "Sourcing Open AI Helpers from $SCRIPT_DIR"
 source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
 
 # Process Functions
@@ -72,7 +79,7 @@ extract-documentation-content() {
     local folder_path="$1"
     local content=""
 
-    echo "Extracting documentation content from folder..." >&2
+    log_debug "Extracting documentation content from folder: $folder_path"
 
     # Find README files (case insensitive) - only check text-based extensions
     for readme_file in "$folder_path"/README* "$folder_path"/readme* "$folder_path"/Readme*; do
@@ -83,7 +90,7 @@ extract-documentation-content() {
 
             # Only process files with known text extensions or no extension
             if [[ "$lowercase_basename" =~ ^readme(\.|$) ]] && [[ "$extension" =~ ^(txt|md|rst||html|htm)$ || "$basename" == "$extension" ]]; then
-                echo "Found README file: $basename" >&2
+                log_debug "Found README file: $basename"
                 local readme_content=$(cat "$readme_file" 2>/dev/null | head -50)
                 if [[ -n "$readme_content" ]]; then
                     content="$content\n\n=== README ($basename) ===\n$readme_content"
@@ -97,7 +104,7 @@ extract-documentation-content() {
         for pdf_file in "$folder_path"/*.pdf "$folder_path"/*.PDF; do
             if [[ -f "$pdf_file" ]]; then
                 local basename=$(basename "$pdf_file")
-                echo "Found PDF file: $basename" >&2
+                log_debug "Found PDF file: $basename"
                 local pdf_content=$(pdftotext "$pdf_file" - 2>/dev/null | head -100)
                 if [[ -n "$pdf_content" ]]; then
                     content="$content\n\n=== PDF ($basename) ===\n$pdf_content"
@@ -114,9 +121,8 @@ extract-documentation-content() {
         done
 
         if [[ $pdf_count -gt 0 ]]; then
-            echo "Found $pdf_count PDF file(s) but pdftotext is not available." >&2
-            echo "To extract PDF content for better organization, install poppler-utils:" >&2
-            echo "  brew install poppler" >&2
+            log_warn "Found $pdf_count PDF file(s) but pdftotext is not available"
+            log_info "To extract PDF content for better organization, install poppler-utils: brew install poppler"
 
             for pdf_file in "$folder_path"/*.pdf "$folder_path"/*.PDF; do
                 if [[ -f "$pdf_file" ]]; then
@@ -135,18 +141,17 @@ extract-documentation-content() {
 
             # Skip README files (already processed above)
             if [[ ! "$lowercase_basename" =~ ^readme(\.|$) ]]; then
-                echo "Found text documentation: $basename" >&2
+                log_debug "Found text documentation: $basename"
 
                 # Handle RTF files with proper text extraction
                 if [[ "$lowercase_basename" =~ \.rtf$ ]]; then
                     local doc_content=""
                     if command -v unrtf >/dev/null 2>&1; then
-                        echo "Extracting RTF content using unrtf: $basename" >&2
+                        log_debug "Extracting RTF content using unrtf: $basename"
                         doc_content=$(unrtf --text "$doc_file" 2>/dev/null | head -50)
                     else
-                        echo "Found RTF file but unrtf is not available: $basename" >&2
-                        echo "To extract RTF content for better organization, install unrtf:" >&2
-                        echo "  brew install unrtf" >&2
+                        log_warn "Found RTF file but unrtf is not available: $basename"
+                        log_info "To extract RTF content for better organization, install unrtf: brew install unrtf"
                         doc_content="[RTF file present but content extraction unavailable - install unrtf with 'brew install unrtf' for text extraction]"
                     fi
                 else
@@ -173,24 +178,24 @@ extract-documentation-content() {
 summarize-documentation() {
     local documentation_content="$1"
 
-    echo "DEBUG: summarize-documentation called with content length: ${#documentation_content}"
+    log_debug "summarize-documentation called with content length: ${#documentation_content}"
 
     if [[ -z "$documentation_content" ]]; then
-        echo "DEBUG: Documentation content is empty, returning early"
+        log_debug "Documentation content is empty, returning early"
         echo ""
         return
     fi
 
-    echo "Summarizing documentation content for better organization context..."
+    log_info "Summarizing documentation content for better organization context"
 
     # Clean the documentation content of control characters before processing
     local cleaned_content=$(printf '%s' "$documentation_content" | tr -d '\000-\037\177' | tr -cd '[:print:][:space:]' | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-    echo "DEBUG: After cleaning, content length: ${#cleaned_content}"
-    echo "DEBUG: Cleaned content preview: ${cleaned_content:0:100}..."
+    log_debug "After cleaning, content length: ${#cleaned_content}"
+    log_debug "Cleaned content preview: ${cleaned_content:0:100}..."
 
     # If cleaning failed or resulted in empty content, skip documentation analysis
     if [[ -z "$cleaned_content" ]]; then
-        echo "Warning: Documentation content could not be processed safely. Skipping summarization."
+        log_warn "Documentation content could not be processed safely. Skipping summarization."
         echo ""
         return
     fi
@@ -216,31 +221,30 @@ Specifications: [Key technical specs: sizes, versions, materials]
 **DOCUMENTATION:**
 $cleaned_content"
 
-    echo "DEBUG: About to escape messages for JSON"
+    log_debug "About to escape messages for JSON"
 
     # Test the escaping process step by step
-    echo "DEBUG: Testing system message escaping..."
+    log_debug "Testing system message escaping..."
     local escaped_summary_system
     if ! escaped_summary_system=$(printf '%s' "$summary_system_message" | jq -R -s .); then
-        echo "ERROR: Failed to escape system message"
+        log_error "Failed to escape system message"
         return
     fi
-    echo "DEBUG: System message escaped successfully"
+    log_debug "System message escaped successfully"
 
-    echo "DEBUG: Testing user message escaping..."
+    log_debug "Testing user message escaping..."
     local escaped_summary_user
     if ! escaped_summary_user=$(printf '%s' "$summary_user_message" | jq -R -s .); then
-        echo "ERROR: Failed to escape user message"
-        echo "DEBUG: Problematic user message content: ${summary_user_message:0:500}..."
-        echo "DEBUG: Hex dump of first 100 characters:"
-        printf '%s' "$summary_user_message" | head -c 100 | hexdump -C
-        echo ""
-        echo "WARNING: Skipping documentation summarization due to character encoding issues"
+        log_error "Failed to escape user message"
+        log_debug "Problematic user message content: ${summary_user_message:0:500}..."
+        log_debug "Hex dump of first 100 characters:"
+        printf '%s' "$summary_user_message" | head -c 100 | hexdump -C >&2
+        log_warn "Skipping documentation summarization due to character encoding issues"
         return
     fi
-    echo "DEBUG: User message escaped successfully"
+    log_debug "User message escaped successfully"
 
-    echo "DEBUG: Creating JSON payload"
+    log_debug "Creating JSON payload"
     # Create the JSON payload for summarization
     local summary_json_payload=$(jq -n \
         --argjson system_msg "$escaped_summary_system" \
@@ -258,16 +262,16 @@ $cleaned_content"
             ],
             "temperature": 0.1
         }')
-    echo "DEBUG: JSON payload created successfully"
+    log_debug "JSON payload created successfully"
 
-    echo "DEBUG: Making API call"
+    log_debug "Making API call"
     local summary_response=$(get-openai-response "$summary_json_payload")
-    echo "DEBUG: API call completed, response length: ${#summary_response}"
+    log_debug "API call completed, response length: ${#summary_response}"
 
     if [[ -n "$summary_response" && "$summary_response" != "null" ]]; then
         echo "$summary_response"
     else
-        echo "Failed to summarize documentation - using original content"
+        log_warn "Failed to summarize documentation - using original content"
         echo "$documentation_content"
     fi
 }
@@ -276,9 +280,11 @@ get-folder-structure() {
     local base_path="$1"
     local structure=""
 
+    log_debug "Getting folder structure from: $base_path"
+
     # Check if base path exists
     if [[ ! -d "$base_path" ]]; then
-        echo "Base path does not exist: $base_path"
+        log_warn "Base path does not exist: $base_path"
         return 1
     fi
 
@@ -315,7 +321,7 @@ get-folder-structure() {
     done
 
     if [[ -z "$structure" ]]; then
-        echo "No directories found in $base_path"
+        log_debug "No directories found in $base_path"
         return 1
     fi
 
@@ -482,19 +488,20 @@ Provide a complete, consistent organization plan that maintains technical accura
 ##################################################
 
 # Get hierarchical folder structure instead of just top-level folders
+log_debug "Getting folder structure from base path"
 FOLDER_STRUCTURE=$(get-folder-structure "$BASE_PATH")
 if [[ $? -ne 0 || -z "$FOLDER_STRUCTURE" ]]; then
-    echo "Warning: Could not get folder structure from $BASE_PATH."
-    echo "This might be the first time organizing, or the path might not exist."
+    log_warn "Could not get folder structure from $BASE_PATH"
+    log_info "This might be the first time organizing, or the path might not exist"
     FOLDER_STRUCTURE="No existing categories found. Please suggest appropriate categories for 3D print organization."
 fi
 
-echo "Current folder structure:"
+log_info "Current folder structure:"
 echo -e "$FOLDER_STRUCTURE"
 
 # Create backup of original folder structure
-echo "**************************************************\n"
-echo "Creating backup of original folder structure"
+log_divider "BACKUP CREATION"
+log_info "Creating backup of original folder structure"
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 BACKUP_NAME="${NAME}_backup_${TIMESTAMP}.zip"
@@ -503,16 +510,16 @@ BACKUP_PATH="$BASE_PATH/$BACKUP_NAME"
 # Create zip backup of the original folder
 cd "$(dirname "$INPUT_PATH")"
 if zip -r "$BACKUP_PATH" "$(basename "$INPUT_PATH")" >/dev/null 2>&1; then
-    echo "Backup created successfully: $BACKUP_PATH"
+    log_info "Backup created successfully: $BACKUP_PATH"
 else
-    echo "Warning: Failed to create backup. Continuing with organization..."
+    log_warn "Failed to create backup. Continuing with organization..."
 fi
 
-echo "**************************************************\n"
-echo "Flattening the original folder structure before AI processing"
+log_divider "FOLDER PREPARATION"
+log_info "Flattening the original folder structure before AI processing"
 
 # Remove OS-generated files that shouldn't be organized
-echo "Removing OS-generated files..."
+log_debug "Removing OS-generated files..."
 find "$INPUT_PATH" -name ".DS_Store" -delete 2>/dev/null || true
 find "$INPUT_PATH" -name "Thumbs.db" -delete 2>/dev/null || true
 find "$INPUT_PATH" -name "thumbs.db" -delete 2>/dev/null || true
@@ -521,6 +528,7 @@ find "$INPUT_PATH" -name ".localized" -delete 2>/dev/null || true
 find "$INPUT_PATH" -name "._*" -delete 2>/dev/null || true
 
 # Flatten any nested folder structure to give AI complete visibility of all files
+log_debug "Flattening nested folder structures"
 export INPUT_PATH
 find "$INPUT_PATH" -mindepth 2 -type f -exec sh -c '
     for file; do
@@ -552,43 +560,43 @@ find "$INPUT_PATH" -mindepth 1 -type d -empty -delete
 # Get complete file list from the source folder AFTER flattening
 FULL_FILE_LIST=$(get-file-list "$INPUT_PATH")
 if [ -z "$FULL_FILE_LIST" ]; then
-    echo "No files found in $INPUT_PATH after flattening."
+    log_error "No files found in $INPUT_PATH after flattening"
     exit 1
 fi
 
-echo "**************************************************\n"
-echo "Analyzing folder '$NAME' with files: $FULL_FILE_LIST"
-echo "Extracting documentation content to improve organization decisions..."
+log_divider "CONTENT ANALYSIS"
+log_info "Analyzing folder '$NAME' with files: $FULL_FILE_LIST"
+log_info "Extracting documentation content to improve organization decisions"
 
 # Extract content from README and PDF files
-echo "DEBUG: Calling extract-documentation-content for path: $INPUT_PATH"
+log_debug "Calling extract-documentation-content for path: $INPUT_PATH"
 RAW_DOCUMENTATION_CONTENT=$(extract-documentation-content "$INPUT_PATH")
-echo "DEBUG: Raw documentation content length: ${#RAW_DOCUMENTATION_CONTENT}"
-echo "DEBUG: Raw documentation content (first 200 chars): ${RAW_DOCUMENTATION_CONTENT:0:200}"
+log_debug "Raw documentation content length: ${#RAW_DOCUMENTATION_CONTENT}"
+log_debug "Raw documentation content (first 200 chars): ${RAW_DOCUMENTATION_CONTENT:0:200}"
 
 # Clean and validate documentation content before processing
 CLEANED_RAW_CONTENT=""
 if [[ -n "$RAW_DOCUMENTATION_CONTENT" ]]; then
-    echo "DEBUG: Raw documentation content is not empty, proceeding to clean"
+    log_debug "Raw documentation content is not empty, proceeding to clean"
     # Clean the raw content and check if there's anything meaningful left
     CLEANED_RAW_CONTENT=$(printf '%s' "$RAW_DOCUMENTATION_CONTENT" | tr -d '\000-\037\177' | tr -cd '[:print:][:space:]' | tr -s '[:space:]' ' ' | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
-    echo "DEBUG: Cleaned content length: ${#CLEANED_RAW_CONTENT}"
-    echo "DEBUG: Cleaned content (first 200 chars): ${CLEANED_RAW_CONTENT:0:200}"
-    echo "DEBUG: Hex dump of first 50 characters of cleaned content:"
-    printf '%s' "$CLEANED_RAW_CONTENT" | head -c 50 | hexdump -C
+    log_debug "Cleaned content length: ${#CLEANED_RAW_CONTENT}"
+    log_debug "Cleaned content (first 200 chars): ${CLEANED_RAW_CONTENT:0:200}"
+    log_debug "Hex dump of first 50 characters of cleaned content:"
+    printf '%s' "$CLEANED_RAW_CONTENT" | head -c 50 | hexdump -C >&2
 else
-    echo "DEBUG: Raw documentation content is empty"
+    log_debug "Raw documentation content is empty"
 fi
 
 # Summarize the documentation content to focus on essential information
 if [[ -n "$CLEANED_RAW_CONTENT" && "$CLEANED_RAW_CONTENT" != " " ]]; then
-    echo "DEBUG: Proceeding with documentation summarization"
+    log_debug "Proceeding with documentation summarization"
 
     # Try documentation summarization with error handling
     if DOCUMENTATION_CONTENT=$(summarize-documentation "$CLEANED_RAW_CONTENT" 2>&1); then
-        echo "DEBUG: Summarization successful, content length: ${#DOCUMENTATION_CONTENT}"
+        log_debug "Summarization successful, content length: ${#DOCUMENTATION_CONTENT}"
         if [[ -n "$DOCUMENTATION_CONTENT" ]]; then
-            echo "Documentation summarized for organization context."
+            log_info "Documentation summarized for organization context"
             echo ""
             echo "DOCUMENTATION SUMMARY:"
             echo "====================="
@@ -598,53 +606,50 @@ if [[ -n "$CLEANED_RAW_CONTENT" && "$CLEANED_RAW_CONTENT" != " " ]]; then
 
             # Save summary to SUMMARY.txt file
             echo "$DOCUMENTATION_CONTENT" > "$INPUT_PATH/SUMMARY.txt"
-            echo "Documentation summary saved to SUMMARY.txt"
+            log_info "Documentation summary saved to SUMMARY.txt"
         else
-            echo "Documentation content could not be summarized. Proceeding without documentation context."
+            log_warn "Documentation content could not be summarized. Proceeding without documentation context."
             DOCUMENTATION_CONTENT=""
         fi
     else
-        echo "ERROR: Documentation summarization failed with error:"
+        log_error "Documentation summarization failed with error:"
         echo "$DOCUMENTATION_CONTENT"
-        echo "Proceeding without documentation context."
+        log_warn "Proceeding without documentation context"
         DOCUMENTATION_CONTENT=""
     fi
 else
-    echo "No documentation content found. Proceeding without documentation context."
+    log_info "No documentation content found. Proceeding without documentation context."
     DOCUMENTATION_CONTENT=""
 fi
 
-echo "Making comprehensive organization plan with AI..."
+log_info "Making comprehensive organization plan with AI"
 
 # Make single AI call to organize everything
 AI_RESPONSE=$(organize-all-files "$NAME" "$FOLDER_STRUCTURE" "$FULL_FILE_LIST" "$DOCUMENTATION_CONTENT")
 
 # Debug: Check if we got a valid response
 if [[ -z "$AI_RESPONSE" || "$AI_RESPONSE" == "null" ]]; then
-    echo "Error: No response received from OpenAI API. Exiting."
+    log_error "No response received from OpenAI API. Exiting."
     exit 1
 fi
 
 # Debug: Show raw response to help troubleshoot
-echo "Raw AI Response:"
-echo "$AI_RESPONSE"
-echo ""
-echo "Response length: $(echo "$AI_RESPONSE" | wc -c) characters"
+log_debug "Raw AI Response:"
+log_debug "$AI_RESPONSE"
+log_debug "Response length: $(echo "$AI_RESPONSE" | wc -c) characters"
 
 # Try to parse as JSON and check if it's valid
 if ! echo "$AI_RESPONSE" | jq . >/dev/null 2>&1; then
-    echo "Error: Invalid JSON response from OpenAI API:"
-    echo "$AI_RESPONSE"
+    log_error "Invalid JSON response from OpenAI API:"
+    log_error "$AI_RESPONSE"
 
     # Check if the response looks truncated
     if [[ "$AI_RESPONSE" == *"targetSub" ]] || [[ "$AI_RESPONSE" != *"}" ]]; then
-        echo ""
-        echo "WARNING: Response appears to be truncated. This may be due to:"
-        echo "1. Large number of files to organize"
-        echo "2. API response size limits"
-        echo "3. Network or connection issues"
-        echo ""
-        echo "Consider organizing fewer files at once or checking your connection."
+        log_warn "Response appears to be truncated. This may be due to:"
+        log_warn "1. Large number of files to organize"
+        log_warn "2. API response size limits"
+        log_warn "3. Network or connection issues"
+        log_info "Consider organizing fewer files at once or checking your connection"
     fi
     exit 1
 fi
@@ -659,25 +664,24 @@ SUBCATEGORY=$(echo "$AI_RESPONSE" | jq -r '.subCategory // empty')
 
 # Check if we have the essential information even if JSON is truncated
 if [[ -z "$PROPOSED_NAME" || "$PROPOSED_NAME" == "null" || -z "$CATEGORY" || "$CATEGORY" == "null" || -z "$SUBCATEGORY" || "$SUBCATEGORY" == "null" ]]; then
-    echo "Error: AI response missing required information. Response may be truncated."
+    log_error "AI response missing required information. Response may be truncated."
 
     # Try to extract what we can from a potentially truncated response
     if [[ "$AI_RESPONSE" == *'"proposedFolderName"'* ]]; then
-        echo ""
-        echo "Attempting to extract partial information from truncated response..."
+        log_info "Attempting to extract partial information from truncated response..."
 
         # Try alternative parsing methods for truncated JSON
         PROPOSED_NAME=$(echo "$AI_RESPONSE" | grep -o '"proposedFolderName":"[^"]*"' | cut -d'"' -f4 | head -1)
         CATEGORY=$(echo "$AI_RESPONSE" | grep -o '"parentCategory":"[^"]*"' | cut -d'"' -f4 | head -1)
         SUBCATEGORY=$(echo "$AI_RESPONSE" | grep -o '"subCategory":"[^"]*"' | cut -d'"' -f4 | head -1)
 
-        echo "Extracted - Name: '$PROPOSED_NAME', Category: '$CATEGORY', Subcategory: '$SUBCATEGORY'"
+        log_debug "Extracted - Name: '$PROPOSED_NAME', Category: '$CATEGORY', Subcategory: '$SUBCATEGORY'"
 
         if [[ -n "$PROPOSED_NAME" && -n "$CATEGORY" && -n "$SUBCATEGORY" ]]; then
-            echo "Found essential folder organization information. Continuing with basic organization..."
-            echo "WARNING: File-level organization may be incomplete due to truncated response."
+            log_warn "Found essential folder organization information. Continuing with basic organization..."
+            log_warn "File-level organization may be incomplete due to truncated response."
         else
-            echo "Could not extract essential information. Exiting."
+            log_error "Could not extract essential information. Exiting."
             exit 1
         fi
     else
@@ -690,26 +694,26 @@ SUBCATEGORY_DIR="$CATEGORY_DIR/$SUBCATEGORY"
 NEW_FILEPATH="$SUBCATEGORY_DIR/$PROPOSED_NAME"
 RENAME_FILE="$NEW_FILEPATH/RENAMES.txt"
 
-echo "**************************************************\n"
-echo "Creating directory structure:"
-echo "Category: $CATEGORY"
-echo "Subcategory: $SUBCATEGORY"
-echo "Final path: $NEW_FILEPATH"
+log_divider "DIRECTORY SETUP"
+log_info "Creating directory structure:"
+log_info "Category: $CATEGORY"
+log_info "Subcategory: $SUBCATEGORY"
+log_info "Final path: $NEW_FILEPATH"
 
 # Create directory structure
 if [ ! -d "$CATEGORY_DIR" ]; then
-    echo "Creating category folder: $CATEGORY"
+    log_info "Creating category folder: $CATEGORY"
     mkdir -p "$CATEGORY_DIR"
 fi
 
 if [ ! -d "$SUBCATEGORY_DIR" ]; then
-    echo "Creating subcategory folder: $SUBCATEGORY"
+    log_info "Creating subcategory folder: $SUBCATEGORY"
     mkdir -p "$SUBCATEGORY_DIR"
 fi
 
 # TODO: check if there's already a folder called this, if so ask for another name until it doesn't exist
 if [[ -d "$NEW_FILEPATH" ]]; then
-    echo "Warning: Folder '$PROPOSED_NAME' already exists in $SUBCATEGORY_DIR"
+    log_warn "Folder '$PROPOSED_NAME' already exists in $SUBCATEGORY_DIR"
     COUNTER=2
     ORIGINAL_PROPOSED_NAME="$PROPOSED_NAME"
     while [[ -d "$SUBCATEGORY_DIR/$PROPOSED_NAME" ]]; do
@@ -717,35 +721,35 @@ if [[ -d "$NEW_FILEPATH" ]]; then
         NEW_FILEPATH="$SUBCATEGORY_DIR/$PROPOSED_NAME"
         COUNTER=$((COUNTER + 1))
     done
-    echo "Using unique name: $PROPOSED_NAME"
+    log_info "Using unique name: $PROPOSED_NAME"
     RENAME_FILE="$NEW_FILEPATH/RENAMES.txt"
 fi
 
-echo "**************************************************\n"
-echo "Moving $INPUT_PATH to $NEW_FILEPATH"
+log_divider "FOLDER RELOCATION"
+log_info "Moving $INPUT_PATH to $NEW_FILEPATH"
 
 mv "$INPUT_PATH" "$NEW_FILEPATH"
 echo "$INPUT_PATH => $NEW_FILEPATH" >> "$RENAME_FILE"
 
-echo "**************************************************\n"
-echo "Moving backup file to organized folder"
+log_divider "BACKUP MANAGEMENT"
+log_info "Moving backup file to organized folder"
 
 # Move the backup zip file to the new organized location
 if [[ -f "$BACKUP_PATH" ]]; then
     mv "$BACKUP_PATH" "$NEW_FILEPATH/"
-    echo "Backup moved to: $NEW_FILEPATH/$(basename "$BACKUP_PATH")"
+    log_info "Backup moved to: $NEW_FILEPATH/$(basename "$BACKUP_PATH")"
     echo "Backup: $BACKUP_PATH => $NEW_FILEPATH/$(basename "$BACKUP_PATH")" >> "$RENAME_FILE"
 else
-    echo "Warning: Backup file not found at $BACKUP_PATH"
+    log_warn "Backup file not found at $BACKUP_PATH"
 fi
 
-echo "**************************************************\n"
-echo "Opening $NEW_FILEPATH in Finder"
+log_divider "WORKSPACE SETUP"
+log_info "Opening $NEW_FILEPATH in Finder"
 open "$NEW_FILEPATH"
 touch "$RENAME_FILE"
 
-echo "**************************************************\n"
-echo "Creating organized folder structure"
+log_divider "STRUCTURE CREATION"
+log_info "Creating organized folder structure"
 
 FILES_FOLDER="$NEW_FILEPATH/files"
 IMAGES_FOLDER="$NEW_FILEPATH/images"
@@ -754,16 +758,16 @@ MISC_FOLDER="$NEW_FILEPATH/misc"
 
 # Remove any existing conflicting folders first
 if [[ -d "$FILES_FOLDER" ]]; then
-    echo "Warning: files folder already exists, merging contents..."
+    log_warn "files folder already exists, merging contents..."
 fi
 if [[ -d "$IMAGES_FOLDER" ]]; then
-    echo "Warning: images folder already exists, merging contents..."
+    log_warn "images folder already exists, merging contents..."
 fi
 if [[ -d "$EXPORTS_FOLDER" ]]; then
-    echo "Warning: exports folder already exists, merging contents..."
+    log_warn "exports folder already exists, merging contents..."
 fi
 if [[ -d "$MISC_FOLDER" ]]; then
-    echo "Warning: misc folder already exists, merging contents..."
+    log_warn "misc folder already exists, merging contents..."
 fi
 
 mkdir -p "$FILES_FOLDER"
@@ -771,8 +775,8 @@ mkdir -p "$IMAGES_FOLDER"
 mkdir -p "$EXPORTS_FOLDER"
 mkdir -p "$MISC_FOLDER"
 
-echo "**************************************************\n"
-echo "Organizing and renaming files according to AI plan"
+log_divider "FILE ORGANIZATION"
+log_info "Organizing and renaming files according to AI plan"
 
 # First, handle special files (README, LICENSE, SUMMARY) that should stay at root with original names
 for file in "$NEW_FILEPATH"/*; do
@@ -782,7 +786,7 @@ for file in "$NEW_FILEPATH"/*; do
 
         # Check if it's a README, LICENSE, or SUMMARY file (case insensitive)
         if [[ "$LOWERCASE_BASENAME" =~ ^readme(\.|$) || "$LOWERCASE_BASENAME" =~ ^license(\.|$) || "$LOWERCASE_BASENAME" =~ ^summary(\.|$) ]]; then
-            echo "Keeping special file at root: $BASENAME"
+            log_debug "Keeping special file at root: $BASENAME"
             echo "Special file preserved: $BASENAME => root/$BASENAME" >> "$RENAME_FILE"
             # File stays where it is, no moving needed
             continue
@@ -793,7 +797,7 @@ done
 # Process each file according to AI recommendations
 # Check if we have file organization data before attempting to process
 if echo "$AI_RESPONSE" | jq -e '.fileOrganization[]' >/dev/null 2>&1; then
-    echo "Processing AI file organization recommendations..."
+    log_info "Processing AI file organization recommendations..."
     echo "$AI_RESPONSE" | jq -r '.fileOrganization[] | @base64' 2>/dev/null | while IFS= read -r file_data; do
         if [[ -n "$file_data" ]]; then
             FILE_INFO=$(echo "$file_data" | base64 -d 2>/dev/null)
@@ -804,7 +808,7 @@ if echo "$AI_RESPONSE" | jq -e '.fileOrganization[]' >/dev/null 2>&1; then
 
                 # Skip if we couldn't parse the file info
                 if [[ -z "$ORIGINAL_NAME" || -z "$PROPOSED_NAME" ]]; then
-                    echo "Warning: Skipping malformed file organization entry"
+                    log_warn "Skipping malformed file organization entry"
                     continue
                 fi
 
@@ -857,11 +861,11 @@ if echo "$AI_RESPONSE" | jq -e '.fileOrganization[]' >/dev/null 2>&1; then
 
         # Check if target file already exists
         if [[ ! -e "$TARGET_PATH" ]]; then
-            echo "Moving and renaming: $(basename "$ACTUAL_FILE") -> $TARGET_SUBFOLDER/$FINAL_NAME"
+            log_debug "Moving and renaming: $(basename "$ACTUAL_FILE") -> $TARGET_SUBFOLDER/$FINAL_NAME"
             echo "$(basename "$ACTUAL_FILE") => $TARGET_SUBFOLDER/$FINAL_NAME" >> "$RENAME_FILE"
             mv "$ACTUAL_FILE" "$TARGET_PATH"
         else
-            echo "Target file $FINAL_NAME already exists in $TARGET_SUBFOLDER"
+            log_warn "Target file $FINAL_NAME already exists in $TARGET_SUBFOLDER"
             # Create a unique name by adding a counter
             COUNTER=2
             ORIGINAL_FINAL_NAME="$FINAL_NAME"
@@ -871,22 +875,22 @@ if echo "$AI_RESPONSE" | jq -e '.fileOrganization[]' >/dev/null 2>&1; then
                 COUNTER=$((COUNTER + 1))
             done
             UNIQUE_NAME="${FILENAME}_${COUNTER}.${EXTENSION}"
-            echo "Using unique name: $UNIQUE_NAME"
+            log_info "Using unique name: $UNIQUE_NAME"
             echo "$(basename "$ACTUAL_FILE") => $TARGET_SUBFOLDER/$UNIQUE_NAME" >> "$RENAME_FILE"
             mv "$ACTUAL_FILE" "$TARGET_DIR/$UNIQUE_NAME"
         fi
         else
-            echo "Warning: Could not find file $ORIGINAL_NAME"
+            log_warn "Could not find file $ORIGINAL_NAME"
         fi
             fi
         fi
     done
 else
-    echo "Warning: No file organization data found in AI response. Using fallback organization..."
+    log_warn "No file organization data found in AI response. Using fallback organization..."
 fi
 
-echo "**************************************************\n"
-echo "Moving any remaining unprocessed files"
+log_divider "CLEANUP PROCESSING"
+log_info "Moving any remaining unprocessed files"
 
 # Handle any files that weren't processed by the AI (safety net)
 for file in "$NEW_FILEPATH"/*; do
@@ -922,7 +926,7 @@ for file in "$NEW_FILEPATH"/*; do
     fi
 done
 
-echo "**************************************************\n"
-echo "Done."
+log_divider "COMPLETION"
+log_info "Organization complete!"
 
 exit 0
