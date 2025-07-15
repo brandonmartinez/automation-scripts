@@ -23,8 +23,15 @@ if [[ -z "${LOGGING_INITIALIZED:-}" ]]; then
     export LOG_COLOR_ERROR="\033[0;31m"    # Red
     export LOG_COLOR_RESET="\033[0m"       # Reset
 
-    # Disable colors if not a terminal or NO_COLOR is set
-    if [[ ! -t $LOG_FD ]] || [[ -n "${NO_COLOR:-}" ]]; then
+    # Disable colors if NO_COLOR is set, but keep them for file logging
+    if [[ -n "${NO_COLOR:-}" ]]; then
+        LOG_COLOR_DEBUG=""
+        LOG_COLOR_INFO=""
+        LOG_COLOR_WARN=""
+        LOG_COLOR_ERROR=""
+        LOG_COLOR_RESET=""
+    elif [[ ! -t $LOG_FD ]] && [[ -z "${LOG_FILE:-}" ]]; then
+        # Only disable colors if not a terminal AND not using file logging
         LOG_COLOR_DEBUG=""
         LOG_COLOR_INFO=""
         LOG_COLOR_WARN=""
@@ -109,19 +116,47 @@ set_log_level() {
 
 # Enable/disable colors
 set_log_colors() {
-    if [[ "$1" == "true" ]] && [[ -t $LOG_FD ]]; then
-        LOG_COLOR_DEBUG="\033[0;36m"
-        LOG_COLOR_INFO="\033[0;32m"
-        LOG_COLOR_WARN="\033[0;33m"
-        LOG_COLOR_ERROR="\033[0;31m"
-        LOG_COLOR_RESET="\033[0m"
-    else
-        LOG_COLOR_DEBUG=""
-        LOG_COLOR_INFO=""
-        LOG_COLOR_WARN=""
-        LOG_COLOR_ERROR=""
-        LOG_COLOR_RESET=""
-    fi
+    case "${1:-auto}" in
+        true|on|1)
+            LOG_COLOR_DEBUG="\033[0;36m"
+            LOG_COLOR_INFO="\033[0;32m"
+            LOG_COLOR_WARN="\033[0;33m"
+            LOG_COLOR_ERROR="\033[0;31m"
+            LOG_COLOR_RESET="\033[0m"
+            ;;
+        false|off|0)
+            LOG_COLOR_DEBUG=""
+            LOG_COLOR_INFO=""
+            LOG_COLOR_WARN=""
+            LOG_COLOR_ERROR=""
+            LOG_COLOR_RESET=""
+            ;;
+        auto)
+            # Reapply the original color logic
+            if [[ -n "${NO_COLOR:-}" ]]; then
+                LOG_COLOR_DEBUG=""
+                LOG_COLOR_INFO=""
+                LOG_COLOR_WARN=""
+                LOG_COLOR_ERROR=""
+                LOG_COLOR_RESET=""
+            elif [[ ! -t $LOG_FD ]] && [[ -z "${LOG_FILE:-}" ]]; then
+                LOG_COLOR_DEBUG=""
+                LOG_COLOR_INFO=""
+                LOG_COLOR_WARN=""
+                LOG_COLOR_ERROR=""
+                LOG_COLOR_RESET=""
+            else
+                LOG_COLOR_DEBUG="\033[0;36m"
+                LOG_COLOR_INFO="\033[0;32m"
+                LOG_COLOR_WARN="\033[0;33m"
+                LOG_COLOR_ERROR="\033[0;31m"
+                LOG_COLOR_RESET="\033[0m"
+            fi
+            ;;
+        *)
+            log_warn "Unknown color setting: $1, use 'true', 'false', or 'auto'"
+            ;;
+    esac
 }
 
 # Visual divider for log sections
