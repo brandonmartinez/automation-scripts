@@ -54,6 +54,9 @@ export LOG_FILE="$BASE_PATH/logfile.txt"
 source "$SCRIPT_DIR/../utilities/logging.sh"
 set_log_level "$LOG_LEVEL_NAME"
 
+# Log header to mark new session start
+log_header "organize-3d-imports.sh"
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
@@ -241,7 +244,9 @@ $cleaned_content"
             "temperature": 0.1
         }')
 
+    debug_log_api "SUMMARIZATION API REQUEST" "$summary_json_payload"
     local summary_response=$(get-openai-response "$summary_json_payload")
+    debug_log_api "SUMMARIZATION API RESPONSE" "$summary_response"
     log_debug "Summarization API response length: ${#summary_response}"
 
     if [[ -n "$summary_response" && "$summary_response" != "null" ]]; then
@@ -417,6 +422,7 @@ Provide a complete, consistent organization plan."
             }
         }')
 
+    debug_log_api "ORGANIZATION API REQUEST" "$json_payload"
     get-openai-response "$json_payload"
 }
 
@@ -566,6 +572,9 @@ get_organization_plan() {
     log_info "Getting comprehensive organization plan from AI"
 
     ai_response=$(organize_all_files "$NAME" "$folder_structure" "$full_file_list" "$documentation_content")
+
+    debug_log_api "ORGANIZATION AI RESPONSE" "$ai_response"
+    log_debug "Organization AI response received (${#ai_response} characters)"
 
     if [[ -z "$ai_response" || "$ai_response" == "null" ]]; then
         log_error "No response received from OpenAI API"

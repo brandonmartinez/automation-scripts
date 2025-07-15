@@ -185,6 +185,51 @@ log_divider() {
     fi
 }
 
+# Log header to mark the start of a new log session
+log_header() {
+    local script_name="${1:-$(basename "${0:-unknown}")}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local divider_char="="
+    local divider_length=80
+
+    # Create the divider line
+    local divider_line=$(printf "%*s" $divider_length | tr ' ' "$divider_char")
+
+    # Bold formatting for better visibility when tailing logs
+    local bold_start="\033[1m"
+    local bold_end="\033[0m"
+
+    # Combine with existing color for consistency
+    local header_color="${LOG_COLOR_INFO}${bold_start}"
+    local reset_color="${bold_end}${LOG_COLOR_RESET}"
+
+    printf "\n${header_color}%s${reset_color}\n" "$divider_line" >&$LOG_FD
+    printf "${header_color}NEW LOG SESSION: %s${reset_color}\n" "$script_name" >&$LOG_FD
+    printf "${header_color}STARTED: %s${reset_color}\n" "$timestamp" >&$LOG_FD
+    printf "${header_color}%s${reset_color}\n\n" "$divider_line" >&$LOG_FD
+}
+
+# Debug log API request/response with pretty printing
+debug_log_api() {
+    local type="$1"
+    local data="$2"
+
+    if [[ "$LOG_LEVEL" -le 0 ]]; then  # DEBUG level (0) or lower
+        log_debug "=== $type ==="
+        if command -v jq >/dev/null 2>&1 && echo "$data" | jq . >/dev/null 2>&1; then
+            echo "$data" | jq . | while IFS= read -r line; do
+                log_debug "$line"
+            done
+        else
+            # Fallback if jq is not available or data is not JSON
+            echo "$data" | while IFS= read -r line; do
+                log_debug "$line"
+            done
+        fi
+        log_debug "=== END $type ==="
+    fi
+}
+
 # Restore original file descriptors
 restore_log_redirection() {
     if [[ -n "${LOG_ORIGINAL_FDS_SAVED:-}" ]]; then
