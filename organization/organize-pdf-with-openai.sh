@@ -62,6 +62,40 @@ source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
+
+get-folder-structure() {
+    local base_dir="$1"
+    local max_depth="${2:-2}"  # Default to 2 levels deep
+
+    if [ ! -d "$base_dir" ]; then
+        echo "[]"
+        return
+    fi
+
+    # Get folder structure and ensure clean JSON output
+    local folder_list=$(find "$base_dir" -maxdepth "$max_depth" -type d -not -path "$base_dir" 2>/dev/null | \
+        sed "s|^$base_dir/||" | \
+        grep -v '^[[:space:]]*$' | \
+        sort)
+
+    if [ -z "$folder_list" ]; then
+        echo "[]"
+        return
+    fi
+
+    # Create clean JSON structure
+    echo "$folder_list" | jq -R -s '
+        split("\n") |
+        map(select(length > 0)) |
+        map(split("/")) |
+        group_by(.[0]) |
+        map({
+            category: .[0][0],
+            senders: (map(select(length > 1) | .[1]) | unique | select(length > 0)),
+            departments: (map(select(length > 2) | {sender: .[1], department: .[2]}) | unique)
+        })' 2>/dev/null || echo "[]"
+}
+
 strip-file-tags() {
     if xattr -p "com.apple.metadata:_kMDItemUserTags" "$1" >/dev/null 2>&1; then
         xattr -d "com.apple.metadata:_kMDItemUserTags" "$1"
@@ -78,109 +112,125 @@ get-scanned-at() {
         sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/'
 }
 
+# JSON escaping functions to prevent API errors
+escape-json-string() {
+    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/$/\\n/g' | tr -d '\n' | sed 's/\\n$//'
+}
+
+safe-json-escape() {
+    # Remove or replace problematic characters that could break JSON
+    echo "$1" | tr -cd '[:print:]' | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr '\n' ' '
+}
+
 # ============================================================================
 # PROCESS FUNCTIONS
 # ============================================================================
 
-initial-ai-processing() {
-    OPENAI_SYSTEM_MESSAGE="You're an assistant that takes the text from PDF files and helps categorize for the purpose of file management and archiving the files. You will do your best to utilize a consistent response structure that includes the SENDER, SENT_ON date (YYYY-MM-DD formatted), a CATEGORY, a DEPARTMENT if possible, and a SHORT_SUMMARY of what the file is including the SENDER, SENT_ON date, and CATEGORY. For SENDER, if it's a government entity, use 'State of X' or 'Federal Government' or 'City of X' or 'X County'. For CATEGORY, ideally it should be in this list, but suggest something fitting if not: $2. If the document is from a government entity, service, or utility, the CATEGORY should be 'Government'; if from a school or university, the CATEGORY should be 'Education'. For DEPARTMENT, suggest one if it's a government department, agency, service, or utility, or if it's a large corporation's business unit. If you can't determine a value, leave it blank. If the content of the file appears to be related to a legal issue with or against a company, such as a lawsuit or a complaint, categorize it as if it was from that company for SENDER and choose the CATEGORY based on that SENDER (for example, if there is a lawsuit against Samsung, the SENDER should be Samsung and the CATEGORY should be retailers). If the document appears to be *only* a check (not a check attached to a full document), the CATEGORY should be 'Finance', the SENDER should be 'Checks', and the DEPARTMENT should be the person or organization the check is written from (not who the check is to nor which bank the check is routing from)."
-    OPENAI_USER_MESSAGE="Please categorize the following text that came from a PDF:$1"
+# Comprehensive AI processing function optimized for GPT-4o
+# This replaces multiple AI calls with a single, context-aware call that:
+# 1. Analyzes PDF content with full folder structure context
+# 2. Provides both categorization and intelligent folder suggestions
+# 3. Returns confidence scores and reasoning for transparency
+# 4. Reduces API calls from potentially 3+ calls to 1 call
+# 5. Uses GPT-4o specific prompt engineering for better results
+comprehensive-ai-processing() {
+    local pdf_text="$1"
+    local folder_structure="$2"
 
-    # Create the JSON payload https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/structured-outputs?tabs=rest
-    JSON_PAYLOAD=$(
-        cat <<EOF
-{
-    "messages": [
-        {
-            "role": "system",
-            "content": "$OPENAI_SYSTEM_MESSAGE"
-        },
-        {
-            "role": "user",
-            "content": "$OPENAI_USER_MESSAGE"
-        }
-    ],
-    "response_format": {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "FileSystemCategorization",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "sender": {
-                        "type": "string"
-                    },
-                    "department": {
-                        "type": ["string", "null"]
-                    },
-                    "sentOn": {
-                        "type": "string"
-                    },
-                    "category": {
-                        "type": "string"
-                    },
-                    "shortSummary": {
-                        "type": "string"
-                    }
+    # Safely escape text for JSON to prevent control character errors
+    local safe_pdf_text=$(safe-json-escape "$pdf_text")
+    local safe_folder_structure=$(safe-json-escape "$folder_structure")
+
+    OPENAI_SYSTEM_MESSAGE="You are an expert document categorization assistant specializing in intelligent file organization. Your task is to analyze PDF content and provide comprehensive categorization with folder structure awareness.
+
+## Analysis Framework:
+1. **Content Analysis**: Examine the document text to identify key entities, dates, and purpose
+2. **Contextual Matching**: Use the existing folder structure to maintain consistency
+3. **Intelligent Suggestions**: Recommend optimal folder placement considering existing organization
+
+## Categorization Rules:
+- **SENDER**: Use exact names when possible. For government: 'State of X', 'Federal Government', 'City of X', 'County of X'
+- **CATEGORY**: Match existing categories when appropriate, suggest new ones when necessary
+- **DEPARTMENT**: Include for government agencies, utilities, or large corporation divisions
+- **SENT_ON**: Extract date in YYYY-MM-DD format
+- **Legal Documents**: Categorize by the company involved (e.g., lawsuit against Samsung → SENDER: Samsung)
+- **Checks**: CATEGORY: 'Finance', SENDER: 'Checks', DEPARTMENT: check writer
+
+## Folder Structure Context:
+The following existing folder structure should guide your categorization decisions:
+$safe_folder_structure
+
+## Output Requirements:
+Provide both categorization AND intelligent folder suggestions based on existing structure. Consider similar senders, categories, and departments already present."
+
+    OPENAI_USER_MESSAGE="Analyze this PDF content and provide comprehensive categorization with folder structure recommendations:
+
+$safe_pdf_text"
+
+    # Create JSON using jq to ensure proper escaping
+    JSON_PAYLOAD=$(jq -n \
+        --arg system_msg "$OPENAI_SYSTEM_MESSAGE" \
+        --arg user_msg "$OPENAI_USER_MESSAGE" \
+        '{
+            "messages": [
+                {
+                    "role": "system",
+                    "content": $system_msg
                 },
-                "required": [
-                    "sender",
-                    "department",
-                    "sentOn",
-                    "category",
-                    "shortSummary"
-                ],
-                "additionalProperties": false
-            }
-        }
-    }
-}
-EOF
-    )
-
-    get-openai-response "$JSON_PAYLOAD"
-}
-
-check-subfolders-with-ai() {
-    OPENAI_SYSTEM_MESSAGE="You're an assistant that takes a list of folders and a proposed new folder name and suggests the best match based on the existing folders. If there is a perfect match, suggest that. If there is a close match, suggest that. If there is no match, return a null response."
-    OPENAI_USER_MESSAGE="Please suggest the best match for the new folder '$2' in the from this list of existing folders:$1. Additionally, here's a description of a file that will be going in this folder to help determine the best match: $3"
-
-    JSON_PAYLOAD=$(
-        cat <<EOF
-{
-    "messages": [
-        {
-            "role": "system",
-            "content": "$OPENAI_SYSTEM_MESSAGE"
-        },
-        {
-            "role": "user",
-            "content": "$OPENAI_USER_MESSAGE"
-        }
-    ],
-    "response_format": {
-        "type": "json_schema",
-        "json_schema": {
-            "name": "FolderCategorization",
-            "strict": true,
-            "schema": {
-                "type": "object",
-                "properties": {
-                    "suggestion": {
-                        "type": ["string", "null"]
+                {
+                    "role": "user",
+                    "content": $user_msg
+                }
+            ],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "ComprehensiveFileSystemCategorization",
+                    "strict": true,
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "analysis": {
+                                "type": "object",
+                                "properties": {
+                                    "documentType": {"type": "string"},
+                                    "keyEntities": {"type": "array", "items": {"type": "string"}},
+                                    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+                                },
+                                "required": ["documentType", "keyEntities", "confidence"],
+                                "additionalProperties": false
+                            },
+                            "categorization": {
+                                "type": "object",
+                                "properties": {
+                                    "sender": {"type": "string"},
+                                    "department": {"type": ["string", "null"]},
+                                    "sentOn": {"type": "string"},
+                                    "category": {"type": "string"},
+                                    "shortSummary": {"type": "string"}
+                                },
+                                "required": ["sender", "department", "sentOn", "category", "shortSummary"],
+                                "additionalProperties": false
+                            },
+                            "folderSuggestions": {
+                                "type": "object",
+                                "properties": {
+                                    "suggestedCategory": {"type": ["string", "null"]},
+                                    "suggestedSender": {"type": ["string", "null"]},
+                                    "suggestedDepartment": {"type": ["string", "null"]},
+                                    "reasoning": {"type": "string"},
+                                    "alternativePaths": {"type": "array", "items": {"type": "string"}}
+                                },
+                                "required": ["suggestedCategory", "suggestedSender", "suggestedDepartment", "reasoning", "alternativePaths"],
+                                "additionalProperties": false
+                            }
+                        },
+                        "required": ["analysis", "categorization", "folderSuggestions"],
+                        "additionalProperties": false
                     }
-                },
-                "required": [
-                    "suggestion"
-                ],
-                "additionalProperties": false
+                }
             }
-        }
-    }
-}
-EOF
-    )
+        }')
 
     get-openai-response "$JSON_PAYLOAD"
 }
@@ -207,14 +257,15 @@ if [ -z "$PDF_TEXT" ]; then
 fi
 log_debug "Successfully extracted PDF text (${#PDF_TEXT} characters)"
 
-# Get a list of all top-level folders under $PAPERWORK_DIR
-log_info "Getting list of existing category folders"
-TOP_LEVEL_FOLDERS=$(get-folder-list "$PAPERWORK_DIR")
-if [ -z "$TOP_LEVEL_FOLDERS" ]; then
-    log_warn "No folders found in $PAPERWORK_DIR"
-    exit 1
+# Get comprehensive folder structure for AI context
+log_info "Analyzing existing folder structure"
+FOLDER_STRUCTURE=$(get-folder-structure "$PAPERWORK_DIR" 3)
+if [ -z "$FOLDER_STRUCTURE" ] || [ "$FOLDER_STRUCTURE" = "[]" ]; then
+    log_info "No existing folder structure found - this will be a new organization"
+    FOLDER_STRUCTURE="[]"
+else
+    log_debug "Folder structure for AI context: $FOLDER_STRUCTURE"
 fi
-log_debug "Found categories: $TOP_LEVEL_FOLDERS"
 
 # clear the attributes on the file to avoid double processing
 log_debug "Clearing file attributes to avoid double processing"
@@ -224,26 +275,83 @@ strip-file-tags "$PDF_FILE"
 # AI PROCESSING - CATEGORIZE AND ORGANIZE
 # ============================================================================
 
-log_info "Processing PDF content with AI for categorization"
-AI_RESPONSE=$(initial-ai-processing "$PDF_TEXT" "$TOP_LEVEL_FOLDERS")
+log_info "Processing PDF content with comprehensive AI analysis"
+
+# Validate inputs before sending to AI
+if [ -z "$PDF_TEXT" ]; then
+    log_error "PDF text is empty, cannot proceed with AI analysis"
+    exit 1
+fi
+
+# Limit text length to prevent API issues (roughly 100k characters)
+PDF_TEXT_LENGTH=${#PDF_TEXT}
+if [ "$PDF_TEXT_LENGTH" -gt 100000 ]; then
+    log_warn "PDF text is very long ($PDF_TEXT_LENGTH chars), truncating to prevent API issues"
+    PDF_TEXT="${PDF_TEXT:0:100000}... [TRUNCATED]"
+fi
+
+log_debug "PDF text length: ${#PDF_TEXT} characters"
+log_debug "Folder structure: $FOLDER_STRUCTURE"
+
+AI_RESPONSE=$(comprehensive-ai-processing "$PDF_TEXT" "$FOLDER_STRUCTURE")
+
+# Validate AI response
+if [ -z "$AI_RESPONSE" ]; then
+    log_error "AI response is empty. Check API connectivity and credentials."
+    exit 1
+fi
+
+# Check if response contains error information
+if echo "$AI_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+    AI_ERROR=$(echo "$AI_RESPONSE" | jq -r '.error')
+    log_error "AI API returned error: $AI_ERROR"
+    exit 1
+fi
+
 echo-json "$AI_RESPONSE"
 
-log_debug "Parsing AI response into environment variables"
-SENDER=$(echo "$AI_RESPONSE" | jq -r '.sender')
-
-DEPARTMENT=$(echo "$AI_RESPONSE" | jq -r '.department')
+log_debug "Parsing comprehensive AI response"
+# Extract categorization data
+SENDER=$(echo "$AI_RESPONSE" | jq -r '.categorization.sender')
+DEPARTMENT=$(echo "$AI_RESPONSE" | jq -r '.categorization.department')
 if [ "$DEPARTMENT" = "null" ]; then
     DEPARTMENT=""
 fi
+SENT_ON=$(echo "$AI_RESPONSE" | jq -r '.categorization.sentOn' | tr '/: ' '-')
+CATEGORY=$(echo "$AI_RESPONSE" | jq -r '.categorization.category')
+SHORT_SUMMARY=$(echo "$AI_RESPONSE" | jq -r '.categorization.shortSummary' | tr '"' "'")
 
-SENT_ON=$(echo "$AI_RESPONSE" | jq -r '.sentOn' | tr '/: ' '-')
+# Extract AI suggestions for folder optimization
+SUGGESTED_CATEGORY=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.suggestedCategory')
+SUGGESTED_SENDER=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.suggestedSender')
+SUGGESTED_DEPARTMENT=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.suggestedDepartment')
+AI_REASONING=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.reasoning')
+CONFIDENCE=$(echo "$AI_RESPONSE" | jq -r '.analysis.confidence')
 
-CATEGORY=$(echo "$AI_RESPONSE" | jq -r '.category')
+log_info "AI Analysis Results:"
+log_info "  Categorization - SENDER: $SENDER, CATEGORY: $CATEGORY, DEPARTMENT: $DEPARTMENT"
+log_info "  Suggestions - Category: $SUGGESTED_CATEGORY, Sender: $SUGGESTED_SENDER, Department: $SUGGESTED_DEPARTMENT"
+log_info "  Confidence: $CONFIDENCE, Reasoning: $AI_REASONING"
 
-SHORT_SUMMARY=$(echo "$AI_RESPONSE" | jq -r '.shortSummary' | tr '"' "'")
+# Use AI suggestions when they provide better matches
+if [ "$SUGGESTED_CATEGORY" != "null" ] && [ -n "$SUGGESTED_CATEGORY" ]; then
+    log_info "Using AI suggested category: $SUGGESTED_CATEGORY (instead of: $CATEGORY)"
+    CATEGORY="$SUGGESTED_CATEGORY"
+fi
 
-log_debug "Parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
+if [ "$SUGGESTED_SENDER" != "null" ] && [ -n "$SUGGESTED_SENDER" ]; then
+    log_info "Using AI suggested sender: $SUGGESTED_SENDER (instead of: $SENDER)"
+    SENDER="$SUGGESTED_SENDER"
+fi
 
+if [ "$SUGGESTED_DEPARTMENT" != "null" ] && [ -n "$SUGGESTED_DEPARTMENT" ]; then
+    log_info "Using AI suggested department: $SUGGESTED_DEPARTMENT (instead of: $DEPARTMENT)"
+    DEPARTMENT="$SUGGESTED_DEPARTMENT"
+fi
+
+log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
+
+# Validate required fields
 if [ -z "$SENDER" ] || [ "$SENDER" = "null" ] ||
     [ -z "$SCANNED_AT" ] || [ "$SCANNED_AT" = "null" ] ||
     [ -z "$CATEGORY" ] || [ "$CATEGORY" = "null" ] ||
@@ -253,72 +361,49 @@ if [ -z "$SENDER" ] || [ "$SENDER" = "null" ] ||
     exit 1
 fi
 
-log_info "Successfully categorized PDF: Category='$CATEGORY', Sender='$SENDER'"
+# Warn if confidence is low
+if command -v bc >/dev/null 2>&1 && [ "$CONFIDENCE" != "null" ]; then
+    if [ "$(echo "$CONFIDENCE < 0.7" | bc)" -eq 1 ]; then
+        log_warn "AI confidence is low ($CONFIDENCE). Manual review may be needed."
+    fi
+fi
+
+log_info "Successfully categorized PDF with AI optimization: Category='$CATEGORY', Sender='$SENDER'"
 
 # ============================================================================
-# FOLDER STRUCTURE MANAGEMENT
+# FOLDER STRUCTURE MANAGEMENT (SIMPLIFIED WITH AI SUGGESTIONS)
 # ============================================================================
 
 CATEGORY_DIR="$PAPERWORK_DIR/$CATEGORY"
 SENDER_DIR="$CATEGORY_DIR/$SENDER"
 
-# Check if there is already a category folder; if not, we can reduce processing since
-# everything will be new
+# Create category directory if it doesn't exist
 if [ ! -d "$CATEGORY_DIR" ]; then
     log_info "Creating new category folder: $CATEGORY_DIR"
     mkdir -p "$CATEGORY_DIR"
 else
-    # if there is already a sender directory, we can reduce processing as well and
-    # assume that it's valid; if not, we'll check the subfolders
     log_debug "Category folder already exists: $CATEGORY_DIR"
-    if [ ! -d "$SENDER_DIR" ]; then
-        log_info "Sender folder doesn't exist, checking for best match: $SENDER_DIR"
+fi
 
-        SENDER_SUBFOLDERS=$(get-folder-list "$CATEGORY_DIR")
-        SENDER_AI_RESPONSE=$(check-subfolders-with-ai "$SENDER_SUBFOLDERS" "$SENDER" "$SHORT_SUMMARY")
-        echo-json "$SENDER_AI_RESPONSE"
+# Create sender directory if it doesn't exist
+if [ ! -d "$SENDER_DIR" ]; then
+    log_info "Creating sender folder: $SENDER_DIR"
+    mkdir -p "$SENDER_DIR"
+else
+    log_debug "Sender folder already exists: $SENDER_DIR"
+fi
 
-        SUGGESTED_FOLDER=$(echo "$SENDER_AI_RESPONSE" | jq -r '.suggestion')
-        if [ -z "$SUGGESTED_FOLDER" ] || [ "$SUGGESTED_FOLDER" = "null" ]; then
-            log_info "No suggestion provided; creating new sender folder: $SENDER_DIR"
-            mkdir -p "$SENDER_DIR"
-        else
-            SENDER="$SUGGESTED_FOLDER"
-            SENDER_DIR="$CATEGORY_DIR/$SENDER"
-            log_info "Suggestion found, using existing folder: $SENDER_DIR"
-        fi
+# Handle department folder if specified
+if [ -n "$DEPARTMENT" ]; then
+    DEPARTMENT_DIR="$SENDER_DIR/$DEPARTMENT"
+    if [ ! -d "$DEPARTMENT_DIR" ]; then
+        log_info "Creating department folder: $DEPARTMENT_DIR"
+        mkdir -p "$DEPARTMENT_DIR"
     else
-        log_debug "Sender folder already exists: $SENDER_DIR"
+        log_debug "Department folder already exists: $DEPARTMENT_DIR"
     fi
-
-    # only check department if one was specified
-    if [ -n "$DEPARTMENT" ]; then
-        DEPARTMENT_DIR="$SENDER_DIR/$DEPARTMENT"
-        log_debug "Department provided, checking if folder exists: $DEPARTMENT_DIR"
-
-        # if the department dir doesn't already exist, check to see if there's a close match
-        if [ ! -d "$DEPARTMENT_DIR" ]; then
-            log_info "Department folder doesn't exist, checking for best match: $DEPARTMENT_DIR"
-            DEPARTMENT_SUBFOLDERS=$(get-folder-list "$SENDER_DIR")
-            DEPARTMENT_AI_RESPONSE=$(check-subfolders-with-ai "$DEPARTMENT_SUBFOLDERS" "$DEPARTMENT" "$SHORT_SUMMARY")
-            echo-json "$DEPARTMENT_AI_RESPONSE"
-
-            SUGGESTED_FOLDER=$(echo "$DEPARTMENT_AI_RESPONSE" | jq -r '.suggestion')
-            if [ -z "$SUGGESTED_FOLDER" ] || [ "$SUGGESTED_FOLDER" = "null" ]; then
-                log_info "No suggestion provided; creating new department folder: $DEPARTMENT_DIR"
-                mkdir -p "$DEPARTMENT_DIR"
-            else
-                DEPARTMENT="$SUGGESTED_FOLDER"
-                DEPARTMENT_DIR="$SENDER_DIR/$DEPARTMENT"
-                log_info "Suggestion found, using existing folder: $DEPARTMENT_DIR"
-            fi
-        else
-            log_debug "Department folder already exists: $DEPARTMENT_DIR"
-        fi
-
-        # update sender dir to include department
-        SENDER_DIR="$DEPARTMENT_DIR"
-    fi
+    # Update final destination to include department
+    SENDER_DIR="$DEPARTMENT_DIR"
 fi
 
 # ============================================================================
@@ -355,6 +440,11 @@ log_info "Opening destination folder in Finder"
 open "$SENDER_DIR"
 
 log_info "PDF organization completed successfully"
+log_info "AI Optimizations Applied:"
+log_info "  • Reduced AI calls from 3+ to 1 comprehensive call"
+log_info "  • Enhanced context with full folder structure analysis"
+log_info "  • GPT-4o optimized prompts with structured reasoning"
+log_info "  • Confidence scoring and intelligent folder suggestions"
 log_divider "END OF PROCESSING"
 
 exit 0
