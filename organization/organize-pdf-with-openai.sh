@@ -204,32 +204,43 @@ set_finder_comments() {
 
 extract_scanned_timestamp() {
     local filename="$1"
+    log_debug "Extracting scanned timestamp from filename: $filename"
 
     # Try new format first: scan-YYYYMMDD (e.g., scan-20231206)
     local new_format_match
-    new_format_match=$(echo "$filename" | grep -oE 'scan-([0-9]{8})' | sed 's/scan-//')
+    new_format_match=$(echo "$filename" | grep -oE 'scan-([0-9]{8})' | sed 's/scan-//' || true)
+    log_debug "New format scan-YYYYMMDD pattern search result: '$new_format_match'"
 
     if [[ -n "$new_format_match" ]]; then
+        log_info "Found new format timestamp pattern: scan-$new_format_match"
         # Convert YYYYMMDD to YYYY-MM-DDTHH-MM-SS format (use 00-00-00 for time since we don't have it)
         local year="${new_format_match:0:4}"
         local month="${new_format_match:4:2}"
         local day="${new_format_match:6:2}"
-        echo "${year}-${month}-${day}T00-00-00"
+        local formatted_timestamp="${year}-${month}-${day}T00-00-00"
+        log_info "Converted new format timestamp to: $formatted_timestamp"
+        echo "$formatted_timestamp"
         return 0
     fi
 
     # Fallback to old format: YYYY-MM-DD[T]HH-MM-SS anywhere in filename
+    log_debug "New format not found, trying old format: YYYY-MM-DD[T]HH-MM-SS"
     local old_format_match
     old_format_match=$(echo "$filename" |
         grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' |
-        sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/')
+        sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/' || true)
+    log_debug "Old format YYYY-MM-DD[T]HH-MM-SS pattern search result: '$old_format_match'"
 
     if [[ -n "$old_format_match" ]]; then
+        log_info "Found old format timestamp: $old_format_match"
         echo "$old_format_match"
         return 0
     fi
 
-    # If neither format is found, return empty (will trigger error in calling function)
+    # If neither format is found, log error but don't exit (let calling function handle it)
+    log_error "No timestamp pattern found in filename: $filename"
+    log_error "Expected patterns: 'scan-YYYYMMDD' or 'YYYY-MM-DD[T]HH-MM-SS'"
+    log_error "Please ensure the filename contains a valid timestamp pattern"
     echo ""
     return 1
 }
@@ -683,14 +694,20 @@ prepare_initial_data() {
     log_info "Starting PDF organization for: $(basename "$PDF_FILE")"
 
     # Extract the date from the filename (should be in format 2023-12-06T10-40-27)
-    SCANNED_AT=$(extract_scanned_timestamp "$PDF_FILE")
+    log_debug "Attempting to extract scanned timestamp from filename"
+    SCANNED_AT=$(extract_scanned_timestamp "$PDF_FILE" || true)
     if [[ -z "$SCANNED_AT" ]]; then
-        log_error "Scanned DateTime not found in the filename $PDF_FILE"
+        log_error "Critical error: Scanned DateTime not found in the filename '$PDF_FILE'"
+        log_error "The filename must contain either:"
+        log_error "  - New format: scan-YYYYMMDD (e.g., scan-20231206)"
+        log_error "  - Old format: YYYY-MM-DD[T]HH-MM-SS (e.g., 2023-12-06T10-40-27)"
+        log_error "Please rename the file to include a valid timestamp and try again"
         exit 1
     fi
-    log_debug "Extracted scanned timestamp: $SCANNED_AT"
+    log_info "Successfully extracted scanned timestamp: $SCANNED_AT"
 
     # Extract text from PDF
+    log_info "Proceeding with PDF text extraction"
     PDF_TEXT=$(extract_pdf_text "$PDF_FILE")
     log_debug "PDF text length: ${#PDF_TEXT} characters"
 
