@@ -252,8 +252,31 @@ log_debug "Extracted scanned timestamp: $SCANNED_AT"
 log_info "Extracting text from PDF file"
 PDF_TEXT=$(get-pdf-text "$PDF_FILE")
 if [ -z "$PDF_TEXT" ]; then
-    log_error "Failed to extract and/or sanitize text from the PDF"
-    exit 1
+    log_warn "Initial text extraction failed, attempting OCR processing..."
+
+    # Call the OCR script to process the PDF
+    OCR_SCRIPT="$SCRIPT_DIR/../media/pdf-ocr-text.sh"
+    if [ -f "$OCR_SCRIPT" ]; then
+        log_info "Running OCR processing on PDF: $OCR_SCRIPT"
+        if "$OCR_SCRIPT" "$PDF_FILE"; then
+            log_info "OCR processing completed, retrying text extraction"
+            PDF_TEXT=$(get-pdf-text "$PDF_FILE")
+
+            if [ -z "$PDF_TEXT" ]; then
+                log_error "Failed to extract text even after OCR processing"
+                exit 1
+            else
+                log_info "Successfully extracted text after OCR processing"
+            fi
+        else
+            log_error "OCR processing failed"
+            exit 1
+        fi
+    else
+        log_error "OCR script not found at $OCR_SCRIPT"
+        log_error "Failed to extract and/or sanitize text from the PDF"
+        exit 1
+    fi
 fi
 log_debug "Successfully extracted PDF text (${#PDF_TEXT} characters)"
 
@@ -440,11 +463,7 @@ log_info "Opening destination folder in Finder"
 open "$SENDER_DIR"
 
 log_info "PDF organization completed successfully"
-log_info "AI Optimizations Applied:"
-log_info "  • Reduced AI calls from 3+ to 1 comprehensive call"
-log_info "  • Enhanced context with full folder structure analysis"
-log_info "  • GPT-4o optimized prompts with structured reasoning"
-log_info "  • Confidence scoring and intelligent folder suggestions"
+
 log_divider "END OF PROCESSING"
 
 exit 0
