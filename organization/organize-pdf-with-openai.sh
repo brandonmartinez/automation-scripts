@@ -31,6 +31,7 @@ declare -g PDF_TEXT=""
 declare -g FOLDER_STRUCTURE=""
 declare -g AI_RESPONSE=""
 declare -g MOVE_FILE=false
+declare -g ADDITIONAL_CONTEXT=""
 
 # ============================================================================
 # INITIALIZATION AND VALIDATION
@@ -103,17 +104,15 @@ setup_environment() {
     source "$SCRIPT_DIR/../utilities/logging.sh"
     set_log_level "$LOG_LEVEL_NAME"
 
-    # Log header to mark new session start
-    log_header "organize-pdf-with-openai.sh"
-}
-
-source_dependencies() {
     log_info "Sourcing Open AI Helpers from $SCRIPT_DIR"
     if [[ ! -f "$SCRIPT_DIR/../ai/open-ai-functions.sh" ]]; then
         log_error "OpenAI functions not found at $SCRIPT_DIR/../ai/open-ai-functions.sh"
         exit 1
     fi
     source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
+
+    # Log header to mark new session start
+    log_header "organize-pdf-with-openai.sh"
 }
 
 # ============================================================================
@@ -141,6 +140,8 @@ get_folder_structure() {
         return
     fi
 
+    log_debug "Found folder structure: $folder_list"
+
     # Create clean JSON structure
     echo "$folder_list" | jq -R -s '
         split("\n") |
@@ -156,8 +157,41 @@ get_folder_structure() {
 
 strip_file_tags() {
     local file_path="$1"
-    if xattr -p "com.apple.metadata:_kMDItemUserTags" "$file_path" >/dev/null 2>&1; then
-        xattr -d "com.apple.metadata:_kMDItemUserTags" "$file_path"
+
+    # Use tag command if available (handles all extended attributes automatically)
+    if command -v tag >/dev/null 2>&1; then
+        log_debug "Using 'tag' command to clear all tags and extended attributes"
+        tag -r "*" "$file_path" 2>/dev/null || true
+    else
+        # Fallback: Manual extended attribute removal when tag command is not available
+        log_debug "Using manual extended attribute removal (tag command not available)"
+        local tag_attributes=(
+            "com.apple.metadata:_kMDItemUserTags"
+            "com.apple.metadata:kMDItemUserTags"
+            "com.apple.FinderInfo"
+            "com.apple.metadata:_kMDItemFinderComment"
+        )
+
+        for attr in "${tag_attributes[@]}"; do
+            if xattr -p "$attr" "$file_path" >/dev/null 2>&1; then
+                log_debug "Removing extended attribute: $attr"
+                xattr -d "$attr" "$file_path" 2>/dev/null || true
+            fi
+        done
+
+        # Additional AppleScript fallback for Finder labels
+        log_debug "Using AppleScript fallback to clear Finder labels"
+        osascript -e "
+            try
+                tell application \"Finder\"
+                    set theFile to POSIX file \"$file_path\" as alias
+                    set label index of theFile to 0
+                    set comment of theFile to \"\"
+                end tell
+            on error
+                -- Ignore errors if file is not accessible
+            end try
+        " 2>/dev/null || true
     fi
 }
 
@@ -169,9 +203,34 @@ set_finder_comments() {
 
 extract_scanned_timestamp() {
     local filename="$1"
-    echo "$filename" | \
+
+    # Try new format first: scan-YYYYMMDD (e.g., scan-20231206)
+    local new_format_match
+    new_format_match=$(echo "$filename" | grep -oE 'scan-([0-9]{8})' | sed 's/scan-//')
+
+    if [[ -n "$new_format_match" ]]; then
+        # Convert YYYYMMDD to YYYY-MM-DDTHH-MM-SS format (use 00-00-00 for time since we don't have it)
+        local year="${new_format_match:0:4}"
+        local month="${new_format_match:4:2}"
+        local day="${new_format_match:6:2}"
+        echo "${year}-${month}-${day}T00-00-00"
+        return 0
+    fi
+
+    # Fallback to old format: YYYY-MM-DD[T]HH-MM-SS anywhere in filename
+    local old_format_match
+    old_format_match=$(echo "$filename" | \
         grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' | \
-        sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/'
+        sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/')
+
+    if [[ -n "$old_format_match" ]]; then
+        echo "$old_format_match"
+        return 0
+    fi
+
+    # If neither format is found, return empty (will trigger error in calling function)
+    echo ""
+    return 1
 }
 
 safe_json_escape() {
@@ -305,10 +364,19 @@ process_pdf_with_ai() {
 ## Categorization Rules:
 - **SENDER**: Use exact names when possible. For government: 'State of X', 'Federal Government', 'City of X', 'County of X'
 - **CATEGORY**: Match existing categories when appropriate, suggest new ones when necessary
-- **DEPARTMENT**: Include for government agencies, utilities, or large corporation divisions
+- **DEPARTMENT**: Only include for government organizations (federal, state, local agencies). Leave null for private companies, individuals, and non-government entities
+- **ADDITIONAL_CONTEXT**: Use for key identifying details that aid in organization and searchability:
+  • **Financial**: Check writer name, account numbers (last 4 digits), loan numbers, claim numbers
+  • **Medical**: Doctor name, patient name, procedure type, appointment date
+  • **Legal**: Case number, attorney name, court name, opposing party
+  • **Insurance**: Policy number, claim number, agent name, coverage type
+  • **Real Estate**: Property address, MLS number, agent name, transaction type
+  • **Employment**: Employee ID, position title, department name, manager name
+  • **Education**: Student name, course name, semester/year, institution
+  • **Personal**: Contact name, event type, reference number, project name
 - **SENT_ON**: Extract date in YYYY-MM-DD format
 - **Legal Documents**: Categorize by the company involved (e.g., lawsuit against Samsung → SENDER: Samsung)
-- **Checks**: CATEGORY: 'Finance', SENDER: 'Checks', DEPARTMENT: check writer
+- **Checks**: CATEGORY: 'Finance', SENDER: 'Checks', DEPARTMENT: null, ADDITIONAL_CONTEXT: check writer name
 
 ## Folder Structure Context:
 The following existing folder structure should guide your categorization decisions:
@@ -361,11 +429,12 @@ $safe_pdf_text"
                                 "properties": {
                                     "sender": {"type": "string"},
                                     "department": {"type": ["string", "null"]},
+                                    "additionalContext": {"type": ["string", "null"]},
                                     "sentOn": {"type": "string"},
                                     "category": {"type": "string"},
                                     "shortSummary": {"type": "string"}
                                 },
-                                "required": ["sender", "department", "sentOn", "category", "shortSummary"],
+                                "required": ["sender", "department", "additionalContext", "sentOn", "category", "shortSummary"],
                                 "additionalProperties": false
                             },
                             "folderSuggestions": {
@@ -374,10 +443,11 @@ $safe_pdf_text"
                                     "suggestedCategory": {"type": ["string", "null"]},
                                     "suggestedSender": {"type": ["string", "null"]},
                                     "suggestedDepartment": {"type": ["string", "null"]},
+                                    "suggestedAdditionalContext": {"type": ["string", "null"]},
                                     "reasoning": {"type": "string"},
                                     "alternativePaths": {"type": "array", "items": {"type": "string"}}
                                 },
-                                "required": ["suggestedCategory", "suggestedSender", "suggestedDepartment", "reasoning", "alternativePaths"],
+                                "required": ["suggestedCategory", "suggestedSender", "suggestedDepartment", "suggestedAdditionalContext", "reasoning", "alternativePaths"],
                                 "additionalProperties": false
                             }
                         },
@@ -414,21 +484,26 @@ extract_categorization_data() {
     log_debug "Parsing comprehensive AI response"
 
     # Extract categorization data
-    local sender department sent_on category short_summary
+    local sender department additional_context sent_on category short_summary
     sender=$(echo "$response" | jq -r '.categorization.sender')
     department=$(echo "$response" | jq -r '.categorization.department')
+    additional_context=$(echo "$response" | jq -r '.categorization.additionalContext')
     sent_on=$(echo "$response" | jq -r '.categorization.sentOn' | tr '/: ' '-')
     category=$(echo "$response" | jq -r '.categorization.category')
     short_summary=$(echo "$response" | jq -r '.categorization.shortSummary' | tr '"' "'")
 
-    # Handle null department
+    # Handle null values
     if [[ "$department" == "null" ]]; then
         department=""
+    fi
+    if [[ "$additional_context" == "null" ]]; then
+        additional_context=""
     fi
 
     # Set global variables for use in other functions
     declare -g SENDER="$sender"
     declare -g DEPARTMENT="$department"
+    declare -g ADDITIONAL_CONTEXT="$additional_context"
     declare -g SENT_ON="$sent_on"
     declare -g CATEGORY="$category"
     declare -g SHORT_SUMMARY="$short_summary"
@@ -438,16 +513,17 @@ apply_ai_suggestions() {
     local response="$1"
 
     # Extract AI suggestions for folder optimization
-    local suggested_category suggested_sender suggested_department ai_reasoning confidence
+    local suggested_category suggested_sender suggested_department suggested_additional_context ai_reasoning confidence
     suggested_category=$(echo "$response" | jq -r '.folderSuggestions.suggestedCategory')
     suggested_sender=$(echo "$response" | jq -r '.folderSuggestions.suggestedSender')
     suggested_department=$(echo "$response" | jq -r '.folderSuggestions.suggestedDepartment')
+    suggested_additional_context=$(echo "$response" | jq -r '.folderSuggestions.suggestedAdditionalContext')
     ai_reasoning=$(echo "$response" | jq -r '.folderSuggestions.reasoning')
     confidence=$(echo "$response" | jq -r '.analysis.confidence')
 
     log_info "AI Analysis Results:"
-    log_info "  Categorization - SENDER: $SENDER, CATEGORY: $CATEGORY, DEPARTMENT: $DEPARTMENT"
-    log_info "  Suggestions - Category: $suggested_category, Sender: $suggested_sender, Department: $suggested_department"
+    log_info "  Categorization - SENDER: $SENDER, CATEGORY: $CATEGORY, DEPARTMENT: $DEPARTMENT, ADDITIONAL_CONTEXT: $ADDITIONAL_CONTEXT"
+    log_info "  Suggestions - Category: $suggested_category, Sender: $suggested_sender, Department: $suggested_department, Additional Context: $suggested_additional_context"
     log_info "  Confidence: $confidence, Reasoning: $ai_reasoning"
 
     # Use AI suggestions when they provide better matches
@@ -466,9 +542,14 @@ apply_ai_suggestions() {
         DEPARTMENT="$suggested_department"
     fi
 
+    if [[ "$suggested_additional_context" != "null" && -n "$suggested_additional_context" ]]; then
+        log_info "Using AI suggested additional context: $suggested_additional_context (instead of: $ADDITIONAL_CONTEXT)"
+        ADDITIONAL_CONTEXT="$suggested_additional_context"
+    fi
+
     check_confidence_level "$confidence"
 
-    log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
+    log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, ADDITIONAL_CONTEXT: $ADDITIONAL_CONTEXT, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
 }
 
 # ============================================================================
@@ -519,15 +600,74 @@ generate_unique_filename() {
     local destination_dir="$1"
     local sender_sanitized="$2"
     local department_sanitized="$3"
-    local scanned_at="$4"
-    local sent_on="$5"
+    local additional_context_sanitized="$4"
+    local scanned_at="$5"
+    local sent_on="$6"
 
-    local base_filename="$sender_sanitized$department_sanitized-$scanned_at-senton-$sent_on.pdf"
+    # macOS filename limit (255 characters)
+    local max_filename_length=255
+
+    # Format scan date to remove colons and T (YYYY-MM-DDTXX-XX-XX -> YYYYMMDD)
+    local scan_date_formatted
+    scan_date_formatted=$(echo "$scanned_at" | sed 's/T.*//' | tr -d '-')
+
+    # Build filename components with fallback options
+    local sender_part="$sender_sanitized$department_sanitized$additional_context_sanitized"
+    local base_filename="${sent_on}_${sender_part}_scan-${scan_date_formatted}.pdf"
+
+    # Check if filename is too long and create shorter versions if needed
+    if [[ ${#base_filename} -gt $max_filename_length ]]; then
+        log_warn "Filename too long (${#base_filename} chars), creating shorter version"
+
+        # Fallback 1: Remove additional context
+        if [[ -n "$additional_context_sanitized" ]]; then
+            sender_part="$sender_sanitized$department_sanitized"
+            base_filename="${sent_on}_${sender_part}_scan-${scan_date_formatted}.pdf"
+            log_info "Removed additional context: new length ${#base_filename} chars"
+        fi
+
+        # Fallback 2: Remove department if still too long
+        if [[ ${#base_filename} -gt $max_filename_length && -n "$department_sanitized" ]]; then
+            sender_part="$sender_sanitized"
+            base_filename="${sent_on}_${sender_part}_scan-${scan_date_formatted}.pdf"
+            log_info "Removed department: new length ${#base_filename} chars"
+        fi
+
+        # Fallback 3: Truncate sender name if still too long
+        if [[ ${#base_filename} -gt $max_filename_length ]]; then
+            local fixed_part="${sent_on}__scan-${scan_date_formatted}.pdf"
+            local available_length=$((max_filename_length - ${#fixed_part}))
+            if [[ $available_length -gt 0 ]]; then
+                sender_part="${sender_sanitized:0:$available_length}"
+                base_filename="${sent_on}_${sender_part}_scan-${scan_date_formatted}.pdf"
+                log_info "Truncated sender name: new length ${#base_filename} chars"
+            else
+                # Last resort: use minimal filename
+                base_filename="${sent_on}_scan-${scan_date_formatted}.pdf"
+                log_warn "Using minimal filename: ${base_filename}"
+            fi
+        fi
+    fi
+
     local new_file="$destination_dir/$base_filename"
 
+    # Handle duplicates with counter, ensuring we don't exceed length limit
     local counter=1
     while [[ -e "$new_file" ]]; do
-        new_file="$destination_dir/$sender_sanitized$department_sanitized-$scanned_at-senton-$sent_on-$(printf "%03d" $counter).pdf"
+        local counter_suffix="-$(printf "%03d" $counter)"
+        local base_without_extension="${base_filename%.pdf}"
+        local filename_with_counter="${base_without_extension}${counter_suffix}.pdf"
+
+        # If counter makes filename too long, truncate the base part
+        if [[ ${#filename_with_counter} -gt $max_filename_length ]]; then
+            local extension=".pdf"
+            local available_for_base=$((max_filename_length - ${#counter_suffix} - ${#extension}))
+            base_without_extension="${base_without_extension:0:$available_for_base}"
+            filename_with_counter="${base_without_extension}${counter_suffix}${extension}"
+            log_info "Truncated base filename to accommodate counter: ${filename_with_counter}"
+        fi
+
+        new_file="$destination_dir/$filename_with_counter"
         counter=$((counter + 1))
     done
 
@@ -597,9 +737,10 @@ organize_and_move_file() {
     destination_dir=$(create_folder_structure "$CATEGORY" "$SENDER" "$DEPARTMENT")
 
     # Create sanitized versions for file names
-    local sender_sanitized department_sanitized
+    local sender_sanitized department_sanitized additional_context_sanitized
     sender_sanitized=$(sanitize-text "$SENDER")
     department_sanitized=$(sanitize-text "$DEPARTMENT")
+    additional_context_sanitized=$(sanitize-text "$ADDITIONAL_CONTEXT")
 
     if [[ -n "$department_sanitized" && "$department_sanitized" != "null" ]]; then
         department_sanitized="-${department_sanitized}"
@@ -607,9 +748,15 @@ organize_and_move_file() {
         department_sanitized=""
     fi
 
+    if [[ -n "$additional_context_sanitized" && "$additional_context_sanitized" != "null" ]]; then
+        additional_context_sanitized="-${additional_context_sanitized}"
+    else
+        additional_context_sanitized=""
+    fi
+
     # Generate unique filename
     local new_file
-    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$SCANNED_AT" "$SENT_ON")
+    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$additional_context_sanitized" "$SCANNED_AT" "$SENT_ON")
 
     log_info "Final file destination: $(basename "$new_file")"
     log_debug "Full path: $new_file"
@@ -642,7 +789,6 @@ main() {
     # Initialize and validate
     validate_arguments "$@"
     setup_environment
-    source_dependencies
 
     # Process the PDF
     prepare_initial_data
