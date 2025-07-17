@@ -1,0 +1,8 @@
+{
+  "recommendations": [
+    "editorconfig.editorconfig",
+    "timonwong.shellcheck",
+    "foxundermoon.shell-format",
+    "ms-vscode.vscode-json"
+  ]
+}

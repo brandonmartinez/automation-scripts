@@ -49,33 +49,33 @@ validate_arguments() {
     # Parse arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            --move)
-                MOVE_FILE=true
-                shift
-                ;;
-            --help|-h)
-                echo "Usage: $0 [--move] <pdf_file_path>" >&2
-                echo "Organizes PDF files using AI categorization" >&2
-                echo "" >&2
-                echo "Options:" >&2
-                echo "  --move    Move the file instead of copying it" >&2
-                echo "  --help    Show this help message" >&2
-                exit 0
-                ;;
-            -*)
-                echo "Unknown option: $1" >&2
-                echo "Use --help for usage information" >&2
+        --move)
+            MOVE_FILE=true
+            shift
+            ;;
+        --help | -h)
+            echo "Usage: $0 [--move] <pdf_file_path>" >&2
+            echo "Organizes PDF files using AI categorization" >&2
+            echo "" >&2
+            echo "Options:" >&2
+            echo "  --move    Move the file instead of copying it" >&2
+            echo "  --help    Show this help message" >&2
+            exit 0
+            ;;
+        -*)
+            echo "Unknown option: $1" >&2
+            echo "Use --help for usage information" >&2
+            exit 1
+            ;;
+        *)
+            if [[ -z "$PDF_FILE" ]]; then
+                PDF_FILE="$1"
+            else
+                echo "Error: Multiple PDF files specified. Only one file can be processed at a time." >&2
                 exit 1
-                ;;
-            *)
-                if [[ -z "$PDF_FILE" ]]; then
-                    PDF_FILE="$1"
-                else
-                    echo "Error: Multiple PDF files specified. Only one file can be processed at a time." >&2
-                    exit 1
-                fi
-                shift
-                ;;
+            fi
+            shift
+            ;;
         esac
     done
 
@@ -130,9 +130,9 @@ get_folder_structure() {
 
     # Get folder structure and ensure clean JSON output
     local folder_list
-    folder_list=$(find "$base_dir" -maxdepth "$max_depth" -type d -not -path "$base_dir" 2>/dev/null | \
-        sed "s|^$base_dir/||" | \
-        grep -v '^[[:space:]]*$' | \
+    folder_list=$(find "$base_dir" -maxdepth "$max_depth" -type d -not -path "$base_dir" 2>/dev/null |
+        sed "s|^$base_dir/||" |
+        grep -v '^[[:space:]]*$' |
         sort)
 
     if [[ -z "$folder_list" ]]; then
@@ -153,6 +153,7 @@ get_folder_structure() {
             senders: (map(select(length > 1) | .[1]) | unique | select(length > 0)),
             departments: (map(select(length > 2) | {sender: .[1], department: .[2]}) | unique)
         })' 2>/dev/null || echo "[]"
+
 }
 
 strip_file_tags() {
@@ -219,8 +220,8 @@ extract_scanned_timestamp() {
 
     # Fallback to old format: YYYY-MM-DD[T]HH-MM-SS anywhere in filename
     local old_format_match
-    old_format_match=$(echo "$filename" | \
-        grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' | \
+    old_format_match=$(echo "$filename" |
+        grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' |
         sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/')
 
     if [[ -n "$old_format_match" ]]; then
@@ -245,9 +246,9 @@ validate_required_fields() {
     local short_summary="$4"
 
     if [[ -z "$sender" || "$sender" == "null" ]] ||
-       [[ -z "$scanned_at" || "$scanned_at" == "null" ]] ||
-       [[ -z "$category" || "$category" == "null" ]] ||
-       [[ -z "$short_summary" || "$short_summary" == "null" ]]; then
+        [[ -z "$scanned_at" || "$scanned_at" == "null" ]] ||
+        [[ -z "$category" || "$category" == "null" ]] ||
+        [[ -z "$short_summary" || "$short_summary" == "null" ]]; then
         log_error "One or more required fields are empty or null"
         log_error "SENDER: '$sender', SCANNED_AT: '$scanned_at', CATEGORY: '$category', SHORT_SUMMARY: '$short_summary'"
         return 1

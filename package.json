@@ -1,0 +1,26 @@
+{
+  "version": "1.0.0",
+  "name": "automation-scripts",
+  "description": "Shell automation scripts for macOS using zsh",
+  "main": "README.md",
+  "scripts": {
+    "lint": "shellcheck -s zsh **/*.sh",
+    "format": "shfmt -i 4 -ln zsh -w **/*.sh"
+  },
+  "keywords": [
+    "shell",
+    "zsh",
+    "automation",
+    "scripts",
+    "macos"
+  ],
+  "author": "Brandon Martinez",
+  "license": "MIT",
+  "engines": {
+    "zsh": ">=5.0.0"
+  },
+  "devDependencies": {
+    "shellcheck": "latest",
+    "shfmt": "latest"
+  }
+}

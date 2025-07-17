@@ -1,0 +1,12 @@
+{
+    "shellcheck.customArgs": [
+        "-s", "zsh"
+    ],
+    "shellcheck.executablePath": "/opt/homebrew/bin/shellcheck",
+    "shellformat.path": "/opt/homebrew/bin/shfmt",
+    "shellformat.flag": "-i 4 -ln zsh",
+    "files.associations": {
+        "*.sh": "shellscript"
+    },
+    "shellformat.useEditorConfig": true
+}
