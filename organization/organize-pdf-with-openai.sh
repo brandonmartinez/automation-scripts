@@ -10,75 +10,133 @@ if [[ "${TRACE-0}" == "1" ]]; then
 fi
 
 # ============================================================================
-# CONFIGURATION AND ENVIRONMENT SETUP
+# CONSTANTS AND CONFIGURATION
 # ============================================================================
 
 # Validate required environment
 PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
-SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
+readonly SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
 
-# Configuration variables
+# Configuration constants
 readonly PAPERWORK_DIR="${PAPERWORK_DIR:-$HOME/Documents/Paperwork}"
 readonly LOG_LEVEL_NAME="${LOG_LEVEL_NAME:-DEBUG}"
+readonly MAX_PDF_TEXT_LENGTH=100000
+readonly FOLDER_STRUCTURE_DEPTH=3
+readonly OCR_SCRIPT="$SCRIPT_DIR/../media/pdf-ocr-text.sh"
 
-# Validate input argument early
-if [[ $# -eq 0 ]]; then
-    echo "Usage: $0 <pdf_file_path>" >&2
-    echo "Please provide a PDF file path to organize" >&2
-    exit 1
-fi
-
-readonly PDF_FILE="$1"
-
-# Validate that the PDF file exists
-if [[ ! -f "$PDF_FILE" ]]; then
-    echo "Error: '$PDF_FILE' does not exist or is not a file" >&2
-    exit 1
-fi
-
-# Ensure paperwork directory exists for logging
-if [[ ! -d "$PAPERWORK_DIR" ]]; then
-    mkdir -p "$PAPERWORK_DIR"
-fi
-
-# Initialize logging utility
-export LOG_LEVEL=0
-export LOG_FD=2
-export LOG_FILE="$PAPERWORK_DIR/logfile.txt"
-source "$SCRIPT_DIR/../utilities/logging.sh"
-set_log_level "$LOG_LEVEL_NAME"
-
-# Log header to mark new session start
-log_header "organize-pdf-with-openai.sh"
-
+# Global variables for processed data
+declare -g PDF_FILE=""
+declare -g SCANNED_AT=""
+declare -g PDF_TEXT=""
+declare -g FOLDER_STRUCTURE=""
+declare -g AI_RESPONSE=""
+declare -g MOVE_FILE=false
 
 # ============================================================================
-# SOURCE DEPENDENCIES
+# INITIALIZATION AND VALIDATION
 # ============================================================================
 
-log_info "Sourcing Open AI Helpers from $SCRIPT_DIR"
-source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
+validate_arguments() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: $0 [--move] <pdf_file_path>" >&2
+        echo "Please provide a PDF file path to organize" >&2
+        echo "Options:" >&2
+        echo "  --move    Move the file instead of copying it" >&2
+        exit 1
+    fi
+
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --move)
+                MOVE_FILE=true
+                shift
+                ;;
+            --help|-h)
+                echo "Usage: $0 [--move] <pdf_file_path>" >&2
+                echo "Organizes PDF files using AI categorization" >&2
+                echo "" >&2
+                echo "Options:" >&2
+                echo "  --move    Move the file instead of copying it" >&2
+                echo "  --help    Show this help message" >&2
+                exit 0
+                ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                echo "Use --help for usage information" >&2
+                exit 1
+                ;;
+            *)
+                if [[ -z "$PDF_FILE" ]]; then
+                    PDF_FILE="$1"
+                else
+                    echo "Error: Multiple PDF files specified. Only one file can be processed at a time." >&2
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    if [[ -z "$PDF_FILE" ]]; then
+        echo "Error: No PDF file specified" >&2
+        echo "Use --help for usage information" >&2
+        exit 1
+    fi
+
+    if [[ ! -f "$PDF_FILE" ]]; then
+        echo "Error: '$PDF_FILE' does not exist or is not a file" >&2
+        exit 1
+    fi
+}
+
+setup_environment() {
+    # Ensure paperwork directory exists for logging
+    if [[ ! -d "$PAPERWORK_DIR" ]]; then
+        mkdir -p "$PAPERWORK_DIR"
+    fi
+
+    # Initialize logging utility
+    export LOG_LEVEL=0
+    export LOG_FD=2
+    export LOG_FILE="$PAPERWORK_DIR/logfile.txt"
+    source "$SCRIPT_DIR/../utilities/logging.sh"
+    set_log_level "$LOG_LEVEL_NAME"
+
+    # Log header to mark new session start
+    log_header "organize-pdf-with-openai.sh"
+}
+
+source_dependencies() {
+    log_info "Sourcing Open AI Helpers from $SCRIPT_DIR"
+    if [[ ! -f "$SCRIPT_DIR/../ai/open-ai-functions.sh" ]]; then
+        log_error "OpenAI functions not found at $SCRIPT_DIR/../ai/open-ai-functions.sh"
+        exit 1
+    fi
+    source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
+}
 
 # ============================================================================
-# HELPER FUNCTIONS
+# UTILITY FUNCTIONS
 # ============================================================================
 
-get-folder-structure() {
+get_folder_structure() {
     local base_dir="$1"
-    local max_depth="${2:-2}"  # Default to 2 levels deep
+    local max_depth="${2:-$FOLDER_STRUCTURE_DEPTH}"
 
-    if [ ! -d "$base_dir" ]; then
+    if [[ ! -d "$base_dir" ]]; then
         echo "[]"
         return
     fi
 
     # Get folder structure and ensure clean JSON output
-    local folder_list=$(find "$base_dir" -maxdepth "$max_depth" -type d -not -path "$base_dir" 2>/dev/null | \
+    local folder_list
+    folder_list=$(find "$base_dir" -maxdepth "$max_depth" -type d -not -path "$base_dir" 2>/dev/null | \
         sed "s|^$base_dir/||" | \
         grep -v '^[[:space:]]*$' | \
         sort)
 
-    if [ -z "$folder_list" ]; then
+    if [[ -z "$folder_list" ]]; then
         echo "[]"
         return
     fi
@@ -96,52 +154,148 @@ get-folder-structure() {
         })' 2>/dev/null || echo "[]"
 }
 
-strip-file-tags() {
-    if xattr -p "com.apple.metadata:_kMDItemUserTags" "$1" >/dev/null 2>&1; then
-        xattr -d "com.apple.metadata:_kMDItemUserTags" "$1"
+strip_file_tags() {
+    local file_path="$1"
+    if xattr -p "com.apple.metadata:_kMDItemUserTags" "$file_path" >/dev/null 2>&1; then
+        xattr -d "com.apple.metadata:_kMDItemUserTags" "$file_path"
     fi
 }
 
-set-finder-comments() {
-    osascript -e 'on run {f, c}' -e 'tell app "Finder" to set comment of (POSIX file f as alias) to c' -e end "file://$1" "$2"
+set_finder_comments() {
+    local file_path="$1"
+    local comment="$2"
+    osascript -e 'on run {f, c}' -e 'tell app "Finder" to set comment of (POSIX file f as alias) to c' -e end "file://$file_path" "$comment"
 }
 
-get-scanned-at() {
-    echo "$1" |
-        grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' |
+extract_scanned_timestamp() {
+    local filename="$1"
+    echo "$filename" | \
+        grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})[-T]([0-9]{2})-([0-9]{2})-([0-9]{2})' | \
         sed 's/\([0-9]\{4\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)[-T]\([0-9]\{2\}\)-\([0-9]\{2\}\)-\([0-9]\{2\}\)/\1-\2-\3T\4-\5-\6/'
 }
 
-# JSON escaping functions to prevent API errors
-escape-json-string() {
-    echo "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/$/\\n/g' | tr -d '\n' | sed 's/\\n$//'
-}
-
-safe-json-escape() {
+safe_json_escape() {
     # Remove or replace problematic characters that could break JSON
     echo "$1" | tr -cd '[:print:]' | sed 's/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g' | tr '\n' ' '
 }
 
+validate_required_fields() {
+    local sender="$1"
+    local scanned_at="$2"
+    local category="$3"
+    local short_summary="$4"
+
+    if [[ -z "$sender" || "$sender" == "null" ]] ||
+       [[ -z "$scanned_at" || "$scanned_at" == "null" ]] ||
+       [[ -z "$category" || "$category" == "null" ]] ||
+       [[ -z "$short_summary" || "$short_summary" == "null" ]]; then
+        log_error "One or more required fields are empty or null"
+        log_error "SENDER: '$sender', SCANNED_AT: '$scanned_at', CATEGORY: '$category', SHORT_SUMMARY: '$short_summary'"
+        return 1
+    fi
+    return 0
+}
+
+check_confidence_level() {
+    local confidence="$1"
+
+    if command -v bc >/dev/null 2>&1 && [[ "$confidence" != "null" ]]; then
+        if [[ $(echo "$confidence < 0.7" | bc) -eq 1 ]]; then
+            log_warn "AI confidence is low ($confidence). Manual review may be needed."
+        fi
+    fi
+}
+
 # ============================================================================
-# PROCESS FUNCTIONS
+# PDF TEXT EXTRACTION FUNCTIONS
+# ============================================================================
+
+extract_pdf_text() {
+    local pdf_file="$1"
+
+    log_info "Extracting text from PDF file"
+    local text
+    text=$(get-pdf-text "$pdf_file")
+
+    if [[ -z "$text" ]]; then
+        log_warn "Initial text extraction failed, attempting OCR processing..."
+        text=$(extract_text_with_ocr "$pdf_file")
+    fi
+
+    if [[ -z "$text" ]]; then
+        log_error "Failed to extract text from PDF file"
+        exit 1
+    fi
+
+    log_debug "Successfully extracted PDF text (${#text} characters)"
+
+    # Limit text length to prevent API issues
+    if [[ ${#text} -gt $MAX_PDF_TEXT_LENGTH ]]; then
+        log_warn "PDF text is very long (${#text} chars), truncating to prevent API issues"
+        text="${text:0:$MAX_PDF_TEXT_LENGTH}... [TRUNCATED]"
+    fi
+
+    echo "$text"
+}
+
+extract_text_with_ocr() {
+    local pdf_file="$1"
+
+    if [[ ! -f "$OCR_SCRIPT" ]]; then
+        log_error "OCR script not found at $OCR_SCRIPT"
+        return 1
+    fi
+
+    log_info "Running OCR processing on PDF: $OCR_SCRIPT"
+    if "$OCR_SCRIPT" "$pdf_file"; then
+        log_info "OCR processing completed, retrying text extraction"
+        local text
+        text=$(get-pdf-text "$pdf_file")
+
+        if [[ -z "$text" ]]; then
+            log_error "Failed to extract text even after OCR processing"
+            return 1
+        else
+            log_info "Successfully extracted text after OCR processing"
+            echo "$text"
+        fi
+    else
+        log_error "OCR processing failed"
+        return 1
+    fi
+}
+
+prepare_folder_structure_context() {
+    log_info "Analyzing existing folder structure"
+    local structure
+    structure=$(get_folder_structure "$PAPERWORK_DIR")
+
+    if [[ -z "$structure" || "$structure" == "[]" ]]; then
+        log_info "No existing folder structure found - this will be a new organization"
+        echo "[]"
+    else
+        log_debug "Folder structure for AI context: $structure"
+        echo "$structure"
+    fi
+}
+
+# ============================================================================
+# AI PROCESSING FUNCTIONS
 # ============================================================================
 
 # Comprehensive AI processing function optimized for GPT-4o
-# This replaces multiple AI calls with a single, context-aware call that:
-# 1. Analyzes PDF content with full folder structure context
-# 2. Provides both categorization and intelligent folder suggestions
-# 3. Returns confidence scores and reasoning for transparency
-# 4. Reduces API calls from potentially 3+ calls to 1 call
-# 5. Uses GPT-4o specific prompt engineering for better results
-comprehensive-ai-processing() {
+process_pdf_with_ai() {
     local pdf_text="$1"
     local folder_structure="$2"
 
     # Safely escape text for JSON to prevent control character errors
-    local safe_pdf_text=$(safe-json-escape "$pdf_text")
-    local safe_folder_structure=$(safe-json-escape "$folder_structure")
+    local safe_pdf_text
+    local safe_folder_structure
+    safe_pdf_text=$(safe_json_escape "$pdf_text")
+    safe_folder_structure=$(safe_json_escape "$folder_structure")
 
-    OPENAI_SYSTEM_MESSAGE="You are an expert document categorization assistant specializing in intelligent file organization. Your task is to analyze PDF content and provide comprehensive categorization with folder structure awareness.
+    local system_message
+    system_message="You are an expert document categorization assistant specializing in intelligent file organization. Your task is to analyze PDF content and provide comprehensive categorization with folder structure awareness.
 
 ## Analysis Framework:
 1. **Content Analysis**: Examine the document text to identify key entities, dates, and purpose
@@ -163,14 +317,16 @@ $safe_folder_structure
 ## Output Requirements:
 Provide both categorization AND intelligent folder suggestions based on existing structure. Consider similar senders, categories, and departments already present."
 
-    OPENAI_USER_MESSAGE="Analyze this PDF content and provide comprehensive categorization with folder structure recommendations:
+    local user_message
+    user_message="Analyze this PDF content and provide comprehensive categorization with folder structure recommendations:
 
 $safe_pdf_text"
 
     # Create JSON using jq to ensure proper escaping
-    JSON_PAYLOAD=$(jq -n \
-        --arg system_msg "$OPENAI_SYSTEM_MESSAGE" \
-        --arg user_msg "$OPENAI_USER_MESSAGE" \
+    local json_payload
+    json_payload=$(jq -n \
+        --arg system_msg "$system_message" \
+        --arg user_msg "$user_message" \
         '{
             "messages": [
                 {
@@ -232,238 +388,269 @@ $safe_pdf_text"
             }
         }')
 
-    get-openai-response "$JSON_PAYLOAD"
+    get-openai-response "$json_payload"
+}
+
+validate_ai_response() {
+    local response="$1"
+
+    if [[ -z "$response" ]]; then
+        log_error "AI response is empty. Check API connectivity and credentials."
+        exit 1
+    fi
+
+    # Check if response contains error information
+    if echo "$response" | jq -e '.error' >/dev/null 2>&1; then
+        local ai_error
+        ai_error=$(echo "$response" | jq -r '.error')
+        log_error "AI API returned error: $ai_error"
+        exit 1
+    fi
+}
+
+extract_categorization_data() {
+    local response="$1"
+
+    log_debug "Parsing comprehensive AI response"
+
+    # Extract categorization data
+    local sender department sent_on category short_summary
+    sender=$(echo "$response" | jq -r '.categorization.sender')
+    department=$(echo "$response" | jq -r '.categorization.department')
+    sent_on=$(echo "$response" | jq -r '.categorization.sentOn' | tr '/: ' '-')
+    category=$(echo "$response" | jq -r '.categorization.category')
+    short_summary=$(echo "$response" | jq -r '.categorization.shortSummary' | tr '"' "'")
+
+    # Handle null department
+    if [[ "$department" == "null" ]]; then
+        department=""
+    fi
+
+    # Set global variables for use in other functions
+    declare -g SENDER="$sender"
+    declare -g DEPARTMENT="$department"
+    declare -g SENT_ON="$sent_on"
+    declare -g CATEGORY="$category"
+    declare -g SHORT_SUMMARY="$short_summary"
+}
+
+apply_ai_suggestions() {
+    local response="$1"
+
+    # Extract AI suggestions for folder optimization
+    local suggested_category suggested_sender suggested_department ai_reasoning confidence
+    suggested_category=$(echo "$response" | jq -r '.folderSuggestions.suggestedCategory')
+    suggested_sender=$(echo "$response" | jq -r '.folderSuggestions.suggestedSender')
+    suggested_department=$(echo "$response" | jq -r '.folderSuggestions.suggestedDepartment')
+    ai_reasoning=$(echo "$response" | jq -r '.folderSuggestions.reasoning')
+    confidence=$(echo "$response" | jq -r '.analysis.confidence')
+
+    log_info "AI Analysis Results:"
+    log_info "  Categorization - SENDER: $SENDER, CATEGORY: $CATEGORY, DEPARTMENT: $DEPARTMENT"
+    log_info "  Suggestions - Category: $suggested_category, Sender: $suggested_sender, Department: $suggested_department"
+    log_info "  Confidence: $confidence, Reasoning: $ai_reasoning"
+
+    # Use AI suggestions when they provide better matches
+    if [[ "$suggested_category" != "null" && -n "$suggested_category" ]]; then
+        log_info "Using AI suggested category: $suggested_category (instead of: $CATEGORY)"
+        CATEGORY="$suggested_category"
+    fi
+
+    if [[ "$suggested_sender" != "null" && -n "$suggested_sender" ]]; then
+        log_info "Using AI suggested sender: $suggested_sender (instead of: $SENDER)"
+        SENDER="$suggested_sender"
+    fi
+
+    if [[ "$suggested_department" != "null" && -n "$suggested_department" ]]; then
+        log_info "Using AI suggested department: $suggested_department (instead of: $DEPARTMENT)"
+        DEPARTMENT="$suggested_department"
+    fi
+
+    check_confidence_level "$confidence"
+
+    log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
 }
 
 # ============================================================================
-# PREPARATION - EXTRACT INITIAL FILE DATA
+# FOLDER MANAGEMENT FUNCTIONS
 # ============================================================================
 
-log_info "Starting PDF organization for: $(basename "$PDF_FILE")"
+create_folder_structure() {
+    local category="$1"
+    local sender="$2"
+    local department="$3"
 
-# Extract the date from the filename (should be in this format 2023-12-06T10-40-27)
-SCANNED_AT=$(get-scanned-at "$PDF_FILE")
-if [ -z "$SCANNED_AT" ]; then
-    log_error "Scanned DateTime not found in the filename $PDF_FILE"
-    exit 1
-fi
-log_debug "Extracted scanned timestamp: $SCANNED_AT"
+    local category_dir="$PAPERWORK_DIR/$category"
+    local sender_dir="$category_dir/$sender"
+    local final_dir="$sender_dir"
 
-log_info "Extracting text from PDF file"
-PDF_TEXT=$(get-pdf-text "$PDF_FILE")
-if [ -z "$PDF_TEXT" ]; then
-    log_warn "Initial text extraction failed, attempting OCR processing..."
-
-    # Call the OCR script to process the PDF
-    OCR_SCRIPT="$SCRIPT_DIR/../media/pdf-ocr-text.sh"
-    if [ -f "$OCR_SCRIPT" ]; then
-        log_info "Running OCR processing on PDF: $OCR_SCRIPT"
-        if "$OCR_SCRIPT" "$PDF_FILE"; then
-            log_info "OCR processing completed, retrying text extraction"
-            PDF_TEXT=$(get-pdf-text "$PDF_FILE")
-
-            if [ -z "$PDF_TEXT" ]; then
-                log_error "Failed to extract text even after OCR processing"
-                exit 1
-            else
-                log_info "Successfully extracted text after OCR processing"
-            fi
-        else
-            log_error "OCR processing failed"
-            exit 1
-        fi
+    # Create category directory if it doesn't exist
+    if [[ ! -d "$category_dir" ]]; then
+        log_info "Creating new category folder: $category_dir"
+        mkdir -p "$category_dir"
     else
-        log_error "OCR script not found at $OCR_SCRIPT"
-        log_error "Failed to extract and/or sanitize text from the PDF"
+        log_debug "Category folder already exists: $category_dir"
+    fi
+
+    # Create sender directory if it doesn't exist
+    if [[ ! -d "$sender_dir" ]]; then
+        log_info "Creating sender folder: $sender_dir"
+        mkdir -p "$sender_dir"
+    else
+        log_debug "Sender folder already exists: $sender_dir"
+    fi
+
+    # Handle department folder if specified
+    if [[ -n "$department" ]]; then
+        local department_dir="$sender_dir/$department"
+        if [[ ! -d "$department_dir" ]]; then
+            log_info "Creating department folder: $department_dir"
+            mkdir -p "$department_dir"
+        else
+            log_debug "Department folder already exists: $department_dir"
+        fi
+        final_dir="$department_dir"
+    fi
+
+    echo "$final_dir"
+}
+
+generate_unique_filename() {
+    local destination_dir="$1"
+    local sender_sanitized="$2"
+    local department_sanitized="$3"
+    local scanned_at="$4"
+    local sent_on="$5"
+
+    local base_filename="$sender_sanitized$department_sanitized-$scanned_at-senton-$sent_on.pdf"
+    local new_file="$destination_dir/$base_filename"
+
+    local counter=1
+    while [[ -e "$new_file" ]]; do
+        new_file="$destination_dir/$sender_sanitized$department_sanitized-$scanned_at-senton-$sent_on-$(printf "%03d" $counter).pdf"
+        counter=$((counter + 1))
+    done
+
+    echo "$new_file"
+}
+
+# ============================================================================
+# FILE PROCESSING FUNCTIONS
+# ============================================================================
+
+prepare_initial_data() {
+    log_info "Starting PDF organization for: $(basename "$PDF_FILE")"
+
+    # Extract the date from the filename (should be in format 2023-12-06T10-40-27)
+    SCANNED_AT=$(extract_scanned_timestamp "$PDF_FILE")
+    if [[ -z "$SCANNED_AT" ]]; then
+        log_error "Scanned DateTime not found in the filename $PDF_FILE"
         exit 1
     fi
-fi
-log_debug "Successfully extracted PDF text (${#PDF_TEXT} characters)"
+    log_debug "Extracted scanned timestamp: $SCANNED_AT"
 
-# Get comprehensive folder structure for AI context
-log_info "Analyzing existing folder structure"
-FOLDER_STRUCTURE=$(get-folder-structure "$PAPERWORK_DIR" 3)
-if [ -z "$FOLDER_STRUCTURE" ] || [ "$FOLDER_STRUCTURE" = "[]" ]; then
-    log_info "No existing folder structure found - this will be a new organization"
-    FOLDER_STRUCTURE="[]"
-else
-    log_debug "Folder structure for AI context: $FOLDER_STRUCTURE"
-fi
+    # Extract text from PDF
+    PDF_TEXT=$(extract_pdf_text "$PDF_FILE")
+    log_debug "PDF text length: ${#PDF_TEXT} characters"
 
-# clear the attributes on the file to avoid double processing
-log_debug "Clearing file attributes to avoid double processing"
-strip-file-tags "$PDF_FILE"
+    # Get comprehensive folder structure for AI context
+    FOLDER_STRUCTURE=$(prepare_folder_structure_context)
 
-# ============================================================================
-# AI PROCESSING - CATEGORIZE AND ORGANIZE
-# ============================================================================
+    # Clear file attributes to avoid double processing
+    log_debug "Clearing file attributes to avoid double processing"
+    strip_file_tags "$PDF_FILE"
+}
 
-log_info "Processing PDF content with comprehensive AI analysis"
+process_with_ai() {
+    log_info "Processing PDF content with comprehensive AI analysis"
 
-# Validate inputs before sending to AI
-if [ -z "$PDF_TEXT" ]; then
-    log_error "PDF text is empty, cannot proceed with AI analysis"
-    exit 1
-fi
-
-# Limit text length to prevent API issues (roughly 100k characters)
-PDF_TEXT_LENGTH=${#PDF_TEXT}
-if [ "$PDF_TEXT_LENGTH" -gt 100000 ]; then
-    log_warn "PDF text is very long ($PDF_TEXT_LENGTH chars), truncating to prevent API issues"
-    PDF_TEXT="${PDF_TEXT:0:100000}... [TRUNCATED]"
-fi
-
-log_debug "PDF text length: ${#PDF_TEXT} characters"
-log_debug "Folder structure: $FOLDER_STRUCTURE"
-
-AI_RESPONSE=$(comprehensive-ai-processing "$PDF_TEXT" "$FOLDER_STRUCTURE")
-
-# Validate AI response
-if [ -z "$AI_RESPONSE" ]; then
-    log_error "AI response is empty. Check API connectivity and credentials."
-    exit 1
-fi
-
-# Check if response contains error information
-if echo "$AI_RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-    AI_ERROR=$(echo "$AI_RESPONSE" | jq -r '.error')
-    log_error "AI API returned error: $AI_ERROR"
-    exit 1
-fi
-
-echo-json "$AI_RESPONSE"
-
-log_debug "Parsing comprehensive AI response"
-# Extract categorization data
-SENDER=$(echo "$AI_RESPONSE" | jq -r '.categorization.sender')
-DEPARTMENT=$(echo "$AI_RESPONSE" | jq -r '.categorization.department')
-if [ "$DEPARTMENT" = "null" ]; then
-    DEPARTMENT=""
-fi
-SENT_ON=$(echo "$AI_RESPONSE" | jq -r '.categorization.sentOn' | tr '/: ' '-')
-CATEGORY=$(echo "$AI_RESPONSE" | jq -r '.categorization.category')
-SHORT_SUMMARY=$(echo "$AI_RESPONSE" | jq -r '.categorization.shortSummary' | tr '"' "'")
-
-# Extract AI suggestions for folder optimization
-SUGGESTED_CATEGORY=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.suggestedCategory')
-SUGGESTED_SENDER=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.suggestedSender')
-SUGGESTED_DEPARTMENT=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.suggestedDepartment')
-AI_REASONING=$(echo "$AI_RESPONSE" | jq -r '.folderSuggestions.reasoning')
-CONFIDENCE=$(echo "$AI_RESPONSE" | jq -r '.analysis.confidence')
-
-log_info "AI Analysis Results:"
-log_info "  Categorization - SENDER: $SENDER, CATEGORY: $CATEGORY, DEPARTMENT: $DEPARTMENT"
-log_info "  Suggestions - Category: $SUGGESTED_CATEGORY, Sender: $SUGGESTED_SENDER, Department: $SUGGESTED_DEPARTMENT"
-log_info "  Confidence: $CONFIDENCE, Reasoning: $AI_REASONING"
-
-# Use AI suggestions when they provide better matches
-if [ "$SUGGESTED_CATEGORY" != "null" ] && [ -n "$SUGGESTED_CATEGORY" ]; then
-    log_info "Using AI suggested category: $SUGGESTED_CATEGORY (instead of: $CATEGORY)"
-    CATEGORY="$SUGGESTED_CATEGORY"
-fi
-
-if [ "$SUGGESTED_SENDER" != "null" ] && [ -n "$SUGGESTED_SENDER" ]; then
-    log_info "Using AI suggested sender: $SUGGESTED_SENDER (instead of: $SENDER)"
-    SENDER="$SUGGESTED_SENDER"
-fi
-
-if [ "$SUGGESTED_DEPARTMENT" != "null" ] && [ -n "$SUGGESTED_DEPARTMENT" ]; then
-    log_info "Using AI suggested department: $SUGGESTED_DEPARTMENT (instead of: $DEPARTMENT)"
-    DEPARTMENT="$SUGGESTED_DEPARTMENT"
-fi
-
-log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
-
-# Validate required fields
-if [ -z "$SENDER" ] || [ "$SENDER" = "null" ] ||
-    [ -z "$SCANNED_AT" ] || [ "$SCANNED_AT" = "null" ] ||
-    [ -z "$CATEGORY" ] || [ "$CATEGORY" = "null" ] ||
-    [ -z "$SHORT_SUMMARY" ] || [ "$SHORT_SUMMARY" = "null" ]; then
-    log_error "One or more required fields are empty or null"
-    log_error "SENDER: '$SENDER', SCANNED_AT: '$SCANNED_AT', CATEGORY: '$CATEGORY', SHORT_SUMMARY: '$SHORT_SUMMARY'"
-    exit 1
-fi
-
-# Warn if confidence is low
-if command -v bc >/dev/null 2>&1 && [ "$CONFIDENCE" != "null" ]; then
-    if [ "$(echo "$CONFIDENCE < 0.7" | bc)" -eq 1 ]; then
-        log_warn "AI confidence is low ($CONFIDENCE). Manual review may be needed."
+    # Validate inputs before sending to AI
+    if [[ -z "$PDF_TEXT" ]]; then
+        log_error "PDF text is empty, cannot proceed with AI analysis"
+        exit 1
     fi
-fi
 
-log_info "Successfully categorized PDF with AI optimization: Category='$CATEGORY', Sender='$SENDER'"
+    log_debug "PDF text length: ${#PDF_TEXT} characters"
+    log_debug "Folder structure: $FOLDER_STRUCTURE"
 
-# ============================================================================
-# FOLDER STRUCTURE MANAGEMENT (SIMPLIFIED WITH AI SUGGESTIONS)
-# ============================================================================
+    AI_RESPONSE=$(process_pdf_with_ai "$PDF_TEXT" "$FOLDER_STRUCTURE")
+    validate_ai_response "$AI_RESPONSE"
 
-CATEGORY_DIR="$PAPERWORK_DIR/$CATEGORY"
-SENDER_DIR="$CATEGORY_DIR/$SENDER"
+    echo-json "$AI_RESPONSE"
 
-# Create category directory if it doesn't exist
-if [ ! -d "$CATEGORY_DIR" ]; then
-    log_info "Creating new category folder: $CATEGORY_DIR"
-    mkdir -p "$CATEGORY_DIR"
-else
-    log_debug "Category folder already exists: $CATEGORY_DIR"
-fi
+    extract_categorization_data "$AI_RESPONSE"
+    apply_ai_suggestions "$AI_RESPONSE"
 
-# Create sender directory if it doesn't exist
-if [ ! -d "$SENDER_DIR" ]; then
-    log_info "Creating sender folder: $SENDER_DIR"
-    mkdir -p "$SENDER_DIR"
-else
-    log_debug "Sender folder already exists: $SENDER_DIR"
-fi
+    # Validate required fields
+    if ! validate_required_fields "$SENDER" "$SCANNED_AT" "$CATEGORY" "$SHORT_SUMMARY"; then
+        exit 1
+    fi
 
-# Handle department folder if specified
-if [ -n "$DEPARTMENT" ]; then
-    DEPARTMENT_DIR="$SENDER_DIR/$DEPARTMENT"
-    if [ ! -d "$DEPARTMENT_DIR" ]; then
-        log_info "Creating department folder: $DEPARTMENT_DIR"
-        mkdir -p "$DEPARTMENT_DIR"
+    log_info "Successfully categorized PDF with AI optimization: Category='$CATEGORY', Sender='$SENDER'"
+}
+
+organize_and_move_file() {
+    log_info "Preparing final file naming and placement"
+
+    # Create folder structure and get destination directory
+    local destination_dir
+    destination_dir=$(create_folder_structure "$CATEGORY" "$SENDER" "$DEPARTMENT")
+
+    # Create sanitized versions for file names
+    local sender_sanitized department_sanitized
+    sender_sanitized=$(sanitize-text "$SENDER")
+    department_sanitized=$(sanitize-text "$DEPARTMENT")
+
+    if [[ -n "$department_sanitized" && "$department_sanitized" != "null" ]]; then
+        department_sanitized="-${department_sanitized}"
     else
-        log_debug "Department folder already exists: $DEPARTMENT_DIR"
+        department_sanitized=""
     fi
-    # Update final destination to include department
-    SENDER_DIR="$DEPARTMENT_DIR"
-fi
+
+    # Generate unique filename
+    local new_file
+    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$SCANNED_AT" "$SENT_ON")
+
+    log_info "Final file destination: $(basename "$new_file")"
+    log_debug "Full path: $new_file"
+
+    # Copy or move file to destination based on user preference
+    if [[ "$MOVE_FILE" == true ]]; then
+        log_info "Moving PDF file to destination"
+        mv "$PDF_FILE" "$new_file"
+    else
+        log_info "Copying PDF file to destination"
+        cp "$PDF_FILE" "$new_file"
+    fi
+
+    # Set Finder comments with summary
+    log_info "Setting Finder comments with summary"
+    set_finder_comments "$new_file" "$SHORT_SUMMARY"
+
+    # Open destination folder in Finder
+    log_info "Opening destination folder in Finder"
+    open "$destination_dir"
+
+    log_info "PDF organization completed successfully"
+}
 
 # ============================================================================
-# FILE PROCESSING AND COMPLETION
+# MAIN EXECUTION FLOW
 # ============================================================================
 
-log_info "Preparing final file naming and placement"
+main() {
+    # Initialize and validate
+    validate_arguments "$@"
+    setup_environment
+    source_dependencies
 
-# Create sanitized versions for file names
-SENDER_SANITIZED=$(sanitize-text "$SENDER")
+    # Process the PDF
+    prepare_initial_data
+    process_with_ai
+    organize_and_move_file
 
-DEPARTMENT_SANITIZED=$(sanitize-text "$DEPARTMENT")
-if [ -n "$DEPARTMENT_SANITIZED" ] && [ "$DEPARTMENT_SANITIZED" != "null" ]; then
-    DEPARTMENT_SANITIZED="-${DEPARTMENT_SANITIZED}"
-fi
+    log_divider "END OF PROCESSING"
+}
 
-NEW_FILE="$SENDER_DIR/$SENDER_SANITIZED$DEPARTMENT_SANITIZED-$SCANNED_AT-senton-$SENT_ON.pdf"
-counter=1
-while [ -e "$NEW_FILE" ]; do
-    NEW_FILE="$SENDER_DIR/$SENDER_SANITIZED$DEPARTMENT_SANITIZED-$SCANNED_AT-senton-$SENT_ON-$(printf "%03d" $counter).pdf"
-    counter=$((counter + 1))
-done
-
-log_info "Final file destination: $(basename "$NEW_FILE")"
-log_debug "Full path: $NEW_FILE"
-
-log_info "Copying PDF file to destination"
-cp "$PDF_FILE" "$NEW_FILE"
-
-log_info "Setting Finder comments with summary"
-set-finder-comments "$NEW_FILE" "$SHORT_SUMMARY"
-
-log_info "Opening destination folder in Finder"
-open "$SENDER_DIR"
-
-log_info "PDF organization completed successfully"
-
-log_divider "END OF PROCESSING"
-
-exit 0
+# Execute main function with all arguments
+main "$@"
