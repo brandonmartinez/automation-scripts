@@ -366,39 +366,31 @@ process_pdf_with_ai() {
     safe_folder_structure=$(safe_json_escape "$folder_structure")
 
     local system_message
-    system_message="You are an expert document categorization assistant specializing in intelligent file organization. Your task is to analyze PDF content and provide comprehensive categorization with folder structure awareness.
+    system_message="You are an expert document categorization assistant. Analyze PDF content and categorize it using existing folder structure for consistency.
 
-## Analysis Framework:
-1. **Content Analysis**: Examine the document text to identify key entities, dates, and purpose
-2. **Contextual Matching**: Use the existing folder structure to maintain consistency
-3. **Intelligent Suggestions**: Recommend optimal folder placement considering existing organization
+## Primary Task: Identify the TRUE SENDER
+- Look for company letterhead, logos, official headers, and signatures
+- Check if the sender matches any existing folders to maintain consistency
+- Use existing folder names when similar senders exist (e.g., 'Apple Inc' vs 'Apple' → use existing)
 
 ## Categorization Rules:
-- **SENDER**: Use exact names when possible. For government: 'State of X', 'Federal Government', 'City of X', 'County of X'
-- **CATEGORY**: Match existing categories when appropriate, suggest new ones when necessary
-- **DEPARTMENT**: Only include for government organizations (federal, state, local agencies). Leave null for private companies, individuals, and non-government entities
-- **ADDITIONAL_CONTEXT**: Use for key identifying details that aid in organization and searchability:
-  • **Financial**: Check writer name, account numbers (last 4 digits), loan numbers, claim numbers
-  • **Medical**: Doctor name, patient name, procedure type, appointment date
-  • **Legal**: Case number, attorney name, court name, opposing party
-  • **Insurance**: Policy number, claim number, agent name, coverage type
-  • **Real Estate**: Property address, MLS number, agent name, transaction type
-  • **Employment**: Employee ID, position title, department name, manager name
-  • **Education**: Student name, course name, semester/year, institution
-  • **Personal**: Contact name, event type, reference number, project name
-- **SENT_ON**: Extract date in YYYY-MM-DD format
-- **Legal Documents**: Categorize by the company involved (e.g., lawsuit against Samsung → SENDER: Samsung)
-- **Checks**: CATEGORY: 'Finance', SENDER: 'Checks', DEPARTMENT: null, ADDITIONAL_CONTEXT: check writer name
+- **SENDER**: Identify from letterhead/header. Check against existing folders first.
+- **CATEGORY**: Match existing categories when appropriate
+- **DEPARTMENT**: Only for government organizations (federal, state, local agencies)
+- **ADDITIONAL_CONTEXT**: Key identifying details (account numbers, case numbers, etc.)
+- **SENT_ON**: Document date in YYYY-MM-DD format
 
-## Folder Structure Context:
-The following existing folder structure should guide your categorization decisions:
+## Existing Folder Structure:
 $safe_folder_structure
 
-## Output Requirements:
-Provide both categorization AND intelligent folder suggestions based on existing structure. Consider similar senders, categories, and departments already present."
+## Instructions:
+1. Identify the primary sender from document header/letterhead
+2. Check if this sender exists in the folder structure above
+3. If similar sender exists, use the existing folder name exactly
+4. Provide clear, concise categorization without repetition"
 
     local user_message
-    user_message="Analyze this PDF content and provide comprehensive categorization with folder structure recommendations:
+    user_message="Analyze this PDF and identify the sender from letterhead/header. Check if the sender matches existing folders:
 
 $safe_pdf_text"
 
@@ -430,10 +422,11 @@ $safe_pdf_text"
                                 "type": "object",
                                 "properties": {
                                     "documentType": {"type": "string"},
-                                    "keyEntities": {"type": "array", "items": {"type": "string"}},
+                                    "primarySender": {"type": "string"},
+                                    "existingFolderMatch": {"type": ["string", "null"]},
                                     "confidence": {"type": "number", "minimum": 0, "maximum": 1}
                                 },
-                                "required": ["documentType", "keyEntities", "confidence"],
+                                "required": ["documentType", "primarySender", "existingFolderMatch", "confidence"],
                                 "additionalProperties": false
                             },
                             "categorization": {
@@ -456,10 +449,9 @@ $safe_pdf_text"
                                     "suggestedSender": {"type": ["string", "null"]},
                                     "suggestedDepartment": {"type": ["string", "null"]},
                                     "suggestedAdditionalContext": {"type": ["string", "null"]},
-                                    "reasoning": {"type": "string"},
-                                    "alternativePaths": {"type": "array", "items": {"type": "string"}}
+                                    "reasoning": {"type": "string"}
                                 },
-                                "required": ["suggestedCategory", "suggestedSender", "suggestedDepartment", "suggestedAdditionalContext", "reasoning", "alternativePaths"],
+                                "required": ["suggestedCategory", "suggestedSender", "suggestedDepartment", "suggestedAdditionalContext", "reasoning"],
                                 "additionalProperties": false
                             }
                         },
@@ -524,8 +516,10 @@ extract_categorization_data() {
 apply_ai_suggestions() {
     local response="$1"
 
-    # Extract AI suggestions for folder optimization
+    # Extract AI suggestions and analysis
     local suggested_category suggested_sender suggested_department suggested_additional_context ai_reasoning confidence
+    local primary_sender existing_folder_match
+
     suggested_category=$(echo "$response" | jq -r '.folderSuggestions.suggestedCategory')
     suggested_sender=$(echo "$response" | jq -r '.folderSuggestions.suggestedSender')
     suggested_department=$(echo "$response" | jq -r '.folderSuggestions.suggestedDepartment')
@@ -533,20 +527,30 @@ apply_ai_suggestions() {
     ai_reasoning=$(echo "$response" | jq -r '.folderSuggestions.reasoning')
     confidence=$(echo "$response" | jq -r '.analysis.confidence')
 
+    # Extract simplified analysis data
+    primary_sender=$(echo "$response" | jq -r '.analysis.primarySender')
+    existing_folder_match=$(echo "$response" | jq -r '.analysis.existingFolderMatch')
+
     log_info "AI Analysis Results:"
+    log_info "  Primary Sender Identified: $primary_sender"
+    log_info "  Existing Folder Match: $existing_folder_match"
     log_info "  Categorization - SENDER: $SENDER, CATEGORY: $CATEGORY, DEPARTMENT: $DEPARTMENT, ADDITIONAL_CONTEXT: $ADDITIONAL_CONTEXT"
     log_info "  Suggestions - Category: $suggested_category, Sender: $suggested_sender, Department: $suggested_department, Additional Context: $suggested_additional_context"
     log_info "  Confidence: $confidence, Reasoning: $ai_reasoning"
+
+    # Prioritize existing folder matches for sender consistency
+    if [[ "$existing_folder_match" != "null" && -n "$existing_folder_match" ]]; then
+        log_info "Using existing folder match for sender consistency: $existing_folder_match"
+        SENDER="$existing_folder_match"
+    elif [[ "$suggested_sender" != "null" && -n "$suggested_sender" ]]; then
+        log_info "Using AI suggested sender: $suggested_sender (instead of: $SENDER)"
+        SENDER="$suggested_sender"
+    fi
 
     # Use AI suggestions when they provide better matches
     if [[ "$suggested_category" != "null" && -n "$suggested_category" ]]; then
         log_info "Using AI suggested category: $suggested_category (instead of: $CATEGORY)"
         CATEGORY="$suggested_category"
-    fi
-
-    if [[ "$suggested_sender" != "null" && -n "$suggested_sender" ]]; then
-        log_info "Using AI suggested sender: $suggested_sender (instead of: $SENDER)"
-        SENDER="$suggested_sender"
     fi
 
     if [[ "$suggested_department" != "null" && -n "$suggested_department" ]]; then
