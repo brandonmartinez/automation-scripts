@@ -17,9 +17,9 @@ fi
 
 # Get tokens and keys from 1Password
 ***REMOVED***
-AZURE_OPENAI_ENDPOINT=$(op read -n "op://cli/aoi-martinez/url")
-AZURE_OPENAI_TOKEN=$(op read -n "op://cli/aoi-martinez/token")
-API_KEY=$(op read -n "op://cli/aoi-martinez/api-key")
+AZURE_OPENAI_ENDPOINT=$(op read -n "op://cli/aoai-mm-automation/url")
+AZURE_OPENAI_TOKEN=$(op read -n "op://cli/aoai-mm-automation/token")
+API_KEY=$(op read -n "op://cli/aoai-mm-automation/api-key")
 
 set +a
 
@@ -59,7 +59,6 @@ get-openai-response() {
     # Send the extracted text to the Azure OpenAI endpoint
     RESPONSE=$(curl -s -X POST "$AZURE_OPENAI_ENDPOINT" \
         -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $AZURE_OPENAI_TOKEN" \
         -H "api-key: $API_KEY" \
         -d "$1")
 
