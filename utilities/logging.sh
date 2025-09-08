@@ -353,6 +353,87 @@ debug_log_api() {
     fi
 }
 
+# Helper function to set up standardized log file paths
+# Usage: setup_script_logging [script_name]
+# If script_name is not provided, it will be auto-detected from the calling script
+setup_script_logging() {
+    # Use the provided script name or auto-detect from the calling context
+    local script_name="${1:-}"
+
+    # If no script name provided, try to auto-detect
+    if [[ -z "$script_name" ]]; then
+        # In zsh, try different methods to get the calling script name
+        if [[ -n "${funcfiletrace[1]:-}" ]]; then
+            # zsh funcfiletrace gives us file:line
+            local caller_info="${funcfiletrace[1]}"
+            local script_path="${caller_info%:*}"
+            script_name="$(basename "$script_path" .sh)"
+        elif [[ -n "${BASH_SOURCE[1]:-}" ]]; then
+            # bash BASH_SOURCE
+            script_name="$(basename "${BASH_SOURCE[1]}" .sh)"
+        else
+            # Fallback to $0 and extract just the script name
+            script_name="$(basename "${0:-unknown}" .sh)"
+        fi
+    fi
+
+    # Determine script path for module detection
+    local script_path=""
+    if [[ -n "${funcfiletrace[1]:-}" ]]; then
+        # zsh funcfiletrace
+        local caller_info="${funcfiletrace[1]}"
+        script_path="${caller_info%:*}"
+    elif [[ -n "${BASH_SOURCE[1]:-}" ]]; then
+        # bash BASH_SOURCE
+        script_path="${BASH_SOURCE[1]}"
+    else
+        # Fallback to $0
+        script_path="${0:-unknown}"
+    fi
+
+    # Extract the module folder from the script path
+    local script_dir="$(dirname "$script_path")"
+    local module_folder="$(basename "$script_dir")"
+
+    # Remove any leading path components to get just the module name
+    if [[ "$module_folder" == "." ]] || [[ "$module_folder" == "/" ]] || [[ -z "$module_folder" ]]; then
+        module_folder="general"
+    fi
+
+    # Set up the log file path with module folder included
+    export LOG_FILE="$HOME/Library/Logs/automation-scripts/${module_folder}/${script_name}.log"
+    export LOG_LEVEL=${LOG_LEVEL:-1}  # Default to INFO level if not set
+
+    # Create the log directory if it doesn't exist
+    local log_dir="$(dirname "$LOG_FILE")"
+    if [[ ! -d "$log_dir" ]]; then
+        mkdir -p "$log_dir"
+    fi
+
+    # If logging is already initialized, trigger file redirection setup
+    if [[ -n "${LOGGING_INITIALIZED:-}" ]]; then
+        # Check if log rotation is needed
+        rotate_log_if_needed "$LOG_FILE"
+
+        # Save original file descriptors if not already saved
+        if [[ -z "${LOG_ORIGINAL_FDS_SAVED:-}" ]]; then
+            exec 3>&1 4>&2  # Save original stdout and stderr
+            export LOG_ORIGINAL_FDS_SAVED=1
+        fi
+
+        # Redirect both stdout and stderr to log file while preserving terminal output
+        exec 1> >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+        export LOG_FILE_PATH="$LOG_FILE"
+
+        log_info "Logging output redirected to: $LOG_FILE_PATH"
+    fi
+
+    # Log setup completion for debugging
+    if [[ -n "${LOGGING_INITIALIZED:-}" ]]; then
+        log_debug "Script logging configured: $LOG_FILE (script: $script_name, module: $module_folder)"
+    fi
+}
+
 # Restore original file descriptors
 restore_log_redirection() {
     if [[ -n "${LOG_ORIGINAL_FDS_SAVED:-}" ]]; then

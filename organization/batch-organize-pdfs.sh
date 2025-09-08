@@ -76,8 +76,8 @@ fi
 # Initialize logging utility
 export LOG_LEVEL=0
 export LOG_FD=2
-export LOG_FILE="$PAPERWORK_DIR/batch-organize-logfile.txt"
 source "$SCRIPT_DIR/../utilities/logging.sh"
+setup_script_logging
 set_log_level "$LOG_LEVEL_NAME"
 
 # Log header to mark new session start

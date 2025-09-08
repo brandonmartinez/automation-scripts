@@ -8,6 +8,7 @@ PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 if [[ -z "${LOGGING_INITIALIZED:-}" ]]; then
     SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
     source "$SCRIPT_DIR/../utilities/logging.sh"
+    setup_script_logging
 fi
 
 # Only log initialization if this script is being run directly (not sourced)
