@@ -25,6 +25,9 @@ readonly BASE_PATH="${ORGANIZE_3D_BASE_PATH:-$HOME/Documents/3D Prints}"
 readonly LOG_LEVEL_NAME="${LOG_LEVEL_NAME:-DEBUG}"
 readonly PDF_TEXT_LIMIT="${PDF_TEXT_LIMIT:-100}"
 readonly README_TEXT_LIMIT="${README_TEXT_LIMIT:-50}"
+typeset -A FILE_COUNTERS
+typeset -a CONTEXT_KEYWORDS
+typeset -a WEBLOC_REFERENCES
 
 # Validate input argument early
 if [[ $# -eq 0 ]]; then
@@ -89,6 +92,244 @@ get_file_list() {
     find "$1" -type f -exec basename {} \; | sort | tr '\n' ',' | sed 's/,$//'
 }
 
+get_webloc_url() {
+    local webloc_file="$1"
+    local url=""
+
+    if command -v plutil >/dev/null 2>&1; then
+        url=$(plutil -extract URL raw "$webloc_file" 2>/dev/null || true)
+        if [[ -z "$url" ]]; then
+            url=$(plutil -p "$webloc_file" 2>/dev/null | awk -F'"' '/URL/ {print $4; exit}')
+        fi
+    fi
+
+    if [[ -z "$url" ]]; then
+        url=$(grep -Eo '<string>[^<]+' "$webloc_file" 2>/dev/null | head -1 | sed 's/<string>//')
+    fi
+
+    printf '%s' "$url"
+}
+
+describe_file_type() {
+    local extension="${1:l}"
+
+    case "$extension" in
+        stl|obj|3mf|step|stp|f3d|blend|scad|shapr) echo "3D Model" ;;
+        gcode) echo "Print Export" ;;
+        jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff) echo "Image" ;;
+        pdf|md|txt|rtf|html|htm|doc) echo "Documentation" ;;
+        *) echo "" ;;
+    esac
+}
+
+build_file_inventory() {
+    local file_list="$1"
+    local -a file_array
+    local inventory=""
+
+    file_array=("${(@s/,/)file_list}")
+
+    for file_name in "${file_array[@]}"; do
+        [[ -z "$file_name" ]] && continue
+        local extension=""
+        if [[ "$file_name" == *.* ]]; then
+            extension="${file_name##*.}"
+        fi
+        local type_description="$(describe_file_type "$extension")"
+        if [[ -n "$type_description" ]]; then
+            inventory+=" - $file_name ($type_description)\n"
+        else
+            inventory+=" - $file_name\n"
+        fi
+    done
+
+    echo "$inventory"
+}
+
+normalize_for_comparison() {
+    echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]//g'
+}
+
+is_generic_name() {
+    local name="$1"
+    local sanitized=$(echo "$name" | tr '[:punct:]' ' ' | tr -s ' ' ' ')
+    local -a tokens
+    local generic_list=" file files model models part parts object objects obj copy source mesh export version final item items piece pieces component components print printout file1 file2 "
+
+    tokens=(${=sanitized})
+
+    for token in "${tokens[@]}"; do
+        local lower=$(echo "$token" | tr '[:upper:]' '[:lower:]')
+        if [[ -z "$lower" ]]; then
+            continue
+        fi
+        if [[ "$lower" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+        if [[ ${#lower} -ge 4 && "$generic_list" != *" $lower "* ]]; then
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+contains_context_keyword() {
+    local name_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+
+    for keyword in "${CONTEXT_KEYWORDS[@]}"; do
+        if [[ -n "$keyword" && "$name_lower" == *"$keyword"* ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+set_context_keywords() {
+    CONTEXT_KEYWORDS=()
+
+    local title="$1"
+    local sanitized=$(echo "$title" | tr '-' ' ' | tr '/' ' ' | tr '[:punct:]' ' ' | tr -s ' ' ' ')
+    local -a words
+
+    words=(${=sanitized})
+
+    for word in "${words[@]}"; do
+        local lower=$(echo "$word" | tr '[:upper:]' '[:lower:]')
+        if [[ ${#lower} -ge 4 && "$lower" != "files" && "$lower" != "custom" ]]; then
+            CONTEXT_KEYWORDS+=("$lower")
+        fi
+    done
+}
+
+label_for_extension() {
+    local extension="${1:l}"
+    local subfolder="$2"
+
+    case "$extension" in
+        stl|obj|3mf|step|stp|f3d|blend|scad|shapr) echo "Component" ;;
+        gcode) echo "Gcode" ;;
+        jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff) echo "Image" ;;
+        pdf|md|txt|rtf|html|htm|doc) echo "Document" ;;
+        *)
+            if [[ "$subfolder" == "exports" ]]; then
+                echo "Export"
+            else
+                echo "File"
+            fi
+            ;;
+    esac
+}
+
+generate_semantic_basename() {
+    local original_name="$1"
+    local extension="$2"
+    local target_subfolder="$3"
+
+    local context_title="$proposed_name"
+    [[ -z "$context_title" ]] && context_title="$NAME"
+
+    local sanitized_context=$(echo "$context_title" | tr '/' ' ' | tr -s ' ' ' ')
+    local -a context_words
+    local -a selected_words
+
+    context_words=(${=sanitized_context})
+
+    if (( ${#CONTEXT_KEYWORDS[@]} > 0 )); then
+        for word in "${context_words[@]}"; do
+            local lower_word=$(echo "$word" | tr '[:upper:]' '[:lower:]')
+            for keyword in "${CONTEXT_KEYWORDS[@]}"; do
+                if [[ "$lower_word" == "$keyword" ]]; then
+                    local clean_word=$(echo "$word" | sed 's/[^A-Za-z0-9]//g')
+                    if [[ -n "$clean_word" ]]; then
+                        selected_words+=("$clean_word")
+                    fi
+                    break
+                fi
+            done
+            if (( ${#selected_words[@]} >= 3 )); then
+                break
+            fi
+        done
+    fi
+
+    if (( ${#selected_words[@]} == 0 )); then
+        for word in "${context_words[@]}"; do
+            local clean_word=$(echo "$word" | sed 's/[^A-Za-z0-9]//g')
+            if [[ -z "$clean_word" ]]; then
+                continue
+            fi
+            selected_words+=("$clean_word")
+            if (( ${#selected_words[@]} >= 3 )); then
+                break
+            fi
+        done
+    fi
+
+    if (( ${#selected_words[@]} == 0 )); then
+        selected_words+=("Project")
+    fi
+
+    local descriptor="${(j: :)selected_words}"
+    local type_label="$(label_for_extension "$extension" "$target_subfolder")"
+    local counter_key="${target_subfolder}_${extension:l}"
+    local counter=$(( ${FILE_COUNTERS[$counter_key]:-0} + 1 ))
+    FILE_COUNTERS[$counter_key]=$counter
+
+    local padded_index=$(printf "%02d" "$counter")
+    local numeric_hint=$(echo "$original_name" | grep -oE '[0-9]{1,3}' | head -1)
+    if [[ -n "$numeric_hint" ]]; then
+        numeric_hint=$(printf "%02d" "$numeric_hint")
+    else
+        numeric_hint="$padded_index"
+    fi
+
+    local base_name="$descriptor $type_label $numeric_hint"
+    base_name=$(echo "$base_name" | sed 's/  */ /g' | sed 's/[[:space:]]*$//')
+
+    echo "$base_name"
+}
+
+sanitize_filename_component() {
+    local component="$1"
+    component=$(echo "$component" | sed 's/[\/:*?"<>|]/-/g')
+    component=$(echo "$component" | tr -s ' ' ' ')
+    component=$(echo "$component" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    component=$(echo "$component" | sed 's/[. ]$//')
+    echo "$component"
+}
+
+needs_semantic_name() {
+    local original_name="$1"
+    local proposed_base="$2"
+
+    if [[ -z "$proposed_base" ]]; then
+        return 0
+    fi
+
+    local original_simple="$(normalize_for_comparison "$original_name")"
+    local proposed_simple="$(normalize_for_comparison "$proposed_base")"
+
+    if [[ "$original_simple" == "$proposed_simple" ]]; then
+        return 0
+    fi
+
+    if is_generic_name "$proposed_base"; then
+        return 0
+    fi
+
+    if (( ${#CONTEXT_KEYWORDS[@]} > 0 )); then
+        if contains_context_keyword "$proposed_base"; then
+            return 1
+        else
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 # ============================================================================
 # AI INTEGRATION FUNCTIONS
 # ============================================================================
@@ -113,7 +354,7 @@ Always prioritize consistency, discoverability, and preservation of important te
 extract_documentation_content() {
     local folder_path="$1"
     local content=""
-
+    WEBLOC_REFERENCES=()
     log_debug "Extracting documentation from: $folder_path"
 
     # Process README files
@@ -175,6 +416,22 @@ extract_documentation_content() {
                     content="$content\n\n=== TEXT DOC ($basename) ===\n$doc_content"
                 fi
             fi
+        fi
+    done
+
+    # Process WEBLOC link files (record URLs only)
+    for webloc_file in "$folder_path"/*.webloc "$folder_path"/*.WEBLOC; do
+        if [[ -f "$webloc_file" ]]; then
+            local basename=$(basename "$webloc_file")
+            local url=$(get_webloc_url "$webloc_file")
+
+            if [[ -z "$url" ]]; then
+                log_warn "Failed to extract URL from webloc file: $basename"
+                WEBLOC_REFERENCES+=("$basename -> [missing URL]")
+                continue
+            fi
+
+            WEBLOC_REFERENCES+=("$basename -> $url")
         fi
     done
 
@@ -315,11 +572,22 @@ organize_all_files() {
         fi
     fi
 
+    local file_inventory="$(build_file_inventory "$file_list")"
+
+    local webloc_context=""
+    if (( ${#WEBLOC_REFERENCES[@]} > 0 )); then
+        webloc_context="\n**Referenced Links:**\n"
+        for webloc_entry in "${WEBLOC_REFERENCES[@]}"; do
+            webloc_context+=" - $webloc_entry\n"
+        done
+    fi
+
     local user_message="# 3D Print File Organization Task
 
 ## CONTEXT
 **Target Folder:** '$folder_name'
-**Files to Organize:** $file_list
+**Files to Organize:**
+$file_inventory$webloc_context
 
 ## EXISTING STRUCTURE
 $folder_structure"
@@ -351,9 +619,10 @@ $cleaned_documentation
 
 ### 3. FILE NAMING RULES
 - **CRITICAL:** Preserve all model/part numbers from original names
-- Use Title Case with proper spacing
-- Maintain technical precision while improving readability
-- Keep file extensions lowercase
+- Always include at least one descriptor from the proposed folder name or documentation context (e.g., brand, character, application)
+- Replace placeholder tokens (obj_1, part1, copy) with meaningful component descriptors; if unsure, use "Component" + two-digit numbering (Component 01)
+- Use Title Case with proper spacing and keep file extensions lowercase
+- Maintain technical precision while improving readability and ensure names remain under 60 characters when possible
 
 ### 4. FILE ORGANIZATION
 **Subfolders:**
@@ -362,6 +631,11 @@ $cleaned_documentation
 - \"exports/\" - G-code (.gcode)
 - \"misc/\" - Other non-documentation files
 - \"root/\" - Documentation (.txt, .pdf, .html, .htm, .md, .rtf, .doc)
+
+### 5. QUALITY CHECKS
+- Proposed filenames must not be identical to the originals after removing punctuation and casing
+- Ensure sequential files use consistent numbering (e.g., 01, 02, 03)
+- Highlight any files that cannot be confidently described and provide best-effort naming
 
 ## OUTPUT REQUIREMENTS
 Provide a complete, consistent organization plan."
@@ -620,6 +894,9 @@ get_organization_plan() {
             exit 1
         fi
     fi
+
+    set_context_keywords "$proposed_name"
+    FILE_COUNTERS=()
 }
 
 execute_organization_plan() {
@@ -761,8 +1038,24 @@ organize_with_fallback() {
                 *) target_folder="misc" ;;
             esac
 
-            mv "$file" "$new_filepath/$target_folder/" 2>/dev/null || true
-            echo "$(basename "$file") => $target_folder/$(basename "$file")" >> "$rename_file"
+            local destination_dir="$new_filepath/$target_folder"
+            local destination_name="$(basename "$file")"
+
+            if [[ "$target_folder" == "files" || "$target_folder" == "exports" || "$target_folder" == "misc" ]]; then
+                local extension="${destination_name##*.}"
+                if [[ "$destination_name" == "$extension" ]]; then
+                    mv "$file" "$destination_dir/$destination_name" 2>/dev/null || true
+                    echo "$(basename "$file") => $target_folder/$destination_name" >> "$rename_file"
+                    continue
+                fi
+                local lowercase_extension="$(echo "$extension" | tr '[:upper:]' '[:lower:]')"
+                local new_base="$(generate_semantic_basename "$destination_name" "$extension" "$target_folder")"
+                new_base="$(sanitize_filename_component "$new_base")"
+                destination_name="$new_base.$lowercase_extension"
+            fi
+
+            mv "$file" "$destination_dir/$destination_name" 2>/dev/null || true
+            echo "$(basename "$file") => $target_folder/$destination_name" >> "$rename_file"
         fi
     done
 }
@@ -791,18 +1084,30 @@ move_file_to_target() {
         # Ensure lowercase extension
         local extension="${proposed_name##*.}"
         local filename="${proposed_name%.*}"
-        local final_name="$filename.$(echo "$extension" | tr '[:upper:]' '[:lower:]')"
+
+        if [[ "$target_subfolder" == "files" || "$target_subfolder" == "exports" || "$target_subfolder" == "misc" ]]; then
+            local original_base="$original_name"
+            if [[ "$original_name" == *.* ]]; then
+                original_base="${original_name%.*}"
+            fi
+            if needs_semantic_name "$original_base" "$filename"; then
+                filename="$(generate_semantic_basename "$original_name" "$extension" "$target_subfolder")"
+            fi
+        fi
+
+        filename="$(sanitize_filename_component "$filename")"
+        local lowercase_extension="$(echo "$extension" | tr '[:upper:]' '[:lower:]')"
+        local final_name="$filename.$lowercase_extension"
         local target_path="$target_dir/$final_name"
 
         # Handle conflicts
         if [[ -e "$target_path" ]]; then
             local counter=2
             local base_name="$filename"
-            local ext="$(echo "$extension" | tr '[:upper:]' '[:lower:]')"
-            while [[ -e "$target_dir/${base_name}_${counter}.${ext}" ]]; do
+            while [[ -e "$target_dir/${base_name}_${counter}.${lowercase_extension}" ]]; do
                 counter=$((counter + 1))
             done
-            final_name="${base_name}_${counter}.${ext}"
+            final_name="${base_name}_${counter}.${lowercase_extension}"
         fi
 
         mv "$actual_file" "$target_dir/$final_name"

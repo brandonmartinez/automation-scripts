@@ -18,9 +18,10 @@ fi
 
 # Get tokens and keys from 1Password
 ***REMOVED***
-AZURE_OPENAI_ENDPOINT=$(op read -n "op://cli/aoai-mm-automation/url")
-AZURE_OPENAI_TOKEN=$(op read -n "op://cli/aoai-mm-automation/token")
-API_KEY=$(op read -n "op://cli/aoai-mm-automation/api-key")
+OP_KEY_NAME="cli/aoai-mm-automation"
+AZURE_OPENAI_ENDPOINT=$(op read -n "op://$OP_KEY_NAME/url")
+AZURE_OPENAI_TOKEN=$(op read -n "op://$OP_KEY_NAME/token")
+API_KEY=$(op read -n "op://$OP_KEY_NAME/api-key")
 
 set +a
 
