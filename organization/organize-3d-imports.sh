@@ -79,12 +79,18 @@ is_text_file() {
     [[ "$extension" =~ ^(txt|md|rst|html|htm)$ ]] || [[ "$filename" == "$extension" ]]
 }
 
-# Check if file is a documentation file that should stay at root
+# Check if file is a documentation file or webloc that should stay at root
 is_special_doc_file() {
     local filename="$1"
     local lowercase_name=$(echo "$filename" | tr '[:upper:]' '[:lower:]')
 
-    [[ "$lowercase_name" =~ ^(readme|license|summary)(\.|$) ]]
+    # Check for special doc files (readme, license, summary)
+    [[ "$lowercase_name" =~ ^(readme|license|summary)(\.|$) ]] && return 0
+
+    # Check for webloc files
+    [[ "$lowercase_name" == *.webloc ]] && return 0
+
+    return 1
 }
 
 # Get file list as comma-separated string
@@ -328,6 +334,52 @@ needs_semantic_name() {
     fi
 
     return 1
+}
+
+# Collect non-3MF file extensions that should go into the files directory
+collect_files_extensions() {
+    local folder_path="$1"
+    local -A extensions_found
+
+    # Define 3D model extensions (excluding 3MF which stays at files root)
+    local -a model_extensions=(stl obj step stp f3d blend scad shapr)
+
+    # Scan all files in the folder
+    for file in "$folder_path"/*; do
+        if [[ -f "$file" ]]; then
+            local basename=$(basename "$file")
+            local extension="${basename##*.}"
+            local lowercase_ext=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
+
+            # Check if this extension is a non-3MF model extension
+            for model_ext in "${model_extensions[@]}"; do
+                if [[ "$lowercase_ext" == "$model_ext" ]]; then
+                    extensions_found[$lowercase_ext]=1
+                    break
+                fi
+            done
+        fi
+    done
+
+    # Return the list of extensions found
+    echo "${(k)extensions_found[@]}"
+}
+
+# Get the subdirectory name for a file extension
+get_extension_subdirectory() {
+    local extension="$1"
+    local lowercase_ext=$(echo "$extension" | tr '[:upper:]' '[:lower:]')
+
+    case "$lowercase_ext" in
+        stl) echo "STLs" ;;
+        obj) echo "OBJs" ;;
+        step|stp) echo "STEPs" ;;
+        f3d) echo "F3Ds" ;;
+        blend) echo "Blenders" ;;
+        scad) echo "SCADs" ;;
+        shapr) echo "Shaprs" ;;
+        *) echo "" ;;
+    esac
 }
 
 # ============================================================================
@@ -953,6 +1005,20 @@ setup_organized_folder() {
         mkdir -p "$new_filepath/$folder"
     done
 
+    # Create extension-based subdirectories in files folder
+    log_info "Detecting file extensions for organized subdirectories"
+    local extensions_list=$(collect_files_extensions "$new_filepath")
+
+    if [[ -n "$extensions_list" ]]; then
+        for ext in ${=extensions_list}; do
+            local subdir=$(get_extension_subdirectory "$ext")
+            if [[ -n "$subdir" ]]; then
+                mkdir -p "$new_filepath/files/$subdir"
+                log_info "Created subdirectory: files/$subdir"
+            fi
+        done
+    fi
+
     # Move backup if it exists (after creating misc directory)
     if [[ -f "$backup_path" ]]; then
         mv "$backup_path" "$new_filepath/misc/"
@@ -1040,22 +1106,40 @@ organize_with_fallback() {
 
             local destination_dir="$new_filepath/$target_folder"
             local destination_name="$(basename "$file")"
+            local relative_path="$target_folder"
 
             if [[ "$target_folder" == "files" || "$target_folder" == "exports" || "$target_folder" == "misc" ]]; then
                 local extension="${destination_name##*.}"
                 if [[ "$destination_name" == "$extension" ]]; then
+                    # Check for extension subdirectory
+                    if [[ "$target_folder" == "files" && "$lowercase_ext" != "3mf" ]]; then
+                        local extension_subdir=$(get_extension_subdirectory "$lowercase_ext")
+                        if [[ -n "$extension_subdir" ]]; then
+                            destination_dir="$destination_dir/$extension_subdir"
+                            relative_path="$target_folder/$extension_subdir"
+                        fi
+                    fi
                     mv "$file" "$destination_dir/$destination_name" 2>/dev/null || true
-                    echo "$(basename "$file") => $target_folder/$destination_name" >> "$rename_file"
+                    echo "$(basename "$file") => $relative_path/$destination_name" >> "$rename_file"
                     continue
                 fi
                 local lowercase_extension="$(echo "$extension" | tr '[:upper:]' '[:lower:]')"
                 local new_base="$(generate_semantic_basename "$destination_name" "$extension" "$target_folder")"
                 new_base="$(sanitize_filename_component "$new_base")"
                 destination_name="$new_base.$lowercase_extension"
+
+                # Check for extension subdirectory
+                if [[ "$target_folder" == "files" && "$lowercase_extension" != "3mf" ]]; then
+                    local extension_subdir=$(get_extension_subdirectory "$lowercase_extension")
+                    if [[ -n "$extension_subdir" ]]; then
+                        destination_dir="$destination_dir/$extension_subdir"
+                        relative_path="$target_folder/$extension_subdir"
+                    fi
+                fi
             fi
 
             mv "$file" "$destination_dir/$destination_name" 2>/dev/null || true
-            echo "$(basename "$file") => $target_folder/$destination_name" >> "$rename_file"
+            echo "$(basename "$file") => $relative_path/$destination_name" >> "$rename_file"
         fi
     done
 }
@@ -1097,6 +1181,18 @@ move_file_to_target() {
 
         filename="$(sanitize_filename_component "$filename")"
         local lowercase_extension="$(echo "$extension" | tr '[:upper:]' '[:lower:]')"
+
+        # For files folder, check if we should use an extension-based subdirectory
+        local extension_subdir=""
+        local relative_path="$target_subfolder"
+        if [[ "$target_subfolder" == "files" && "$lowercase_extension" != "3mf" ]]; then
+            extension_subdir=$(get_extension_subdirectory "$lowercase_extension")
+            if [[ -n "$extension_subdir" ]]; then
+                target_dir="$target_dir/$extension_subdir"
+                relative_path="$target_subfolder/$extension_subdir"
+            fi
+        fi
+
         local final_name="$filename.$lowercase_extension"
         local target_path="$target_dir/$final_name"
 
@@ -1111,7 +1207,7 @@ move_file_to_target() {
         fi
 
         mv "$actual_file" "$target_dir/$final_name"
-        echo "$(basename "$actual_file") => $target_subfolder/$final_name" >> "$rename_file"
+        echo "$(basename "$actual_file") => $relative_path/$final_name" >> "$rename_file"
     fi
 }
 
