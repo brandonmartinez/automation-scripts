@@ -90,6 +90,9 @@ is_special_doc_file() {
     # Check for webloc files
     [[ "$lowercase_name" == *.webloc ]] && return 0
 
+    # Check for JSON files
+    [[ "$lowercase_name" == *.json ]] && return 0
+
     return 1
 }
 
