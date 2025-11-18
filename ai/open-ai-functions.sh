@@ -18,10 +18,16 @@ fi
 
 # Get tokens and keys from 1Password
 ***REMOVED***
-OP_KEY_NAME="cli/aoai-mm-automation"
-AZURE_OPENAI_ENDPOINT=$(op read -n "op://$OP_KEY_NAME/url")
-AZURE_OPENAI_TOKEN=$(op read -n "op://$OP_KEY_NAME/token")
-API_KEY=$(op read -n "op://$OP_KEY_NAME/api-key")
+OP_KEY_NAME="cli/openai-api"
+API_KEY=$(op read -n "op://$OP_KEY_NAME/credential")
+
+OPENAI_API_BASE_URL="${OPENAI_API_BASE_URL:-https://api.openai.com/v1}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.1}"
+
+if [[ -z "$API_KEY" ]]; then
+    log_error "Failed to load OpenAI API key from 1Password item '$OP_KEY_NAME' (credential field)"
+    exit 1
+fi
 
 set +a
 
@@ -56,21 +62,31 @@ get-folder-list() {
 }
 
 get-openai-response() {
-    log_debug "Sending request to Azure OpenAI endpoint"
+    log_debug "Preparing request for OpenAI API chat completions"
 
-    # Send the extracted text to the Azure OpenAI endpoint
-    RESPONSE=$(curl -s -X POST "$AZURE_OPENAI_ENDPOINT" \
+    local request_body
+    if ! request_body=$(printf '%s' "$1" | jq --arg model "$OPENAI_MODEL" '.model = (if .model then .model else $model end)'); then
+        log_error "Failed to build OpenAI request body from payload"
+        exit 1
+    fi
+
+    local endpoint="${OPENAI_API_BASE_URL%/}/chat/completions"
+    log_debug "Sending request to $endpoint with model '$OPENAI_MODEL'"
+
+    RESPONSE=$(curl -sS -X POST "$endpoint" \
         -H "Content-Type: application/json" \
-        -H "api-key: $API_KEY" \
-        -d "$1")
+        -H "Authorization: Bearer $API_KEY" \
+        -d "$request_body")
 
     # Check if the request was successful
     if [ $? -ne 0 ]; then
-        log_error "Failed to send the text to the Azure OpenAI endpoint"
+        log_error "Failed to send request to OpenAI API at $endpoint"
         exit -1
     fi
 
     log_debug "Received response from API, processing..."
+
+    CLEANED_RESPONSE="$RESPONSE"
 
     # First, let's check if we can extract content without validating the entire JSON
     CONTENT=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
@@ -121,4 +137,49 @@ get-openai-response() {
 
     # Parse the response to get the categorization and date
     echo "$CONTENT"
+}
+
+test-openai-connectivity() {
+    local model="${1:-$OPENAI_MODEL}"
+    local endpoint="${OPENAI_API_BASE_URL%/}/models/${model}"
+
+    log_info "Testing OpenAI API connectivity for model '$model'"
+
+    local tmp_response
+    tmp_response=$(mktemp)
+
+    local http_status
+    if ! http_status=$(curl -sS -o "$tmp_response" -w "%{http_code}" \
+        -H "Authorization: Bearer $API_KEY" \
+        -H "Content-Type: application/json" \
+        "$endpoint"); then
+        log_error "Failed to reach OpenAI API during connectivity test"
+        rm -f "$tmp_response"
+        return 1
+    fi
+
+    local body
+    body=$(cat "$tmp_response")
+    rm -f "$tmp_response"
+
+    if [[ "$http_status" == "200" ]]; then
+        log_info "OpenAI connectivity check succeeded for model '$model'"
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$body" | jq '{id, owned_by, status: "available"}'
+        else
+            printf '%s\n' "$body"
+        fi
+        return 0
+    fi
+
+    local error_message
+    error_message=$(printf '%s' "$body" | jq -r '.error.message // empty' 2>/dev/null)
+
+    if [[ -n "$error_message" ]]; then
+        log_error "OpenAI connectivity check failed (HTTP $http_status): $error_message"
+    else
+        log_error "OpenAI connectivity check failed (HTTP $http_status). Response: $body"
+    fi
+
+    return 1
 }
