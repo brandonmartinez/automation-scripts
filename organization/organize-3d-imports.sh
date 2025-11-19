@@ -36,7 +36,12 @@ if [[ $# -eq 0 ]]; then
     exit 1
 fi
 
-readonly INPUT_PATH="$1"
+# Allow paths with spaces by treating all arguments as part of the directory path
+readonly INPUT_PATH="${*}"
+if [[ -z "$INPUT_PATH" ]]; then
+    echo "Error: resolved directory path is empty after parsing arguments" >&2
+    exit 1
+fi
 readonly NAME="$(basename "$INPUT_PATH")"
 
 # Validate that the input path exists and is a directory

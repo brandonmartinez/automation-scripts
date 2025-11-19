@@ -126,6 +126,10 @@ get-openai-response() {
         fi
     fi
 
+    # Normalize control characters that can break downstream JSON parsing
+    CONTENT="$(printf '%s' "$CONTENT" | tr '\r\n' '  ')"
+    CONTENT="${CONTENT//$'\t'/ }"
+
     # Final content validation
     log_debug "Final content validation - length: ${#CONTENT}, preview: '${CONTENT:0:100}...'"
 
