@@ -156,46 +156,6 @@ get_folder_structure() {
 
 }
 
-strip_file_tags() {
-    local file_path="$1"
-
-    # Use tag command if available (handles all extended attributes automatically)
-    if command -v tag >/dev/null 2>&1; then
-        log_debug "Using 'tag' command to clear all tags and extended attributes"
-        tag -r "*" "$file_path" 2>/dev/null || true
-    else
-        # Fallback: Manual extended attribute removal when tag command is not available
-        log_debug "Using manual extended attribute removal (tag command not available)"
-        local tag_attributes=(
-            "com.apple.metadata:_kMDItemUserTags"
-            "com.apple.metadata:kMDItemUserTags"
-            "com.apple.FinderInfo"
-            "com.apple.metadata:_kMDItemFinderComment"
-        )
-
-        for attr in "${tag_attributes[@]}"; do
-            if xattr -p "$attr" "$file_path" >/dev/null 2>&1; then
-                log_debug "Removing extended attribute: $attr"
-                xattr -d "$attr" "$file_path" 2>/dev/null || true
-            fi
-        done
-
-        # Additional AppleScript fallback for Finder labels
-        log_debug "Using AppleScript fallback to clear Finder labels"
-        osascript -e "
-            try
-                tell application \"Finder\"
-                    set theFile to POSIX file \"$file_path\" as alias
-                    set label index of theFile to 0
-                    set comment of theFile to \"\"
-                end tell
-            on error
-                -- Ignore errors if file is not accessible
-            end try
-        " 2>/dev/null || true
-    fi
-}
-
 set_finder_comments() {
     local file_path="$1"
     local comment="$2"
@@ -718,9 +678,6 @@ prepare_initial_data() {
     # Get comprehensive folder structure for AI context
     FOLDER_STRUCTURE=$(prepare_folder_structure_context)
 
-    # Clear file attributes to avoid double processing
-    log_debug "Clearing file attributes to avoid double processing"
-    strip_file_tags "$PDF_FILE"
 }
 
 process_with_ai() {
