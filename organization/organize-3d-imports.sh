@@ -763,11 +763,21 @@ apply_archive_destination() {
     log_info "Moving organized folder to archive: $resolved_destination"
     mv "$INPUT_PATH" "$resolved_destination"
 
+    local updated_backup_path=""
+    if [[ -n "$BACKUP_ARCHIVE" ]]; then
+        updated_backup_path="$resolved_destination/$(basename "$BACKUP_ARCHIVE")"
+        BACKUP_ARCHIVE="$updated_backup_path"
+    fi
+
     INPUT_PATH="$resolved_destination"
     STATE_FILE="$resolved_destination/$DEFAULT_STATE_FILENAME"
 
     local tmp=$(mktemp)
-    jq --arg path "$resolved_destination" '.metadata.archivePlan.destinationPath = $path' "$STATE_FILE" >"$tmp"
+    jq --arg dest "$resolved_destination" --arg backup "$updated_backup_path" '
+        .metadata.inputPath = $dest |
+        .metadata.archivePlan.destinationPath = $dest |
+        (if $backup == "" then . else (.metadata.backupZip = $backup) end)
+    ' "$STATE_FILE" >"$tmp"
     mv "$tmp" "$STATE_FILE"
 }
 
@@ -817,9 +827,17 @@ main() {
     build_file_inventory
     collect_documentation_context
     run_agentic_cycle
-    enforce_filetype_structure
+    if (( SKIP_AI )); then
+        log_info "Skipping structure enforcement due to --skip-ai"
+    else
+        enforce_filetype_structure
+    fi
     persist_state_file
-    apply_rename_plan
+    if (( SKIP_AI )); then
+        log_info "Skipping rename/move application due to --skip-ai"
+    else
+        apply_rename_plan
+    fi
     plan_archive_destination
     apply_archive_destination
     reveal_result_folder
