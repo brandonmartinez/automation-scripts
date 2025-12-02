@@ -24,6 +24,9 @@ ORIGINAL_INPUT_PATH=""
 FILE_INDEX=0
 AI_HELPERS_LOADED=0
 DOCUMENTATION_CONTEXT=""
+FILE_ENTRIES_BUFFER=""
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/organize-3d-imports"
+ARCHIVE_CACHE_TTL=${ARCHIVE_CACHE_TTL:-900}
 
 
 typeset -a IGNORE_PATTERNS=(
@@ -134,13 +137,16 @@ validate_environment() {
     require_command zip
     require_command find
     require_command stat
+    require_command cmp
 
     if [[ -z "$STATE_FILE" ]]; then
         STATE_FILE="$INPUT_PATH/$DEFAULT_STATE_FILENAME"
     fi
 
     mkdir -p "$BASE_PATH"
+    mkdir -p "$CACHE_DIR"
     WORK_STATE_FILE=$(mktemp -t agentic-state.XXXXXX.json)
+    FILE_ENTRIES_BUFFER=$(mktemp -t agentic-files.XXXXXX.json)
 }
 
 create_backup_archive() {
@@ -188,7 +194,8 @@ initialize_state_document() {
                 backupZip: $backup,
                 dryRun: ($dry == "1"),
                 totalFiles: 0,
-                agentCycles: []
+                agentCycles: [],
+                duplicates: []
             },
             files: []
         }' >"$WORK_STATE_FILE"
@@ -247,9 +254,18 @@ append_file_entry() {
             agentNotes: []
         }')
 
+    printf '%s\n' "$file_json" >>"$FILE_ENTRIES_BUFFER"
+}
+
+finalize_file_inventory() {
+    local entries_json="[]"
+    if [[ -s "$FILE_ENTRIES_BUFFER" ]]; then
+        entries_json=$(jq -s '.' "$FILE_ENTRIES_BUFFER")
+    fi
+
     local tmp=$(mktemp)
-    jq --argjson entry "$file_json" \
-        '.files += [$entry] | .metadata.totalFiles = (.metadata.totalFiles + 1)' \
+    jq --argjson entries "$entries_json" \
+        '.files = $entries | .metadata.totalFiles = ($entries | length)' \
         "$WORK_STATE_FILE" >"$tmp"
     mv "$tmp" "$WORK_STATE_FILE"
 }
@@ -258,6 +274,7 @@ build_file_inventory() {
     log_divider "DISCOVERY"
     log_info "Scanning directory tree for files"
 
+    : >"$FILE_ENTRIES_BUFFER"
     local found_any=0
     while IFS= read -r -d '' file; do
         local base="$(basename "$file")"
@@ -278,6 +295,7 @@ build_file_inventory() {
         log_error "No files discovered in $INPUT_PATH"
         exit 1
     fi
+    finalize_file_inventory
     log_info "Indexed $(jq '.metadata.totalFiles' "$WORK_STATE_FILE") files"
 }
 
@@ -378,11 +396,50 @@ canonical_folder_for_extension() {
 
 sanitize_folder_component() {
     local value="$1"
+    value=$(normalize_readable_token "$value")
     value=$(echo "$value" | sed 's/[\/:*?"<>|]/-/g')
+    value=$(echo "$value" | sed -E 's/-{2,}/-/g')
+    value=$(echo "$value" | sed -E 's/ +- +/ - /g')
     value=$(echo "$value" | tr -s ' ' ' ')
     value=$(echo "$value" | sed 's/^ *//;s/ *$//')
     [[ -z "$value" ]] && value="Unsorted Project"
     echo "$value"
+}
+
+normalize_readable_token() {
+    local value="$1"
+    value="${value//+/ }"
+    value="${value//_/ }"
+    value=$(printf '%s' "$value" | sed -E 's/[^[:alnum:]-]+/ /g')
+    value=$(printf '%s' "$value" | tr -s ' ')
+    value=$(printf '%s' "$value" | sed -E 's/^ +//;s/ +$//')
+    [[ -z "$value" ]] && value="Untitled"
+    printf '%s\n' "$value"
+}
+
+normalize_filename() {
+    local name="$1"
+    [[ -z "$name" ]] && { printf '%s\n' "$name"; return; }
+
+    local base="$name"
+    local ext=""
+
+    if [[ "$name" == .* ]]; then
+        if [[ "$name" == *.* && "$name" != .*.* ]]; then
+            ext="${name##*.}"
+            base="${name%.*}"
+        fi
+    elif [[ "$name" == *.* ]]; then
+        ext="${name##*.}"
+        base="${name%.*}"
+    fi
+
+    base=$(normalize_readable_token "$base")
+    if [[ -n "$ext" ]]; then
+        printf '%s.%s\n' "$base" "$ext"
+    else
+        printf '%s\n' "$base"
+    fi
 }
 
 resolve_unique_archive_destination() {
@@ -410,6 +467,19 @@ get_folder_structure() {
     local base_path="$1"
     [[ -d "$base_path" ]] || return 1
 
+    local cache_key cache_file now modified
+    cache_key=$(printf '%s' "$base_path" | cksum | awk '{print $1}')
+    cache_file="$CACHE_DIR/archive-structure-$cache_key.json"
+    now=$(date +%s)
+
+    if [[ -f "$cache_file" ]]; then
+        modified=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        if (( now - modified < ARCHIVE_CACHE_TTL )); then
+            cat "$cache_file"
+            return 0
+        fi
+    fi
+
     local structure_file=$(mktemp)
     jq -n '{categories: []}' >"$structure_file"
 
@@ -436,8 +506,24 @@ get_folder_structure() {
         mv "$updated" "$structure_file"
     done
 
-    cat "$structure_file"
+    local structure_json
+    structure_json=$(cat "$structure_file")
     rm -f "$structure_file"
+
+    if [[ -n "$structure_json" ]]; then
+        local tmp_cache="$cache_file.tmp"
+        printf '%s' "$structure_json" >"$tmp_cache"
+        mv "$tmp_cache" "$cache_file"
+    fi
+
+    printf '%s' "$structure_json"
+}
+
+invalidate_archive_cache() {
+    local base_path="$1"
+    local cache_key
+    cache_key=$(printf '%s' "$base_path" | cksum | awk '{print $1}')
+    rm -f "$CACHE_DIR/archive-structure-$cache_key.json"
 }
 
 enforce_filetype_structure() {
@@ -457,11 +543,14 @@ enforce_filetype_structure() {
             chosen_name="$proposed_filename"
         fi
 
+        local normalized_name
+        normalized_name=$(normalize_filename "$chosen_name")
+
         local relative_path
         if [[ -z "$target_folder" ]]; then
-            relative_path="$chosen_name"
+            relative_path="$normalized_name"
         else
-            relative_path="$target_folder/$chosen_name"
+            relative_path="$target_folder/$normalized_name"
         fi
 
         local absolute_path="$INPUT_PATH/$relative_path"
@@ -469,7 +558,7 @@ enforce_filetype_structure() {
         local tmp=$(mktemp)
         jq --arg id "$id" \
             --arg folder "$target_folder" \
-            --arg filename "$chosen_name" \
+            --arg filename "$normalized_name" \
             --arg rel "$relative_path" \
             --arg abs "$absolute_path" \
             '(.files[] | select(.id == ($id|tonumber))) |= (
@@ -491,6 +580,31 @@ record_agent_cycle() {
     mv "$tmp" "$WORK_STATE_FILE"
 }
 
+validate_agent_plan() {
+    local plan_json="$1"
+    local expected_ids expected_count
+    expected_ids=$(jq '[.files[].id] | sort' "$WORK_STATE_FILE")
+    expected_count=$(jq '.metadata.totalFiles' "$WORK_STATE_FILE")
+
+    jq -e \
+        --argjson expectedIds "$expected_ids" \
+        --argjson expectedCount "$expected_count" \
+        '(.files | type == "array") and
+         (.files | length == $expectedCount) and
+         (([.files[].id] | sort) == $expectedIds) and
+         (reduce .files[] as $file (
+             true;
+             . and
+             ($file.id | type == "number") and
+             ($file.proposed | type == "object") and
+             ( ($file.proposed.folder == null) or ($file.proposed.folder | type == "string") ) and
+             ( ($file.proposed.filename == null) or ($file.proposed.filename | type == "string") ) and
+             ( ($file.proposed.path == null) or ($file.proposed.path | type == "string") ) and
+             ( ($file.proposed.absolutePath == null) or ($file.proposed.absolutePath | type == "string") ) and
+             ( ($file.proposed.rationale == null) or ($file.proposed.rationale | type == "string") )
+         ))' <<<"$plan_json" >/dev/null 2>&1
+}
+
 run_agentic_cycle() {
     if (( SKIP_AI )); then
         log_info "Skipping AI planning cycle by request"
@@ -500,7 +614,7 @@ run_agentic_cycle() {
     log_divider "AI CYCLE"
     ensure_ai_helpers_loaded
 
-    local system_message="You are an expert 3D printing archivist. Given JSON data describing a folder, propose polished folder structures and rename/move plans. Return JSON matching the schema you received, updating only metadata.agentCycles and files[].proposed.* fields."
+    local system_message="You are an expert 3D printing archivist. Given JSON data describing a folder, propose polished folder structures and rename/move plans. Translate all names to clear English when they appear in other languages, normalize punctuation, and return JSON matching the schema you received, updating only metadata.agentCycles and files[].proposed.* fields."
     local state_blob=$(cat "$WORK_STATE_FILE")
     local user_message="Analyze the following JSON catalog of files. For each entry, fill the proposed fields with the desired destination folder (relative to the input root), the desired filename, and the combined path. If no change is needed, leave the proposed fields null. Respond with valid JSON only.\n\n$state_blob"
 
@@ -534,7 +648,17 @@ run_agentic_cycle() {
         exit 1
     fi
 
+    if ! validate_agent_plan "$response"; then
+        log_error "AI response failed schema validation"
+        exit 1
+    fi
+
     printf '%s' "$response" >"$WORK_STATE_FILE"
+
+    local tmp=$(mktemp)
+    jq 'if (.metadata.duplicates? | type == "array") then . else (.metadata.duplicates = []) end' \
+        "$WORK_STATE_FILE" >"$tmp"
+    mv "$tmp" "$WORK_STATE_FILE"
     record_agent_cycle "Primary planning cycle"
 }
 
@@ -587,6 +711,31 @@ resolve_destination_path() {
     fi
 }
 
+files_identical() {
+    local first="$1"
+    local second="$2"
+    [[ -f "$first" && -f "$second" ]] || return 1
+
+    local size_a size_b
+    size_a=$(stat -f%z "$first" 2>/dev/null || stat -c%s "$first" 2>/dev/null || echo 0)
+    size_b=$(stat -f%z "$second" 2>/dev/null || stat -c%s "$second" 2>/dev/null || echo 0)
+    [[ "$size_a" == "$size_b" ]] || return 1
+
+    cmp -s "$first" "$second"
+}
+
+record_duplicate_detection() {
+    local file_id="$1"
+    local original="$2"
+    local existing="$3"
+
+    local tmp=$(mktemp)
+    jq --arg id "$file_id" --arg orig "$original" --arg dup "$existing" \
+        '.metadata.duplicates += [{ fileId: ($id|tonumber), originalPath: $orig, duplicateOf: $dup }]' \
+        "$STATE_FILE" >"$tmp"
+    mv "$tmp" "$STATE_FILE"
+}
+
 apply_rename_plan() {
     log_divider "APPLY"
     if (( DRY_RUN )); then
@@ -613,6 +762,12 @@ apply_rename_plan() {
             continue
         fi
         if [[ "$original_path" == "$destination" ]]; then
+            continue
+        fi
+
+        if [[ -e "$destination" ]] && files_identical "$original_path" "$destination"; then
+            log_info "Duplicate detected; skipping move for $original_path (matches $destination)"
+            record_duplicate_detection "$file_id" "$original_path" "$destination"
             continue
         fi
 
@@ -670,7 +825,7 @@ plan_archive_destination() {
     else
         ensure_ai_helpers_loaded
 
-        local system_message="You curate a hierarchical 3D print archive organized as Category/Subcategory/ProjectFolder. Prefer reusing existing categories whenever possible; add new subcategories more often than new categories, and only create a brand-new category when no existing theme fits. Always output strict JSON with keys parentCategory, subCategory, folderName, rationale."
+        local system_message="You curate a hierarchical 3D print archive organized as Category/Subcategory/ProjectFolder. Prefer reusing existing categories whenever possible; add new subcategories more often than new categories, and only create a brand-new category when no existing theme fits. Translate non-English names to clear English, normalize punctuation, and always output strict JSON with keys parentCategory, subCategory, folderName, rationale."
 
         local user_message
         printf -v user_message 'Archive structure JSON:\n%s\n\nFolder summary JSON:\n%s\n\nInstructions:\n1. Favor existing categories when possible.\n2. Prefer introducing a new subcategory within an existing category before inventing an entirely new category.\n3. Only create a brand-new category if filenames and documentation clearly describe a novel theme.\n4. Respond only with JSON.\n' "$folder_structure_json" "$summary_json"
@@ -762,6 +917,7 @@ apply_archive_destination() {
 
     log_info "Moving organized folder to archive: $resolved_destination"
     mv "$INPUT_PATH" "$resolved_destination"
+    invalidate_archive_cache "$BASE_PATH"
 
     local updated_backup_path=""
     if [[ -n "$BACKUP_ARCHIVE" ]]; then
@@ -814,6 +970,7 @@ reveal_result_folder() {
 
 cleanup() {
     [[ -n "$WORK_STATE_FILE" && -f "$WORK_STATE_FILE" && "$WORK_STATE_FILE" != "$STATE_FILE" ]] && rm -f "$WORK_STATE_FILE"
+    [[ -n "$FILE_ENTRIES_BUFFER" && -f "$FILE_ENTRIES_BUFFER" ]] && rm -f "$FILE_ENTRIES_BUFFER"
 }
 
 main() {
