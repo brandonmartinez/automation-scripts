@@ -27,6 +27,7 @@ DOCUMENTATION_CONTEXT=""
 FILE_ENTRIES_BUFFER=""
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/organize-3d-imports"
 ARCHIVE_CACHE_TTL=${ARCHIVE_CACHE_TTL:-900}
+typeset -A WEBLOC_URL_REGISTRY=()
 
 
 typeset -a IGNORE_PATTERNS=(
@@ -53,6 +54,60 @@ optional AI planning cycle to propose renames, persists the JSON plan, and then
 USAGE
 }
 
+extract_webloc_url() {
+    local file_path="$1"
+    [[ -f "$file_path" ]] || return
+
+    local url=""
+    if url=$(/usr/libexec/PlistBuddy -c 'Print :URL' "$file_path" 2>/dev/null); then
+        :
+    elif url=$(/usr/libexec/PlistBuddy -c 'Print :URLString' "$file_path" 2>/dev/null); then
+        :
+    else
+        url=$(grep -A1 -i '<key>URL' "$file_path" 2>/dev/null | tail -n1 | sed -E 's/<[^>]+>//g' | sed 's/^\s*//;s/\s*$//')
+    fi
+
+    printf '%s\n' "${url//$'\r'/}" | sed 's/^ *//;s/ *$//'
+}
+
+fetch_url_preview() {
+    local url="$1"
+    [[ -n "$url" ]] || return
+
+    local html
+    html=$(curl -Ls --max-time 15 --retry 1 --retry-all-errors -H 'Accept-Language: en-US,en;q=0.9' -A 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15' "$url" 2>/dev/null | head -c 50000) || return
+    if [[ -z "$html" ]]; then
+        log_debug "URL preview fetch returned empty body: $url"
+        return
+    fi
+
+    local title meta_desc og_desc description preview
+    title=$(printf '%s' "$html" | xmllint --html --recover --xpath 'string(//title)' - 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+    meta_desc=$(printf '%s' "$html" | xmllint --html --recover --xpath 'string(//meta[translate(@name,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="description"]/@content)' - 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+    og_desc=$(printf '%s' "$html" | xmllint --html --recover --xpath 'string(//meta[translate(@property,"ABCDEFGHIJKLMNOPQRSTUVWXYZ","abcdefghijklmnopqrstuvwxyz")="og:description"]/@content)' - 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ *//;s/ *$//')
+
+    description="$meta_desc"
+    [[ -z "$description" ]] && description="$og_desc"
+
+    if [[ -n "$title" && -n "$description" ]]; then
+        preview="$title — $description"
+    elif [[ -n "$title" ]]; then
+        preview="$title"
+    else
+        preview="$description"
+    fi
+
+    preview=$(printf '%s' "$preview" | tr -d '\r' | sed 's/^ *//;s/ *$//' | cut -c1-600)
+
+    case "$preview" in
+        "Just a moment"*|"Attention Required"*)
+            log_debug "URL preview blocked by site challenge: $url"
+            return
+            ;;
+    esac
+
+    [[ -n "$preview" ]] && printf '%s\n' "$preview"
+}
 require_command() {
     local cmd="$1"
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -138,6 +193,8 @@ validate_environment() {
     require_command find
     require_command stat
     require_command cmp
+    require_command curl
+    require_command xmllint
 
     if [[ -z "$STATE_FILE" ]]; then
         STATE_FILE="$INPUT_PATH/$DEFAULT_STATE_FILENAME"
@@ -227,6 +284,21 @@ append_file_entry() {
     local file_id=$FILE_INDEX
     FILE_INDEX=$((FILE_INDEX + 1))
 
+    local source_url=""
+    local link_preview=""
+    local url_duplicate_of=""
+    if [[ "${extension:l}" == "webloc" ]]; then
+        source_url=$(extract_webloc_url "$file_path" || true)
+        if [[ -n "$source_url" ]]; then
+            link_preview=$(fetch_url_preview "$source_url" || true)
+            if [[ -n "${WEBLOC_URL_REGISTRY[$source_url]-}" ]]; then
+                url_duplicate_of="${WEBLOC_URL_REGISTRY[$source_url]}"
+            else
+                WEBLOC_URL_REGISTRY[$source_url]="$file_path"
+            fi
+        fi
+    fi
+
     local file_json
     file_json=$(jq -n \
         --arg id "$file_id" \
@@ -236,6 +308,9 @@ append_file_entry() {
         --arg ext "${extension:l}" \
         --arg size "$size_bytes" \
         --arg category "$category" \
+        --arg source "$source_url" \
+        --arg preview "$link_preview" \
+        --arg duplicate "$url_duplicate_of" \
         '{
             id: ($id|tonumber),
             originalPath: $original,
@@ -244,6 +319,9 @@ append_file_entry() {
             extension: $ext,
             sizeBytes: ($size|tonumber),
             category: $category,
+            sourceUrl: (if $source == "" then null else $source end),
+            linkPreview: (if $preview == "" then null else $preview end),
+            urlDuplicateOf: (if $duplicate == "" then null else $duplicate end),
             proposed: {
                 folder: null,
                 filename: null,
@@ -267,6 +345,27 @@ finalize_file_inventory() {
     jq --argjson entries "$entries_json" \
         '.files = $entries | .metadata.totalFiles = ($entries | length)' \
         "$WORK_STATE_FILE" >"$tmp"
+    mv "$tmp" "$WORK_STATE_FILE"
+
+    record_url_duplicates
+}
+
+record_url_duplicates() {
+    local tmp=$(mktemp)
+    jq '
+        .metadata.duplicates += (
+            [ .files[]
+              | select(.urlDuplicateOf != null)
+              | {
+                    fileId: .id,
+                    originalPath: .originalPath,
+                    duplicateOf: .urlDuplicateOf,
+                    url: .sourceUrl,
+                    type: "url"
+                }
+            ]
+        )
+    ' "$WORK_STATE_FILE" >"$tmp"
     mv "$tmp" "$WORK_STATE_FILE"
 }
 
@@ -338,30 +437,38 @@ collect_documentation_context() {
     done < <(find "$INPUT_PATH" -maxdepth 1 -type f \
         \( -iname 'readme' -o -iname 'readme.*' -o -iname '*.md' -o -iname '*.rtf' -o -iname '*.txt' -o -iname '*.pdf' \) -print0)
 
-    if (( ${#doc_files[@]} == 0 )); then
-        log_info "No documentation files detected"
-        local tmp=$(mktemp)
-        jq '.metadata.documentationContext = ""' "$WORK_STATE_FILE" >"$tmp"
-        mv "$tmp" "$WORK_STATE_FILE"
-        return
-    fi
-
     local combined=""
     local max_chars=6000
-    for doc_file in "${doc_files[@]}"; do
-        local snippet=$(read_text_from_file "$doc_file")
-        [[ -z "$snippet" ]] && continue
-        combined+=$'\n['"$(basename "$doc_file")"$']\n'
-        combined+="$snippet"
+    if (( ${#doc_files[@]} )); then
+        for doc_file in "${doc_files[@]}"; do
+            local snippet=$(read_text_from_file "$doc_file")
+            [[ -z "$snippet" ]] && continue
+            combined+=$'\n['"$(basename "$doc_file")"$']\n'
+            combined+="$snippet"
 
-        if (( ${#combined} >= max_chars )); then
-            combined=${combined:0:$max_chars}
-            break
-        fi
-    done
+            if (( ${#combined} >= max_chars )); then
+                combined=${combined:0:$max_chars}
+                break
+            fi
+        done
+    else
+        log_info "No documentation files detected"
+    fi
+
+    local link_snippets
+    link_snippets=$(jq -r '
+        [ .files[]
+          | select(.linkPreview != null)
+          | "[Link] " + (.sourceUrl // "unknown") + "\n" + .linkPreview
+        ] | join("\n")
+    ' "$WORK_STATE_FILE")
+
+    if [[ -n "$link_snippets" ]]; then
+        combined+=$'\n[Link Previews]\n'
+        combined+="$link_snippets"
+    fi
 
     if [[ -z "$combined" ]]; then
-        log_info "Documentation files could not be read"
         local tmp=$(mktemp)
         jq '.metadata.documentationContext = ""' "$WORK_STATE_FILE" >"$tmp"
         mv "$tmp" "$WORK_STATE_FILE"
