@@ -187,7 +187,6 @@ setup_environment() {
 # ============================================================================
 # STATE MANAGEMENT HELPERS
 # ============================================================================
-
 initialize_state_document() {
     local generated_at file_size extension move_mode phases_json
     generated_at=$(date -Iseconds)
@@ -1113,7 +1112,9 @@ apply_ai_suggestions() {
             log_debug "Existing folder match equals category '$CATEGORY'; keeping sender as '$SENDER'"
         else
             log_info "Using existing folder match for sender consistency: $existing_folder_match"
-            SENDER="$existing_folder_match"
+            if ! normalize_existing_folder_match "$existing_folder_match"; then
+                SENDER="$existing_folder_match"
+            fi
         fi
     elif [[ "$suggested_sender" != "null" && -n "$suggested_sender" ]]; then
         log_info "Using AI suggested sender: $suggested_sender (instead of: $SENDER)"
@@ -1144,6 +1145,47 @@ apply_ai_suggestions() {
 # ============================================================================
 # FOLDER MANAGEMENT FUNCTIONS
 # ============================================================================
+
+normalize_existing_folder_match() {
+    local folder_path="${1:-}"
+    [[ -z "$folder_path" || "$folder_path" == "null" ]] && return 1
+
+    local trimmed="${folder_path%/}"
+    [[ -z "$trimmed" ]] && return 1
+
+    if [[ "$trimmed" == "$PAPERWORK_DIR" ]]; then
+        return 1
+    fi
+
+    if [[ "$trimmed" == "$PAPERWORK_DIR"/* ]]; then
+        trimmed="${trimmed#$PAPERWORK_DIR/}"
+    elif [[ "$trimmed" == "$PAPERWORK_DIR"* ]]; then
+        trimmed="${trimmed#$PAPERWORK_DIR}"
+        trimmed="${trimmed#/}"
+    fi
+
+    trimmed="${trimmed#./}"
+    [[ "$trimmed" != */* ]] && return 1
+
+    local category_part="${trimmed%%/*}"
+    local remainder="${trimmed#*/}"
+    [[ -z "$category_part" || -z "$remainder" ]] && return 1
+
+    local sender_part="${remainder%%/*}"
+    local dept_part=""
+    if [[ "$remainder" == */* ]]; then
+        dept_part="${remainder#*/}"
+    fi
+
+    CATEGORY="$category_part"
+    SENDER="$sender_part"
+    if [[ -n "$dept_part" ]]; then
+        DEPARTMENT="$dept_part"
+    else
+        DEPARTMENT=""
+    fi
+    return 0
+}
 
 create_folder_structure() {
     local category="$1"
