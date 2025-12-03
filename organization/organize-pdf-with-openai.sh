@@ -334,6 +334,9 @@ record_discovery_snapshot() {
     if [[ -z "$structure_json" ]]; then
         structure_json='{"categories":[]}'
     fi
+
+    structure_json=$(printf '%s\n' "$structure_json" | sed -E '/^[[:space:]]*[[:alnum:]_]+=.*/d')
+
     local cleaned_structure
     if ! cleaned_structure=$(printf '%s' "$structure_json" | jq -c '.' 2>/dev/null); then
         log_warn "Folder structure snapshot invalid JSON; defaulting to empty structure"
@@ -433,7 +436,11 @@ build_folder_structure_snapshot() {
 
     if [[ -f "$cache_file" ]]; then
         modified=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)
-        if (( now - modified < STRUCTURE_CACHE_TTL )); then
+        local ttl_check="$STRUCTURE_CACHE_TTL" modified_check="$modified"
+        [[ "$ttl_check" == <-> ]] || ttl_check=900
+        [[ "$modified_check" == <-> ]] || modified_check=0
+
+        if (( ttl_check > 0 )) && (( now - modified_check < ttl_check )); then
             cat "$cache_file"
             return
         fi
@@ -568,30 +575,30 @@ function emit(raw, normalized, precision, pattern) {
     for (i=1; i<=len; i++) {
         subline=substr(line, i)
 
-        if (match(subline, /^[0-9]{4}[-_/][0-9]{2}[-_/][0-9]{2}/)) {
+        if (match(subline, /^[0-9]{4}[-_\/][0-9]{2}[-_\/][0-9]{2}/)) {
             raw=substr(subline, 1, RLENGTH)
             normalized=raw
-            gsub(/[_/]/, "-", normalized)
+            gsub(/[_\/]/, "-", normalized)
             emit(raw, normalized, "day", "separator-day")
         }
 
         if (match(subline, /^[0-9]{8}/)) {
             raw=substr(subline, 1, 8)
             prev=(i==1) ? "" : substr(line, i-1, 1)
-            next=(i+8>len) ? "" : substr(line, i+8, 1)
-            if (!(prev ~ /[0-9]/ || next ~ /[0-9]/)) {
+            next_char=(i+8>len) ? "" : substr(line, i+8, 1)
+            if (!(prev ~ /[0-9]/ || next_char ~ /[0-9]/)) {
                 normalized=sprintf("%s-%s-%s", substr(raw,1,4), substr(raw,5,2), substr(raw,7,2))
                 emit(raw, normalized, "day", "compact-day")
             }
         }
 
-        if (match(subline, /^[0-9]{4}[-_/][0-9]{2}/)) {
+        if (match(subline, /^[0-9]{4}[-_\/][0-9]{2}/)) {
             raw=substr(subline, 1, RLENGTH)
             next_index=i+RLENGTH
             next_char=(next_index <= len) ? substr(line, next_index, 1) : ""
-            if (!(next_char ~ /^[-_/0-9]/)) {
+            if (!(next_char ~ /^[-_\/0-9]/)) {
                 normalized=raw
-                gsub(/[_/]/, "-", normalized)
+                gsub(/[_\/]/, "-", normalized)
                 normalized=substr(normalized, 1, 7)
                 emit(raw, normalized, "month", "separator-month")
             }
@@ -600,8 +607,8 @@ function emit(raw, normalized, precision, pattern) {
         if (match(subline, /^[0-9]{6}/)) {
             raw=substr(subline, 1, 6)
             prev=(i==1) ? "" : substr(line, i-1, 1)
-            next=(i+6>len) ? "" : substr(line, i+6, 1)
-            if (!(prev ~ /[0-9]/ || next ~ /[0-9]/)) {
+            next_char=(i+6>len) ? "" : substr(line, i+6, 1)
+            if (!(prev ~ /[0-9]/ || next_char ~ /[0-9]/)) {
                 normalized=sprintf("%s-%s", substr(raw,1,4), substr(raw,5,2))
                 emit(raw, normalized, "month", "compact-month")
             }
