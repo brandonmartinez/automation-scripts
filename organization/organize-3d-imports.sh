@@ -13,10 +13,13 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
 DEFAULT_STATE_FILENAME="agentic-plan.json"
+SUMMARY_FILENAME="SUMMARY.md"
 readonly BASE_PATH="${ORGANIZE_3D_BASE_PATH:-$HOME/Documents/3D Prints}"
 DRY_RUN=0
 SKIP_AI=0
 STATE_FILE=""
+STATE_FILE_PROVIDED=0
+STATE_FILE_EPHEMERAL=0
 INPUT_PATH=""
 WORK_STATE_FILE=""
 BACKUP_ARCHIVE=""
@@ -123,6 +126,7 @@ parse_args() {
             --state-file)
                 [[ $# -lt 2 ]] && { echo "--state-file requires a value" >&2; exit 1; }
                 STATE_FILE="$2"
+                STATE_FILE_PROVIDED=1
                 shift 2
                 ;;
             --dry-run)
@@ -204,6 +208,12 @@ validate_environment() {
     mkdir -p "$CACHE_DIR"
     WORK_STATE_FILE=$(mktemp -t agentic-state.XXXXXX.json)
     FILE_ENTRIES_BUFFER=$(mktemp -t agentic-files.XXXXXX.json)
+
+    if (( DRY_RUN )) && (( ! STATE_FILE_PROVIDED )); then
+        STATE_FILE="$WORK_STATE_FILE"
+        STATE_FILE_EPHEMERAL=1
+        log_info "Dry-run: agentic plan will stay in a temporary file (use --state-file to override)"
+    fi
 }
 
 create_backup_archive() {
@@ -521,7 +531,63 @@ normalize_readable_token() {
     value=$(printf '%s' "$value" | tr -s ' ')
     value=$(printf '%s' "$value" | sed -E 's/^ +//;s/ +$//')
     [[ -z "$value" ]] && value="Untitled"
+    value=$(title_case_string "$value")
     printf '%s\n' "$value"
+}
+
+title_case_word() {
+    local token="$1"
+    [[ -z "$token" ]] && { printf '%s' "$token"; return; }
+
+    local lower_token="${token:l}"
+    local saved_ifs="$IFS"
+    IFS='-'
+    local -a pieces
+    read -r -A pieces <<< "$lower_token"
+    IFS="$saved_ifs"
+
+    if (( ${#pieces[@]} == 0 )); then
+        printf '%s' "$lower_token"
+        return
+    fi
+
+    local -a processed=()
+    local piece first_char rest
+    for piece in "${pieces[@]}"; do
+        if [[ -z "$piece" ]]; then
+            processed+=("$piece")
+            continue
+        fi
+        first_char="${piece%${piece#?}}"
+        rest="${piece#?}"
+        processed+=("${first_char:u}${rest}")
+    done
+
+    printf '%s' "${(j:-:)processed}"
+}
+
+title_case_string() {
+    local value="$1"
+    [[ -z "$value" ]] && { printf '%s\n' "$value"; return; }
+
+    local saved_ifs="$IFS"
+    IFS=$' \t\n'
+    local -a words
+    read -r -A words <<< "$value"
+    IFS="$saved_ifs"
+
+    if (( ${#words[@]} == 0 )); then
+        printf '%s\n' "$value"
+        return
+    fi
+
+    local -a processed_words=()
+    local word
+    for word in "${words[@]}"; do
+        processed_words+=("$(title_case_word "$word")")
+    done
+
+    printf '%s\n' "${(j: :)processed_words}"
 }
 
 normalize_filename() {
@@ -678,6 +744,30 @@ enforce_filetype_structure() {
     done < <(jq -c '.files[]' "$WORK_STATE_FILE")
 }
 
+ensure_agent_cycle_timestamps() {
+    local target_file="$1"
+    local fallback="${2:-$(date -Iseconds)}"
+    local tmp=$(mktemp)
+    jq --arg fallback "$fallback" '
+        . as $doc
+        | .metadata.agentCycles = (
+            (if ($doc.metadata.agentCycles? | type) == "array" then $doc.metadata.agentCycles else [] end)
+            | map(
+                if (type == "object") then
+                    if ((.completedAt // "") | length) == 0 then
+                        . + { completedAt: ($doc.metadata.generatedAt // $fallback) }
+                    else
+                        .
+                    end
+                else
+                    { description: (.|tostring), completedAt: ($doc.metadata.generatedAt // $fallback) }
+                end
+            )
+        )
+    ' "$target_file" >"$tmp"
+    mv "$tmp" "$target_file"
+}
+
 record_agent_cycle() {
     local description="$1"
     local tmp=$(mktemp)
@@ -766,11 +856,18 @@ run_agentic_cycle() {
     jq 'if (.metadata.duplicates? | type == "array") then . else (.metadata.duplicates = []) end' \
         "$WORK_STATE_FILE" >"$tmp"
     mv "$tmp" "$WORK_STATE_FILE"
+    ensure_agent_cycle_timestamps "$WORK_STATE_FILE"
     record_agent_cycle "Primary planning cycle"
 }
 
 persist_state_file() {
     log_divider "STATE PERSIST"
+    if (( STATE_FILE_EPHEMERAL )); then
+        log_info "Dry-run: agentic plan JSON not written to disk; emitting below"
+        cat "$STATE_FILE"
+        return
+    fi
+
     mkdir -p "$(dirname "$STATE_FILE")"
     cp "$WORK_STATE_FILE" "$STATE_FILE"
     log_info "State written to $STATE_FILE"
@@ -1044,6 +1141,161 @@ apply_archive_destination() {
     mv "$tmp" "$STATE_FILE"
 }
 
+generate_summary_report() {
+    log_divider "SUMMARY"
+    if [[ ! -f "$STATE_FILE" ]]; then
+        log_warn "State file missing; skipping summary report"
+        return
+    fi
+
+    local summary_dir summary_path summary_data
+    summary_dir="$(dirname "$STATE_FILE")"
+    summary_path="$summary_dir/$SUMMARY_FILENAME"
+    summary_data=$(jq '{
+        folderName: .metadata.folderName,
+        generatedAt: .metadata.generatedAt,
+        dryRun: (.metadata.dryRun // false),
+        backupZip: (.metadata.backupZip // ""),
+        totalFiles: (.metadata.totalFiles // 0),
+        plannedMoves: ([.files[] | select(.proposed.path != null or .proposed.absolutePath != null or .proposed.folder != null or .proposed.filename != null)] | length),
+        appliedMoves: ([.files[] | select((.appliedPath? // null) != null)] | length),
+        duplicates: (.metadata.duplicates // []),
+        archivePlan: (.metadata.archivePlan // {}),
+        agentCycles: (.metadata.agentCycles // []),
+        documentationContext: (.metadata.documentationContext // ""),
+        plannedPreview: ([
+            .files[]
+            | select(.proposed.path != null or .proposed.absolutePath != null or .proposed.folder != null or .proposed.filename != null)
+            | {
+                source: (.relativePath // .originalPath // "(unknown)"),
+                destination: (
+                    .proposed.path //
+                    .proposed.absolutePath //
+                    (if .proposed.folder != null and .proposed.filename != null then .proposed.folder + "/" + .proposed.filename
+                     elif .proposed.filename != null then .proposed.filename
+                     else .relativePath end) // "(unchanged)"
+                )
+            }
+        ] | .[:10])
+    }' "$STATE_FILE")
+
+    local folder_name generated_at dry_run_flag dry_run_text backup_zip total_files planned_moves applied_moves duplicate_count
+    folder_name=$(jq -r '.folderName' <<<"$summary_data")
+    generated_at=$(jq -r '.generatedAt' <<<"$summary_data")
+    dry_run_flag=$(jq -r '.dryRun' <<<"$summary_data")
+    dry_run_text=$([[ "$dry_run_flag" == "true" ]] && echo "Yes" || echo "No")
+    backup_zip=$(jq -r '.backupZip' <<<"$summary_data")
+    [[ -z "$backup_zip" || "$backup_zip" == "null" ]] && backup_zip="None"
+    total_files=$(jq -r '.totalFiles' <<<"$summary_data")
+    planned_moves=$(jq -r '.plannedMoves' <<<"$summary_data")
+    applied_moves=$(jq -r '.appliedMoves' <<<"$summary_data")
+    duplicate_count=$(jq -r '.duplicates | length' <<<"$summary_data")
+
+    local archive_category archive_subcategory archive_folder archive_destination archive_rationale
+    archive_category=$(jq -r '.archivePlan.category // "Uncategorized"' <<<"$summary_data")
+    archive_subcategory=$(jq -r '.archivePlan.subcategory // "Needs Review"' <<<"$summary_data")
+    archive_folder=$(jq -r '.archivePlan.folderName // .folderName // ""' <<<"$summary_data")
+    archive_destination=$(jq -r '.archivePlan.destinationPath // "(pending)"' <<<"$summary_data")
+    archive_rationale=$(jq -r '.archivePlan.rationale // ""' <<<"$summary_data")
+
+    local agent_cycles_section
+    agent_cycles_section=$(jq -r --arg fallback "$generated_at" '
+        def entry($item):
+            if ($item | type) == "object" then
+                "- " + ($item.description // "Agent cycle") + " (" + (($item.completedAt // $fallback) // "time unknown") + ")"
+            else
+                "- " + ($item | tostring)
+            end;
+        if (.agentCycles | length) == 0 then "None recorded"
+        else (.agentCycles | map(entry(.)) | join("\n"))
+        end
+    ' <<<"$summary_data")
+
+    local planned_preview_table
+    planned_preview_table=$(jq -r '
+        def esc(str):
+            (str // "(unknown)")
+            | gsub("\\|"; "\\|")
+            | gsub("\n"; " / ");
+        if (.plannedPreview | length) == 0 then ""
+        else
+            (["| Original | Proposed |", "| --- | --- |"] +
+             (.plannedPreview | map("| " + esc(.source) + " | " + esc(.destination) + " |")))
+            | join("\n")
+        end
+    ' <<<"$summary_data")
+
+    local duplicates_section
+    duplicates_section=$(jq -r '
+        def esc(str): (str // "unknown") | gsub("`"; "\\`");
+        if (.duplicates | length) == 0 then ""
+        else
+            (["## Duplicates", ""] +
+             (.duplicates | map("- " + (.type // "file") + ": `" + esc(.originalPath // .url) + "` duplicate of `" + esc(.duplicateOf // .url) + "`")))
+            | join("\n")
+        end
+    ' <<<"$summary_data")
+
+    local doc_context doc_display doc_block
+    doc_context=$(jq -r '.documentationContext' <<<"$summary_data")
+    if [[ "$doc_context" != "null" && -n "$doc_context" ]]; then
+        local max_doc_chars=600
+        doc_display="${doc_context:0:$max_doc_chars}"
+        if (( ${#doc_context} > max_doc_chars )); then
+            doc_display+="…"
+        fi
+        doc_block=$(printf '%s' "$doc_display" | sed 's/^/> /')
+    else
+        doc_block=""
+    fi
+
+    local summary_output
+    summary_output=$(
+        {
+            printf '# 3D Import Summary\n\n'
+            printf -- '- **Folder:** `%s`\n' "$folder_name"
+            printf -- '- **Run Date:** %s\n' "$generated_at"
+            printf -- '- **Dry Run:** %s\n' "$dry_run_text"
+            printf -- '- **Backup ZIP:** %s\n' "$backup_zip"
+            printf -- '- **Total Files Indexed:** %s\n' "$total_files"
+            printf -- '- **Planned Moves:** %s\n' "$planned_moves"
+            printf -- '- **Applied Moves:** %s\n' "$applied_moves"
+            printf -- '- **Duplicates Logged:** %s\n\n' "$duplicate_count"
+
+            printf '## Archive Plan\n\n'
+            printf -- '- **Category:** %s\n' "$archive_category"
+            printf -- '- **Subcategory:** %s\n' "$archive_subcategory"
+            printf -- '- **Project Folder:** %s\n' "$archive_folder"
+            printf -- '- **Destination Path:** %s\n' "$archive_destination"
+            if [[ -n "$archive_rationale" && "$archive_rationale" != "null" ]]; then
+                printf -- '- **Rationale:** %s\n' "$archive_rationale"
+            fi
+
+            printf '\n## Agent Cycles\n\n%s\n' "$agent_cycles_section"
+
+            if [[ -n "$planned_preview_table" ]]; then
+                printf '\n## Planned Moves Preview\n\n%s\n' "$planned_preview_table"
+            fi
+
+            if [[ -n "$doc_block" ]]; then
+                printf '\n## Documentation Context\n\n%s\n' "$doc_block"
+            fi
+
+            if [[ -n "$duplicates_section" ]]; then
+                printf '\n%s\n' "$duplicates_section"
+            fi
+        }
+    )
+
+    if (( DRY_RUN )); then
+        log_info "Dry-run: summary report not written to disk; emitting below"
+        printf '%s\n' "$summary_output"
+    else
+        printf '%s\n' "$summary_output" >"$summary_path"
+        log_info "Summary report written to $summary_path"
+    fi
+}
+
 reveal_result_folder() {
     local target_path context
     if (( DRY_RUN )); then
@@ -1076,7 +1328,11 @@ reveal_result_folder() {
 }
 
 cleanup() {
-    [[ -n "$WORK_STATE_FILE" && -f "$WORK_STATE_FILE" && "$WORK_STATE_FILE" != "$STATE_FILE" ]] && rm -f "$WORK_STATE_FILE"
+    if (( STATE_FILE_EPHEMERAL )); then
+        [[ -n "$STATE_FILE" && -f "$STATE_FILE" ]] && rm -f "$STATE_FILE"
+    else
+        [[ -n "$WORK_STATE_FILE" && -f "$WORK_STATE_FILE" && "$WORK_STATE_FILE" != "$STATE_FILE" ]] && rm -f "$WORK_STATE_FILE"
+    fi
     [[ -n "$FILE_ENTRIES_BUFFER" && -f "$FILE_ENTRIES_BUFFER" ]] && rm -f "$FILE_ENTRIES_BUFFER"
 }
 
@@ -1104,6 +1360,7 @@ main() {
     fi
     plan_archive_destination
     apply_archive_destination
+    generate_summary_report
     reveal_result_folder
 }
 
