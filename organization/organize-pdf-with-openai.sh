@@ -640,6 +640,7 @@ function emit(raw, normalized, precision, pattern) {
 
 extract_scanned_timestamp() {
     local filename="$1"
+    local filename_digits_source="$filename"
     log_debug "Extracting scanned timestamp from filename: $filename"
 
     # Try new format first: scan-YYYYMMDD (e.g., scan-20231206)
@@ -671,8 +672,74 @@ extract_scanned_timestamp() {
         return 0
     fi
 
+    log_debug "Old format not found, checking timeless date formats (YYYY-MM-DD, YYYYMMDD, MMDDYYYY, MM-DD-YYYY)"
+
+    local timeless_match year month day formatted_timestamp
+
+    timeless_match=$(echo "$filename" | grep -oE '([0-9]{4})-([0-9]{2})-([0-9]{2})' | head -n1 || true)
+    if [[ -n "$timeless_match" ]]; then
+        year="${timeless_match:0:4}"
+        month="${timeless_match:5:2}"
+        day="${timeless_match:8:2}"
+        if is_valid_calendar_date "$year" "$month" "$day"; then
+            formatted_timestamp=$(format_timestamp_from_date "$year" "$month" "$day")
+            log_info "Found timeless YYYY-MM-DD pattern: $timeless_match"
+            log_info "Converted timeless date to: $formatted_timestamp"
+            echo "$formatted_timestamp"
+            return 0
+        fi
+    fi
+
+    local month_first_match
+    month_first_match=$(echo "$filename" | grep -oE '([0-9]{2})-([0-9]{2})-([0-9]{4})' | head -n1 || true)
+    if [[ -n "$month_first_match" ]]; then
+        local IFS='-'
+        local month_part day_part year_part
+        read -r month_part day_part year_part <<<"$month_first_match"
+        if is_valid_calendar_date "$year_part" "$month_part" "$day_part"; then
+            formatted_timestamp=$(format_timestamp_from_date "$year_part" "$month_part" "$day_part")
+            log_info "Found timeless MM-DD-YYYY pattern: $month_first_match"
+            log_info "Converted timeless date to: $formatted_timestamp"
+            echo "$formatted_timestamp"
+            return 0
+        fi
+    fi
+
+    local candidate
+    while IFS= read -r candidate; do
+        [[ -z "$candidate" ]] && continue
+        if [[ ${#candidate} -ne 8 ]]; then
+            continue
+        fi
+
+        year="${candidate:0:4}"
+        month="${candidate:4:2}"
+        day="${candidate:6:2}"
+        local -i year_num
+        year_num=$((10#$year))
+        if (( year_num >= 1900 && year_num <= 2100 )) && is_valid_calendar_date "$year" "$month" "$day"; then
+            formatted_timestamp=$(format_timestamp_from_date "$year" "$month" "$day")
+            log_info "Found timeless YYYYMMDD pattern: $candidate"
+            log_info "Converted timeless date to: $formatted_timestamp"
+            echo "$formatted_timestamp"
+            return 0
+        fi
+
+        local mm="${candidate:0:2}"
+        local dd="${candidate:2:2}"
+        local yyyy="${candidate:4:4}"
+        year_num=$((10#$yyyy))
+        if (( year_num >= 1900 && year_num <= 2100 )) && is_valid_calendar_date "$yyyy" "$mm" "$dd"; then
+            formatted_timestamp=$(format_timestamp_from_date "$yyyy" "$mm" "$dd")
+            log_info "Found timeless MMDDYYYY pattern: $candidate"
+            log_info "Converted timeless date to: $formatted_timestamp"
+            echo "$formatted_timestamp"
+            return 0
+        fi
+    done < <(printf '%s\n' "$filename_digits_source" | tr -cs '0-9' '\n')
+
     log_warn "No timestamp pattern found in filename: $filename"
-    log_warn "Expected patterns: 'scan-YYYYMMDD' or 'YYYY-MM-DD[T]HH-MM-SS'"
+    log_warn "Expected patterns: 'scan-YYYYMMDD', 'YYYY-MM-DD[T]HH-MM-SS', 'YYYY-MM-DD', 'YYYYMMDD', 'MMDDYYYY', or 'MM-DD-YYYY'"
     echo ""
     return 1
 }
@@ -773,6 +840,113 @@ title_case_phrase() {
     printf '%s' "${(j: :)title_words}"
 }
 
+strip_redundant_descriptor_tokens() {
+    emulate -L zsh
+    setopt extendedglob nocasematch
+
+    local descriptor="$1"
+    local sender="$2"
+    local primary_date="${3:-}"
+    local scanned_at="${4:-}"
+    local sent_on="${5:-}"
+
+    if [[ -z "$descriptor" || "$descriptor" == "null" ]]; then
+        printf '%s' "$descriptor"
+        return
+    fi
+
+    local -a tokens=()
+    typeset -A seen_tokens
+
+    add_unique_token() {
+        local candidate="$1"
+        candidate="${candidate//$'\r'/ }"
+        candidate="${candidate//$'\n'/ }"
+        candidate="${candidate//$'\t'/ }"
+        candidate=$(printf '%s' "$candidate" | sed -e 's/  */ /g' -e 's/^ //; s/ $//')
+        if [[ -z "$candidate" ]]; then
+            return
+        fi
+        local key="${candidate:l}"
+        if [[ -n "${seen_tokens[$key]-}" ]]; then
+            return
+        fi
+        seen_tokens[$key]=1
+        tokens+=("$candidate")
+    }
+
+    add_token_variants() {
+        local base="$1"
+        [[ -z "$base" || "$base" == "null" ]] && return
+        add_unique_token "$base"
+
+        local condensed="${base//[^[:alnum:]]/}"
+        [[ -n "$condensed" ]] && add_unique_token "$condensed"
+
+        local digits_only="${base//[^0-9]/}"
+        [[ -n "$digits_only" ]] && add_unique_token "$digits_only"
+
+        local dashed="$base"
+        dashed="${dashed//[[:space:][:punct:]]/-}"
+        dashed=$(printf '%s' "$dashed" | sed -e 's/-\{2,\}/-/g' -e 's/^-//; s/-$//')
+        [[ -n "$dashed" ]] && add_unique_token "$dashed"
+
+        local split_source="$base"
+        split_source="${split_source//[\/:_-]/ }"
+        split_source="${split_source//T/ }"
+        split_source="${split_source//t/ }"
+        local part
+        for part in ${(z)split_source}; do
+            [[ ${#part} -lt 3 ]] && continue
+            add_unique_token "$part"
+        done
+    }
+
+    escape_pattern_literal() {
+        local str="$1"
+        str="${str//\\/\\\\}"
+        str="${str//\*/\\*}"
+        str="${str//\?/\\?}"
+        str="${str//\[/\\[}"
+        str="${str//\]/\\]}"
+        str="${str//\(/\\(}"
+        str="${str//\)/\\)}"
+        str="${str//\{/\\{}"
+        str="${str//\}/\\}}"
+        str="${str//\|/\\|}"
+        str="${str//\./\\.}"
+        str="${str//\^/\\^}"
+        str="${str//\$/\\$}"
+        str="${str//\#/\\#}"
+        str="${str//\~/\\~}"
+        str="${str//\+/\\+}"
+        str="${str//\-/\\-}"
+        str="${str//\=/\\=}"
+        printf '%s' "$str"
+    }
+
+    add_token_variants "$sender"
+    add_token_variants "$primary_date"
+    add_token_variants "$scanned_at"
+    add_token_variants "$sent_on"
+
+    local cleaned="$descriptor"
+    local token pattern
+    for token in "${tokens[@]}"; do
+        [[ -z "$token" ]] && continue
+        [[ ${#token} -lt 3 ]] && continue
+        pattern="$(escape_pattern_literal "$token")"
+        cleaned="${cleaned//(#i)$pattern/ }"
+    done
+
+    cleaned="${cleaned//$'\r'/ }"
+    cleaned="${cleaned//$'\n'/ }"
+    cleaned="${cleaned//$'\t'/ }"
+    cleaned=$(printf '%s' "$cleaned" | sed -e 's/  */ /g' -e 's/^ //; s/ $//')
+    [[ -z "$cleaned" ]] && cleaned="$descriptor"
+    printf '%s' "$cleaned"
+}
+
 format_spotlight_summary() {
     local summary="$1"
     if [[ -z "$summary" || "$summary" == "null" ]]; then
@@ -814,6 +988,58 @@ generate_file_name_description() {
     fi
 
     printf '%s' "$text"
+}
+
+is_valid_calendar_date() {
+    local year="$1"
+    local month="$2"
+    local day="$3"
+
+    if (( ${#year} != 4 || ${#month} != 2 || ${#day} != 2 )); then
+        return 1
+    fi
+
+    local -i year_num month_num day_num max_day
+    year_num=$((10#$year))
+    month_num=$((10#$month))
+    day_num=$((10#$day))
+
+    if (( month_num < 1 || month_num > 12 )); then
+        return 1
+    fi
+
+    case $month_num in
+    1 | 3 | 5 | 7 | 8 | 10 | 12)
+        max_day=31
+        ;;
+    4 | 6 | 9 | 11)
+        max_day=30
+        ;;
+    2)
+        if (( (year_num % 4 == 0 && year_num % 100 != 0) || (year_num % 400 == 0) )); then
+            max_day=29
+        else
+            max_day=28
+        fi
+        ;;
+    *)
+        return 1
+        ;;
+    esac
+
+    if (( day_num < 1 || day_num > max_day )); then
+        return 1
+    fi
+
+    return 0
+}
+
+format_timestamp_from_date() {
+    local year="$1"
+    local month="$2"
+    local day="$3"
+
+    printf '%04d-%02d-%02dT00-00-00' "$((10#$year))" "$((10#$month))" "$((10#$day))"
 }
 
 validate_required_fields() {
@@ -939,6 +1165,7 @@ Guidelines:
 - Departments are only for government entities or when explicitly called out.
 - Consider context.filenameDates (normalized dates parsed from the filename) when proposing sentOn or describing the document timeline; treat these as hints that may need validation against the PDF text.
 - Include an organizerDescription inside categorization that is a plain-English label (<=100 characters) suitable for file naming.
+- Organizer descriptions must never repeat the sender name or explicit dates/timestamps; focus on the distinguishing document details only so filenames stay concise.
 - Short summaries are stored verbatim in macOS Finder comments; write a natural-sentence paragraph rich with relevant keywords to maximize Spotlight searchability (do not force title case).
 - Return JSON that follows the provided schema exactly; do not add new keys.
 - Provide reasoning that cites the contextual evidence you relied on."
@@ -1434,6 +1661,14 @@ organize_and_move_file() {
         action_verb="move"
     fi
 
+    local primary_document_date
+    primary_document_date=$(resolve_primary_document_date)
+    if [[ -n "$PRIMARY_DATE_REASON" ]]; then
+        log_info "$PRIMARY_DATE_REASON"
+        record_decision_rationale "primary-date" "$PRIMARY_DATE_REASON"
+        record_phase_note "action" "$PRIMARY_DATE_REASON"
+    fi
+
     # Create folder structure and get destination directory
     local destination_dir
     destination_dir=$(create_folder_structure "$CATEGORY" "$SENDER" "$DEPARTMENT")
@@ -1446,6 +1681,13 @@ organize_and_move_file() {
     if [[ -z "$descriptor_source" || "$descriptor_source" == "null" ]]; then
         descriptor_source="$ORGANIZER_DESCRIPTION"
     fi
+    descriptor_source=$(strip_redundant_descriptor_tokens "$descriptor_source" "$SENDER" "$primary_document_date" "$SCANNED_AT" "$SENT_ON")
+    if [[ -z "$descriptor_source" || "$descriptor_source" == "null" ]]; then
+        descriptor_source="Document"
+    fi
+    FILE_NAME_DESCRIPTION="$descriptor_source"
+    update_state_file '.plan.final.fileNameDescription = (if $desc == "" then null else $desc end)' --arg desc "$FILE_NAME_DESCRIPTION"
+    log_debug "Descriptor after redundancy cleanup: $FILE_NAME_DESCRIPTION"
     file_descriptor_sanitized=$(sanitize-text "$descriptor_source")
 
     if [[ -n "$department_sanitized" && "$department_sanitized" != "null" ]]; then
@@ -1458,14 +1700,6 @@ organize_and_move_file() {
         file_descriptor_sanitized="-${file_descriptor_sanitized}"
     else
         file_descriptor_sanitized=""
-    fi
-
-    local primary_document_date
-    primary_document_date=$(resolve_primary_document_date)
-    if [[ -n "$PRIMARY_DATE_REASON" ]]; then
-        log_info "$PRIMARY_DATE_REASON"
-        record_decision_rationale "primary-date" "$PRIMARY_DATE_REASON"
-        record_phase_note "action" "$PRIMARY_DATE_REASON"
     fi
 
     # Generate unique filename
