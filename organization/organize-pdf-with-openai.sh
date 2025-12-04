@@ -1503,26 +1503,26 @@ generate_unique_filename() {
     descriptor+="$descriptor_sanitized"
     [[ -z "$descriptor" ]] && descriptor="Document"
 
-    local base_filename="${date_component}_${descriptor}.pdf"
+    local base_filename="${date_component}-${descriptor}.pdf"
 
     if [[ ${#base_filename} -gt $max_filename_length ]]; then
         log_warn "Filename too long (${#base_filename} chars), tightening components"
 
         if [[ -n "$descriptor_sanitized" ]]; then
             descriptor="$sender_sanitized$department_sanitized"
-            base_filename="${date_component}_${descriptor}.pdf"
+            base_filename="${date_component}-${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length && -n "$department_sanitized" ]]; then
             descriptor="$sender_sanitized"
-            base_filename="${date_component}_${descriptor}.pdf"
+            base_filename="${date_component}-${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length && -n "$sender_sanitized" ]]; then
             local available_length=$((max_filename_length - ${#date_component} - 1 - 4))
             descriptor="${sender_sanitized:0:$available_length}"
             [[ -z "$descriptor" ]] && descriptor="Doc"
-            base_filename="${date_component}_${descriptor}.pdf"
+            base_filename="${date_component}-${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length ]]; then
@@ -1731,8 +1731,11 @@ organize_and_move_file() {
     set_finder_comments "$new_file" "$SHORT_SUMMARY"
 
     # Open destination folder in Finder
-    log_info "Opening destination folder in Finder"
-    open "$destination_dir"
+    log_info "Revealing organized PDF in Finder"
+    if ! open -R "$new_file"; then
+        log_warn "Failed to reveal file in Finder; opening destination directory instead"
+        open "$destination_dir"
+    fi
 
     record_action_snapshot "$new_file" "$new_file" "$SHORT_SUMMARY"
     record_phase_note "action" "Completed $action_verb to $new_file"
