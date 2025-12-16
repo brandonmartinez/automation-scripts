@@ -13,10 +13,10 @@ fi
 SCRIPT_PATH="${(%):-%N}"
 SCRIPT_DIR="${SCRIPT_PATH:A:h}"
 
-DEFAULT_INTERVAL=15
-CONCURRENCY=${AI_CONCURRENCY:-4}
+DEFAULT_INTERVAL=12
 KEEP_TEMP=0
 INTERVAL="$DEFAULT_INTERVAL"
+MAX_FRAMES=50
 VIDEO_FILE=""
 SUMMARIES_DIR=""
 TEMP_BASE_DIR=""
@@ -24,7 +24,7 @@ WORK_DIR=""
 FRAMES_DIR=""
 FRAME_RESULTS_FILE=""
 VISION_MODEL="${OPENAI_VISION_MODEL:-gpt-4o}"
-SUMMARY_MODEL="${OPENAI_SUMMARY_MODEL:-gpt-5.1}"
+SUMMARY_MODEL="${OPENAI_SUMMARY_MODEL:-gpt-4.1}"
 
 require_command() {
 	local cmd="$1"
@@ -39,10 +39,11 @@ usage() {
 Usage: organize-video-imports.sh [options] <video_file>
 
 Options:
-	--interval <seconds>     Interval between frames (default: 15)
+	--interval <seconds>     Interval between frames (default: 12)
+	--max-frames <count>     Cap the number of frames extracted (default: 50)
 	--summaries-dir <path>   Directory to write the markdown summary
-  --keep-temp              Keep temporary working directory (for debugging)
-  -h, --help               Show this help text
+	--keep-temp              Keep temporary working directory (for debugging)
+	-h, --help               Show this help text
 USAGE
 }
 
@@ -53,6 +54,11 @@ parse_args() {
 			--interval)
 				[[ $# -lt 2 ]] && { echo "--interval requires a value" >&2; exit 1; }
 				INTERVAL="$2"
+				shift 2
+				;;
+			--max-frames)
+				[[ $# -lt 2 ]] && { echo "--max-frames requires a value" >&2; exit 1; }
+				MAX_FRAMES="$2"
 				shift 2
 				;;
 			--summaries-dir)
@@ -111,6 +117,20 @@ describe_frame() {
 	local timecode="$3"
 	local time_seconds="$4"
 
+	log_info "Describing frame $frame_index at $timecode"
+	local start_ts
+	start_ts=$(date +%s)
+
+	# Heartbeat while waiting on the vision API
+	local heartbeat_pid
+	{
+		while true; do
+			sleep 30
+			log_info "Still describing frame $frame_index (time $timecode)..."
+		done
+	} &
+	heartbeat_pid=$!
+
 	local b64
 	if ! b64=$(base64 < "$frame_path" | tr -d '\n'); then
 		log_warn "Failed to base64 encode $frame_path"
@@ -145,8 +165,24 @@ describe_frame() {
 	local desc
 	if ! desc=$(get-openai-response "$payload"); then
 		log_warn "AI description failed for frame $frame_index ($timecode)"
+		if [[ -n "${heartbeat_pid:-}" ]]; then
+			kill "$heartbeat_pid" 2>/dev/null || true
+			wait "$heartbeat_pid" 2>/dev/null || true
+		fi
 		return 0
 	fi
+
+	if [[ -n "${heartbeat_pid:-}" ]]; then
+		kill "$heartbeat_pid" 2>/dev/null || true
+		wait "$heartbeat_pid" 2>/dev/null || true
+	fi
+
+	local end_ts
+	end_ts=$(date +%s)
+	local duration=$((end_ts - start_ts))
+
+	log_info "Described frame $frame_index"
+	log_info "Frame $frame_index duration: ${duration}s"
 
 	jq -n --arg idx "$frame_index" --arg tc "$timecode" --arg desc "$desc" --arg ts "$time_seconds" \
 		'{frame: ($idx|tonumber), timecode: $tc, description: $desc, timeSeconds: ($ts|tonumber)}'
@@ -158,8 +194,8 @@ summarize_video() {
 	local timeline
 	timeline=$(printf '%s' "$scenes_json" | jq -r '.[] | "[\(.timecode)] \(.description)"' | paste -sd '\n' -)
 
-	local payload
-	payload=$(jq -n \
+	local payload_template
+	payload_template=$(jq -n \
 		--arg filename "$VIDEO_BASENAME" \
 		--arg timeline "$timeline" \
 		--arg model "$SUMMARY_MODEL" \
@@ -176,18 +212,46 @@ summarize_video() {
 				}
 			],
 			temperature: 0.25,
-			max_completion_tokens: 700
+			max_completion_tokens: 500
 		}')
 
-	get-openai-response "$payload"
+	local attempt=0
+	local response=""
+	while (( attempt < 3 )); do
+		attempt=$((attempt + 1))
+		log_info "Summarizing video (attempt $attempt)"
+		response=$(get-openai-response "$payload_template" || true)
+		if [[ -n "$response" && "$response" != "null" ]]; then
+			# strip whitespace to detect truly empty content
+			local trimmed
+			trimmed=$(printf '%s' "$response" | tr -d '\r\n[:space:]')
+			if [[ -n "$trimmed" ]]; then
+				log_info "Summary attempt $attempt succeeded"
+				printf '%s' "$response"
+				return 0
+			fi
+		fi
+		log_warn "Empty summary response (attempt $attempt); retrying..."
+		sleep 1
+	done
+
+	log_error "Failed to obtain non-empty summary after 3 attempts"
+	return 1
 }
 
 extract_frames() {
-	log_info "Extracting frames every ${INTERVAL}s"
+	log_info "Extracting frames every ${INTERVAL}s${MAX_FRAMES:+ (cap: ${MAX_FRAMES} frame(s))}"
 	FRAMES_DIR="$WORK_DIR/frames"
 	mkdir -p "$FRAMES_DIR"
 
-	if ! ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vf "fps=1/${INTERVAL}" -q:v 2 "$FRAMES_DIR/frame_%05d.jpg"; then
+	local vframes_arg=()
+	if (( MAX_FRAMES > 0 )); then
+		vframes_arg=(-vframes "$MAX_FRAMES")
+	fi
+
+	local filter="fps=1/${INTERVAL}"
+
+	if ! ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vf "$filter" -vsync vfr -q:v 2 "${vframes_arg[@]}" "$FRAMES_DIR/frame_%05d.jpg"; then
 		log_error "ffmpeg frame extraction failed"
 		exit 1
 	fi
@@ -204,20 +268,20 @@ extract_frames() {
 process_frames() {
 	FRAME_RESULTS_FILE=$(mktemp -t video-scenes.XXXXXX.jsonl)
 	local idx=0
+	local total_frames
+	total_frames=$(ls "$FRAMES_DIR"/frame_*.jpg 2>/dev/null | wc -l | tr -d ' ')
 
 	for img in "$FRAMES_DIR"/frame_*.jpg; do
 		idx=$((idx + 1))
 		local ts_seconds=$(((idx - 1) * INTERVAL))
 		local tc="$(format_timecode "$ts_seconds")"
 
-		while (( $(jobs -p | wc -l) >= CONCURRENCY )); do
-			sleep 0.1
-		done
+		describe_frame "$img" "$idx" "$tc" "$ts_seconds" >>"$FRAME_RESULTS_FILE"
 
-		describe_frame "$img" "$idx" "$tc" "$ts_seconds" >>"$FRAME_RESULTS_FILE" &
+		if (( idx % 5 == 0 )); then
+			log_info "Progress: described $idx/$total_frames frame(s)"
+		fi
 	done
-
-	wait
 }
 
 write_summary() {
