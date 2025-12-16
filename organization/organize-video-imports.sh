@@ -331,10 +331,10 @@ write_summary() {
 	END { $_ .= "\n" unless /\n\z/; }
 ')
 
-	printf '\nAI-generated summary of video file: %s.%s\n' "$VIDEO_BASENAME" "$VIDEO_EXT" >>"$summary_path"
-	printf '%s' "$formatted" >"$summary_path"
+	printf 'AI-generated video summary; check for accuracy\n\n%s' "$formatted" >"$summary_path"
 	log_info "Wrote summary to $summary_path"
 	SUMMARY_PATH="$summary_path"
+    open -r "$summary_path"
 }
 
 main() {
@@ -380,7 +380,7 @@ main() {
 
 	mkdir -p "$TEMP_BASE_DIR"
 	if ! (( REUSE_DESCRIPTIONS )) || [[ ! -f "$FRAME_RESULTS_FILE" ]]; then
-		rm -rf "$WORK_DIR"
+		rm -Rf "$WORK_DIR"
 		mkdir -p "$WORK_DIR"
 	fi
 
