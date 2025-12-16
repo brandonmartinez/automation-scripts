@@ -400,6 +400,14 @@ main() {
 
 	if (( KEEP_TEMP )); then
 		log_info "Temp directory kept at $WORK_DIR"
+	else
+		if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+			rm -rf "$WORK_DIR"
+			log_info "Removed temp directory $WORK_DIR"
+		fi
+		if [[ -n "$TEMP_BASE_DIR" && -d "$TEMP_BASE_DIR" ]]; then
+			rmdir "$TEMP_BASE_DIR" 2>/dev/null || true
+		fi
 	fi
 
 	log_divider "DONE"
