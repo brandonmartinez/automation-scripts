@@ -204,7 +204,7 @@ summarize_video() {
 			messages: [
 				{
 					role: "system",
-					content: "You are a precise video summarizer. Respond ONLY with valid, neatly spaced Markdown. Use this exact structure with blank lines between sections:\n# <Video Title>\n## Summary\n- 2-3 sentences (1 bullet per sentence)\n## Highlights\n- 3-6 bullets of key subjects/actions/locations\n## Timeline\n- One bullet per timeline entry, preserve order and timestamps.\nEnd with a trailing newline."
+					content: "You are a concise video summarizer for home videos. Respond ONLY with valid, neatly spaced Markdown. Use exactly this structure with blank lines between sections:\n# <Video Title>\n\nDescription: <One paragraph, 3-10 sentences, personable and friendly home-video tone; no bullets, no lists, no timestamps, no markers. Describe what viewers will see.>\nEnd with a trailing newline. Include nothing else."
 				},
 				{
 					role: "user",
@@ -302,15 +302,16 @@ write_summary() {
 	# Normalize markdown spacing in case the model returns a single line
 	local formatted
 	formatted=$(printf '%s' "$summary" | perl -0pe '
-s/\r\n?/\n/g;
-s/[ \t]+/ /g;
-s/ *## */\n\n## /g;
-s/^# */# /;
-s/\n{3,}/\n\n/g;
-s/ *- /\n- /g;
-s/\n +/\n/g;
-END { $_ .= "\n" unless /\n\z/; }
+	s/\r\n?/\n/g;
+	s/[ \t]+/ /g;
+	s/^# */# /;
+	s/\n{3,}/\n\n/g;
+	s/\n +/\n/g;
+	s/^Description:\s*/Description: /m;
+	END { $_ .= "\n" unless /\n\z/; }
 ')
+
+	printf '\nAI-generated summary of video file: %s.%s\n' "$VIDEO_BASENAME" "$VIDEO_EXT" >>"$summary_path"
 
 	printf '%s' "$formatted" >"$summary_path"
 	log_info "Wrote summary to $summary_path"
