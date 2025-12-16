@@ -15,6 +15,7 @@ SCRIPT_DIR="${SCRIPT_PATH:A:h}"
 
 DEFAULT_INTERVAL=12
 KEEP_TEMP=0
+REUSE_DESCRIPTIONS=0
 INTERVAL="$DEFAULT_INTERVAL"
 MAX_FRAMES=50
 VIDEO_FILE=""
@@ -68,6 +69,10 @@ parse_args() {
 				;;
 			--keep-temp)
 				KEEP_TEMP=1
+				shift
+				;;
+			--reuse-descriptions)
+				REUSE_DESCRIPTIONS=1
 				shift
 				;;
 			-h|--help)
@@ -204,11 +209,11 @@ summarize_video() {
 			messages: [
 				{
 					role: "system",
-					content: "You are a concise video summarizer for home videos. Respond ONLY with valid, neatly spaced Markdown. Use exactly this structure with blank lines between sections:\n# <Video Title>\n\nDescription: <One paragraph, 3-10 sentences, personable and friendly home-video tone; no bullets, no lists, no timestamps, no markers. Describe what viewers will see.>\nEnd with a trailing newline. Include nothing else."
+					content: "You are a concise video summarizer for home videos. Return ONLY strict JSON (no markdown, no code fences) that conforms to this JSON Schema: {\"type\": \"object\", \"required\": [\"title\", \"description\"], \"properties\": {\"title\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 120}, \"description\": {\"type\": \"string\", \"minLength\": 40, \"maxLength\": 2000, \"description\": \"One paragraph, 3-10 sentences, personable and friendly home-video tone; no bullets, no lists, no timestamps, no markers. Describe what viewers will see.\"}}, \"additionalProperties\": false}. Include nothing else."
 				},
 				{
 					role: "user",
-					content: ("Video file: " + $filename + "\nTimeline entries (ordered):\n" + $timeline + "\n\nFollow the specified Markdown format exactly. Do not inline everything. Each bullet on its own line. Include a final newline.")
+					content: ("Video file: " + $filename + "\nTimeline entries (ordered):\n" + $timeline + "\n\nReturn only JSON with fields title and description. No markdown, no labels, no code fences.")
 				}
 			],
 			temperature: 0.25,
@@ -266,7 +271,8 @@ extract_frames() {
 }
 
 process_frames() {
-	FRAME_RESULTS_FILE=$(mktemp -t video-scenes.XXXXXX.jsonl)
+	FRAME_RESULTS_FILE="$WORK_DIR/scenes.jsonl"
+	: >"$FRAME_RESULTS_FILE"
 	local idx=0
 	local total_frames
 	total_frames=$(ls "$FRAMES_DIR"/frame_*.jpg 2>/dev/null | wc -l | tr -d ' ')
@@ -299,20 +305,32 @@ write_summary() {
 	local summary
 	summary=$(summarize_video "$scenes_json")
 
-	# Normalize markdown spacing in case the model returns a single line
+	local summary_json
+	if ! summary_json=$(printf '%s' "$summary" | jq '.' 2>/dev/null); then
+		log_error "Summary response was not valid JSON"
+		exit 1
+	fi
+
+	local title description
+	title=$(printf '%s' "$summary_json" | jq -r '.title // empty')
+	description=$(printf '%s' "$summary_json" | jq -r '.description // empty')
+
+	if [[ -z "$title" || -z "$description" ]]; then
+		log_error "Summary JSON missing title or description"
+		exit 1
+	fi
+
 	local formatted
-	formatted=$(printf '%s' "$summary" | perl -0pe '
+	formatted=$(printf '# %s\n\n%s\n' "$title" "$description" | perl -0pe '
 	s/\r\n?/\n/g;
 	s/[ \t]+/ /g;
 	s/^# */# /;
 	s/\n{3,}/\n\n/g;
 	s/\n +/\n/g;
-	s/^Description:\s*/Description: /m;
 	END { $_ .= "\n" unless /\n\z/; }
 ')
 
 	printf '\nAI-generated summary of video file: %s.%s\n' "$VIDEO_BASENAME" "$VIDEO_EXT" >>"$summary_path"
-
 	printf '%s' "$formatted" >"$summary_path"
 	log_info "Wrote summary to $summary_path"
 	SUMMARY_PATH="$summary_path"
@@ -357,16 +375,26 @@ main() {
 
 	TEMP_BASE_DIR="$VIDEO_DIR/_temp"
 	WORK_DIR="$TEMP_BASE_DIR/$VIDEO_BASENAME"
+	FRAME_RESULTS_FILE="$WORK_DIR/scenes.jsonl"
 
 	mkdir -p "$TEMP_BASE_DIR"
-	rm -rf "$WORK_DIR"
-	mkdir -p "$WORK_DIR"
+	if ! (( REUSE_DESCRIPTIONS )) || [[ ! -f "$FRAME_RESULTS_FILE" ]]; then
+		rm -rf "$WORK_DIR"
+		mkdir -p "$WORK_DIR"
+	fi
 
 	log_info "Processing video: $(basename "$VIDEO_FILE")"
 	log_info "Interval: ${INTERVAL}s | Summaries dir: $SUMMARIES_DIR"
 
-	extract_frames
-	process_frames
+	if (( REUSE_DESCRIPTIONS )) && [[ -f "$FRAME_RESULTS_FILE" ]]; then
+		log_info "Reusing cached frame descriptions from $FRAME_RESULTS_FILE"
+	else
+		if (( REUSE_DESCRIPTIONS )); then
+			log_warn "Requested reuse but no cache found at $FRAME_RESULTS_FILE; running extraction"
+		fi
+		extract_frames
+		process_frames
+	fi
 	write_summary
 
 	if (( KEEP_TEMP )); then
