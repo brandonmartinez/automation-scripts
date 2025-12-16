@@ -13,19 +13,18 @@ umask 077
 
 print -- "[$(date)] whoami=$(whoami) home=${HOME:-unset} shell=${SHELL:-unset} pwd=$(pwd)" >> "$log"
 
-inbox="$HOME/Documents/Sort/Videos/Done"
+inbox="$(dirname "$src")"
 base="$(basename "$src")"
-dest="$inbox/$base"
 
 # Log the invocation for debugging
-print -- "[$(date)] src='$src' base='$base' dest='$dest' queue='$queue'" >> "$log"
+print -- "[$(date)] src='$src' base='$base' inbox='$inbox' queue='$queue'" >> "$log"
 
 # Ensure queue file exists and is writable, log failure if any
 if ! touch "$queue" 2>>"$log"; then
 	print -- "[$(date)] ERROR: unable to touch queue $queue" >> "$log"
 	exit 1
 fi
-if ! print -- "$dest\t$inbox" >> "$queue" 2>>"$log"; then
+if ! print -- "$src\t$inbox" >> "$queue" 2>>"$log"; then
 	print -- "[$(date)] ERROR: failed to append to queue $queue" >> "$log"
 	exit 1
 fi
