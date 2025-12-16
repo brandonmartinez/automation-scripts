@@ -16,15 +16,16 @@ trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
 [[ -f "$queue" ]] || exit 0
 
-while IFS=$'\t' read -r video original_dir || [[ -n ${video-} ]]; do
+while IFS=$'\t' read -r video summaries_dir || [[ -n ${video-} ]]; do
     [[ -z "$video" ]] && continue
     [[ ! -f "$video" ]] && continue
 
-    if [[ -z "$original_dir" ]]; then
-        original_dir="$(cd "$(dirname "$video")" && pwd)"
+    if [[ -z "$summaries_dir" ]]; then
+        summaries_dir="$(cd "$(dirname "$video")" && pwd)"
     fi
 
-    summaries_dir="$original_dir"
+    # Allow filesystem to settle after move
+    sleep 10
 
     {
         echo "[$(date)] Processing: $video"
