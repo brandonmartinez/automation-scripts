@@ -67,11 +67,18 @@ get-openai-response() {
     local request_body
     if ! request_body=$(printf '%s' "$1" | jq --arg model "$OPENAI_MODEL" '.model = (if .model then .model else $model end)'); then
         log_error "Failed to build OpenAI request body from payload"
-        exit 1
+        return 1
     fi
 
     local endpoint="${OPENAI_API_BASE_URL%/}/chat/completions"
-    log_debug "Sending request to $endpoint with model '$OPENAI_MODEL'"
+    local request_model
+    request_model=$(printf '%s' "$request_body" | jq -r '.model // empty' 2>/dev/null)
+    if [[ -z "$request_model" || "$request_model" == "null" ]]; then
+        request_model="$OPENAI_MODEL"
+        # ensure model is set in the body if it was missing
+        request_body=$(printf '%s' "$request_body" | jq --arg model "$request_model" '.model = $model')
+    fi
+    log_debug "Sending request to $endpoint with model '$request_model'"
 
     RESPONSE=$(curl -sS -X POST "$endpoint" \
         -H "Content-Type: application/json" \
@@ -81,7 +88,7 @@ get-openai-response() {
     # Check if the request was successful
     if [ $? -ne 0 ]; then
         log_error "Failed to send request to OpenAI API at $endpoint"
-        exit -1
+        return 1
     fi
 
     log_debug "Received response from API, processing..."
@@ -122,7 +129,7 @@ get-openai-response() {
         ERROR_MESSAGE=$(echo "${CLEANED_RESPONSE:-$RESPONSE}" | jq -r '.error.message // empty' 2>/dev/null)
         if [[ -n "$ERROR_MESSAGE" ]]; then
             log_error "API Error: $ERROR_MESSAGE"
-            exit -1
+            return 1
         fi
     fi
 
@@ -136,7 +143,8 @@ get-openai-response() {
     if [[ -z "$CONTENT" || "$CONTENT" == "null" || "$CONTENT" == "empty" ]]; then
         log_error "No content found in API response after all attempts"
         log_debug "Response structure: $(echo "${CLEANED_RESPONSE:-$RESPONSE}" | jq 'keys' 2>/dev/null || echo "Could not analyze")"
-        exit -1
+        log_error "Raw response: ${CLEANED_RESPONSE:-$RESPONSE}"
+        return 1
     fi
 
     # Parse the response to get the categorization and date
