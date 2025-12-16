@@ -23,7 +23,7 @@ while IFS=$'\t' read -r video summaries_dir || [[ -n ${video-} ]]; do
     [[ -z "$video" ]] && { echo "[$(date)] Skipping blank line" >>"$log"; continue; }
 
     # Allow filesystem to settle after move before checking existence
-    sleep 10
+    sleep 30
 
     if [[ ! -f "$video" ]]; then
         echo "[$(date)] Missing file after wait; skipping: $video" >>"$log"
