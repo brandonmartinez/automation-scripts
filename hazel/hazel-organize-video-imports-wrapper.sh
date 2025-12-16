@@ -13,7 +13,7 @@ umask 077
 
 print -- "[$(date)] whoami=$(whoami) home=${HOME:-unset} shell=${SHELL:-unset} pwd=$(pwd)" >> "$log"
 
-inbox="/Volumes/Videos/Import/Organize/Done"
+inbox="$HOME/Documents/Sort/Videos/Done"
 base="$(basename "$src")"
 dest="$inbox/$base"
 
@@ -34,6 +34,8 @@ fi
 tail -n 5 "$queue" >> "$log" 2>/dev/null || true
 
 # Kick worker in background
+print -- "[$(date)] Starting worker script $script_dir/hazel-organize-video-imports-worker.sh" >> "$log"
 "$script_dir/hazel-organize-video-imports-worker.sh" & disown
 
+print -- "[$(date)] Done" >> "$log"
 exit 0
