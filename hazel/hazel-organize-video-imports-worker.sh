@@ -8,6 +8,21 @@ lock="$HOME/.hazel-organize-video-imports-queue.lock"
 log="$HOME/Library/Logs/hazel-organize-video-imports-worker.log"
 organizer="$HOME/src/automation-scripts/organization/organize-video-imports.sh"
 
+# Clear stale lock (e.g., after kill -9)
+if [[ -d "$lock" ]]; then
+    # Seconds since last modification
+    last_mod=$(stat -f %m "$lock" 2>/dev/null || echo 0)
+    now=$(date +%s)
+    age=$(( now - last_mod ))
+    if (( age > 3600 )); then
+        echo "[$(date)] Removing stale lock (age ${age}s)" >>"$log"
+        rm -rf "$lock" 2>/dev/null || true
+    else
+        echo "[$(date)] Worker already running; exiting (lock age ${age}s)" >>"$log"
+        exit 0
+    fi
+fi
+
 # Only one worker at a time
 if ! mkdir "$lock" 2>/dev/null; then
     echo "[$(date)] Worker already running; exiting" >>"$log"
