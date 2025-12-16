@@ -21,20 +21,22 @@ print -- "[$(date)] src='$src' base='$base' inbox='$inbox' queue='$queue'" >> "$
 
 # Ensure queue file exists and is writable, log failure if any
 if ! touch "$queue" 2>>"$log"; then
-	print -- "[$(date)] ERROR: unable to touch queue $queue" >> "$log"
-	exit 1
+    print -- "[$(date)] ERROR: unable to touch queue $queue" >> "$log"
+    exit 1
 fi
 if ! print -- "$src\t$inbox" >> "$queue" 2>>"$log"; then
-	print -- "[$(date)] ERROR: failed to append to queue $queue" >> "$log"
-	exit 1
+    print -- "[$(date)] ERROR: failed to append to queue $queue" >> "$log"
+    exit 1
 fi
 
 # Show queue after append (last few lines)
 tail -n 5 "$queue" >> "$log" 2>/dev/null || true
 
-# Kick worker in background
-print -- "[$(date)] Starting worker script $script_dir/hazel-organize-video-imports-worker.sh" >> "$log"
-"$script_dir/hazel-organize-video-imports-worker.sh" & disown
+# Kick worker fully detached (no TTY/stdio ties)
+print -- "[$(date)] Starting worker script $script_dir/hazel-organize-video-imports-worker.sh (nohup, detached)" >> "$log"
+if ! nohup "$script_dir/hazel-organize-video-imports-worker.sh" </dev/null >>"$log" 2>&1 &!; then
+    print -- "[$(date)] ERROR: failed to launch worker" >> "$log"
+fi
 
 print -- "[$(date)] Done" >> "$log"
 exit 0
