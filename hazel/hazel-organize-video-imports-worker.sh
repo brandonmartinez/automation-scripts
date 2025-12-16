@@ -10,22 +10,29 @@ organizer="$HOME/src/automation-scripts/organization/organize-video-imports.sh"
 
 # Only one worker at a time
 if ! mkdir "$lock" 2>/dev/null; then
+    echo "[$(date)] Worker already running; exiting" >>"$log"
     exit 0
 fi
 trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
+echo "[$(date)] Worker started" >>"$log"
+
 [[ -f "$queue" ]] || exit 0
 
 while IFS=$'\t' read -r video summaries_dir || [[ -n ${video-} ]]; do
-    [[ -z "$video" ]] && continue
-    [[ ! -f "$video" ]] && continue
+    [[ -z "$video" ]] && { echo "[$(date)] Skipping blank line" >>"$log"; continue; }
+
+    # Allow filesystem to settle after move before checking existence
+    sleep 10
+
+    if [[ ! -f "$video" ]]; then
+        echo "[$(date)] Missing file after wait; skipping: $video" >>"$log"
+        continue
+    fi
 
     if [[ -z "$summaries_dir" ]]; then
         summaries_dir="$(cd "$(dirname "$video")" && pwd)"
     fi
-
-    # Allow filesystem to settle after move
-    sleep 10
 
     {
         echo "[$(date)] Processing: $video"

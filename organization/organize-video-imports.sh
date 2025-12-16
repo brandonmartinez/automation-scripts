@@ -14,11 +14,11 @@ PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 SCRIPT_PATH="${(%):-%N}"
 SCRIPT_DIR="${SCRIPT_PATH:A:h}"
 
-DEFAULT_INTERVAL=10
+DEFAULT_INTERVAL=5
 KEEP_TEMP=0
 REUSE_DESCRIPTIONS=0
 INTERVAL="$DEFAULT_INTERVAL"
-MAX_FRAMES=75
+MAX_FRAMES=100
 VIDEO_FILE=""
 SUMMARIES_DIR=""
 TEMP_BASE_DIR=""
@@ -107,7 +107,7 @@ parse_args() {
 
 cleanup() {
 	if (( KEEP_TEMP == 0 )) && [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
-		rm -rf "$WORK_DIR"
+		rm -Rf "$WORK_DIR"
 	fi
 }
 trap cleanup EXIT
@@ -321,20 +321,22 @@ write_summary() {
 		exit 1
 	fi
 
-	local formatted
-	formatted=$(printf '# %s\n\n%s\n' "$title" "$description" | perl -0pe '
-	s/\r\n?/\n/g;
-	s/[ \t]+/ /g;
-	s/^# */# /;
-	s/\n{3,}/\n\n/g;
-	s/\n +/\n/g;
-	END { $_ .= "\n" unless /\n\z/; }
+    local formatted
+    formatted=$(printf '# %s\n\n%s\n\n%s\n' "$title" "AI-generated video summary; check for accuracy" "$description" | perl -0pe '
+    s/\r\n?/\n/g;
+    s/[ \t]+/ /g;
+    s/^# */# /;
+    s/\n{3,}/\n\n/g;
+    s/\n +/\n/g;
+    END { $_ .= "\n" unless /\n\z/; }
 ')
 
-	printf 'AI-generated video summary; check for accuracy\n\n%s' "$formatted" >"$summary_path"
+	printf '%s' "$formatted" >"$summary_path"
 	log_info "Wrote summary to $summary_path"
 	SUMMARY_PATH="$summary_path"
-    open -r "$summary_path"
+	if command -v open >/dev/null 2>&1; then
+		open -R "$summary_path" || true
+	fi
 }
 
 main() {
@@ -402,7 +404,7 @@ main() {
 		log_info "Temp directory kept at $WORK_DIR"
 	else
 		if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
-			rm -rf "$WORK_DIR"
+			rm -Rf "$WORK_DIR"
 			log_info "Removed temp directory $WORK_DIR"
 		fi
 		if [[ -n "$TEMP_BASE_DIR" && -d "$TEMP_BASE_DIR" ]]; then
