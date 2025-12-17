@@ -107,10 +107,20 @@ parse_args() {
 
 cleanup() {
 	if (( KEEP_TEMP == 0 )) && [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
-		rm -Rf "$WORK_DIR"
+		safe_remove_dir "$WORK_DIR"
 	fi
 }
 trap cleanup EXIT
+
+safe_remove_dir() {
+	local target="$1"
+	if [[ -z "$target" || ! -d "$target" ]]; then
+		return 0
+	fi
+	if ! rm -Rf "$target" 2>/dev/null; then
+		log_warn "Failed to remove $target (resource busy or permission issue); continuing"
+	fi
+}
 
 format_timecode() {
 	local seconds="$1"
@@ -137,15 +147,16 @@ describe_frame() {
 	} &
 	heartbeat_pid=$!
 
-	local b64
-	if ! b64=$(base64 < "$frame_path" | tr -d '\n'); then
+	local b64_file
+	b64_file="$WORK_DIR/frame_${frame_index}.b64"
+	if ! base64 < "$frame_path" | tr -d '\n' >"$b64_file"; then
 		log_warn "Failed to base64 encode $frame_path"
 		return 0
 	fi
 
 	local payload
 	payload=$(jq -n \
-		--arg b64 "$b64" \
+		--rawfile b64 "$b64_file" \
 		--arg filename "$VIDEO_BASENAME" \
 		--arg tc "$timecode" \
 		--arg model "$VISION_MODEL" \
@@ -160,7 +171,7 @@ describe_frame() {
 					role: "user",
 					content: [
 						{"type": "text", "text": ("Video file name: " + $filename + "\nFrame time: " + $tc + "\nDescribe what is visible in 1-2 concise sentences." )},
-						{"type": "image_url", "image_url": {"url": ("data:image/jpeg;base64," + $b64) }}
+						{"type": "image_url", "image_url": {"url": ("data:image/jpeg;base64," + ($b64 | gsub("\n"; "")) ) }}
 					]
 				}
 			],
@@ -382,7 +393,7 @@ main() {
 
 	mkdir -p "$TEMP_BASE_DIR"
 	if ! (( REUSE_DESCRIPTIONS )) || [[ ! -f "$FRAME_RESULTS_FILE" ]]; then
-		rm -Rf "$WORK_DIR"
+		safe_remove_dir "$WORK_DIR"
 		mkdir -p "$WORK_DIR"
 	fi
 
@@ -404,7 +415,7 @@ main() {
 		log_info "Temp directory kept at $WORK_DIR"
 	else
 		if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
-			rm -Rf "$WORK_DIR"
+			safe_remove_dir "$WORK_DIR"
 			log_info "Removed temp directory $WORK_DIR"
 		fi
 		if [[ -n "$TEMP_BASE_DIR" && -d "$TEMP_BASE_DIR" ]]; then
