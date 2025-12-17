@@ -30,7 +30,6 @@ SUMMARY_MODEL="${OPENAI_SUMMARY_MODEL:-gpt-4.1}"
 AUDIO_MODEL="${OPENAI_AUDIO_MODEL:-whisper-1}"
 AUDIO_FILE=""
 AUDIO_TRANSCRIPT_PATH=""
-FINAL_TRANSCRIPT_PATH=""
 TRANSCRIPT_SNIPPET=""
 HAS_AUDIO_TRACK=0
 AUDIO_DIR=""
@@ -228,8 +227,7 @@ transcribe_audio_track() {
 	fi
 
 	AUDIO_TRANSCRIPT_PATH="$AUDIO_DIR/audio_transcript.txt"
-	FINAL_TRANSCRIPT_PATH="$SUMMARIES_DIR/$VIDEO_BASENAME.transcript.txt"
-	mkdir -p "$SUMMARIES_DIR"
+	mkdir -p "$AUDIO_DIR"
 
 	local endpoint
 	endpoint="${OPENAI_API_BASE_URL%/}/audio/transcriptions"
@@ -260,8 +258,7 @@ transcribe_audio_track() {
 	fi
 
 	printf '%s\n' "$body" >"$AUDIO_TRANSCRIPT_PATH"
-	command cp "$AUDIO_TRANSCRIPT_PATH" "$FINAL_TRANSCRIPT_PATH" 2>/dev/null || true
-	log_info "Transcript saved to $FINAL_TRANSCRIPT_PATH"
+	log_info "Transcript saved to $AUDIO_TRANSCRIPT_PATH"
 
 	prepare_transcript_snippet
 }
@@ -607,7 +604,6 @@ main() {
 	FRAMES_DIR="$WORK_DIR/frames"
 	AUDIO_DIR="$WORK_DIR/audio"
 	AUDIO_TRANSCRIPT_PATH="$WORK_DIR/audio_transcript.txt"
-	FINAL_TRANSCRIPT_PATH="$SUMMARIES_DIR/$VIDEO_BASENAME.transcript.txt"
 
 	mkdir -p "$TEMP_BASE_DIR" "$WORK_DIR" "$FRAMES_DIR" "$AUDIO_DIR"
 
