@@ -4,11 +4,42 @@ set -o nounset
 set -o pipefail
 
 queue="$HOME/.hazel-organize-video-imports-queue"
+queue_lock="$HOME/.hazel-organize-video-imports-queue.oplock"
 lock="$HOME/.hazel-organize-video-imports-queue.lock"
 log="$HOME/Library/Logs/hazel-organize-video-imports-worker.log"
 organizer="$HOME/src/automation-scripts/organization/organize-video-imports.sh"
-settle_timeout="${QUEUE_SETTLE_TIMEOUT:-5}"
-settle_interval=1
+
+acquire_queue_lock() {
+    local waited=0
+    local max_wait=50 # 5s total (50 * 0.1s)
+    while true; do
+        if mkdir "$queue_lock" 2>/dev/null; then
+            break
+        fi
+
+        if [[ -d "$queue_lock" ]]; then
+            last_mod=$(stat -f %m "$queue_lock" 2>/dev/null || echo 0)
+            now=$(date +%s)
+            age=$(( now - last_mod ))
+            if (( age > 3600 )); then
+                echo "[$(date)] Removing stale queue lock (age ${age}s)" >>"$log"
+                rmdir "$queue_lock" 2>/dev/null || true
+                continue
+            fi
+        fi
+
+        sleep 0.1
+        waited=$(( waited + 1 ))
+        if (( waited >= max_wait )); then
+            echo "[$(date)] ERROR: queue lock wait exceeded" >>"$log"
+            return 1
+        fi
+    done
+}
+
+release_queue_lock() {
+    rmdir "$queue_lock" 2>/dev/null || true
+}
 
 # Clear stale lock (e.g., after kill -9)
 if [[ -d "$lock" ]]; then
@@ -34,41 +65,40 @@ trap 'rmdir "$lock" 2>/dev/null || true' EXIT
 
 echo "[$(date)] Worker started" >>"$log"
 
-if [[ ! -f "$queue" ]]; then
-    echo "[$(date)] No queue file; exiting" >>"$log"
-    exit 0
-fi
-
-# Let the queue file settle in case it's still being appended to
-if [[ -f "$queue" && $settle_timeout -gt 0 ]]; then
-    last_mtime=$(stat -f %m "$queue" 2>/dev/null || echo 0)
-    waited=0
-    while (( waited < settle_timeout )); do
-        sleep "$settle_interval"
-        mtime=$(stat -f %m "$queue" 2>/dev/null || echo 0)
-        if (( mtime == last_mtime )); then
-            break
-        fi
-        last_mtime=$mtime
-        waited=$(( waited + settle_interval ))
-    done
-fi
-
-while IFS=$'\t' read -r video summaries_dir || [[ -n ${video-} ]]; do
-    [[ -z "$video" ]] && { echo "[$(date)] Skipping blank line" >>"$log"; continue; }
-
-    if [[ -z "$summaries_dir" ]]; then
-        summaries_dir="$(cd "$(dirname "$video")" && pwd)"
+while true; do
+    if ! acquire_queue_lock; then
+        echo "[$(date)] Failed to acquire queue lock; exiting" >>"$log"
+        exit 1
     fi
 
-    {
-        echo "[$(date)] Processing: $video"
-        "$organizer" --summaries-dir "$summaries_dir" "$video"
-        echo "[$(date)] Done: $video"
-    } >>"$log" 2>&1 || echo "[$(date)] ERROR processing $video" >>"$log"
-done < "$queue"
+    if [[ ! -s "$queue" ]]; then
+        release_queue_lock
+        break
+    fi
 
-# Clear queue
-: > "$queue"
+    batch_file="${queue}.processing.$$"
+    if mv "$queue" "$batch_file" 2>/dev/null; then
+        : > "$queue"
+    else
+        echo "[$(date)] ERROR: unable to move queue to batch" >>"$log"
+        release_queue_lock
+        exit 1
+    fi
+
+    release_queue_lock
+
+    while IFS= read -r video || [[ -n ${video-} ]]; do
+        video="${video//$'\r'/}"
+        [[ -z "$video" ]] && { echo "[$(date)] Skipping blank line" >>"$log"; continue; }
+
+        {
+            echo "[$(date)] Processing: $video"
+            "$organizer" "$video"
+            echo "[$(date)] Done: $video"
+        } >>"$log" 2>&1 || echo "[$(date)] ERROR processing $video" >>"$log"
+    done < "$batch_file"
+
+    rm -f "$batch_file"
+done
 
 echo "[$(date)] Worker finished" >>"$log"

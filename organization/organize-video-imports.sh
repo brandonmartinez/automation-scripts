@@ -45,7 +45,7 @@ Usage: organize-video-imports.sh [options] <video_file>
 Options:
 	--interval <seconds>     Interval between frames (default: 10)
 	--max-frames <count>     Cap the number of frames extracted (default: 50)
-	--summaries-dir <path>   Directory to write the markdown summary
+	--summaries-dir <path>   Directory to write the markdown summary (default: video directory)
 	--keep-temp              Keep temporary working directory (for debugging)
 	-h, --help               Show this help text
 USAGE
