@@ -84,16 +84,35 @@ get-openai-response() {
     req_file=$(mktemp)
     printf '%s' "$request_body" >"$req_file"
 
-    RESPONSE=$(curl -sS -X POST "$endpoint" \
-        -H "Content-Type: application/json" \
-        -H "Authorization: Bearer $API_KEY" \
-        -d @"$req_file")
-    local curl_status=$?
+    local attempt=0
+    local max_attempts=3
+    local sleep_base=2
+    local curl_status=0
+    local RESPONSE=""
+
+    while (( attempt < max_attempts )); do
+        attempt=$((attempt + 1))
+
+        RESPONSE=$(curl -sS --max-time 60 -X POST "$endpoint" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $API_KEY" \
+            -d @"$req_file")
+        curl_status=$?
+
+        if [ $curl_status -eq 0 ]; then
+            break
+        fi
+
+        log_warn "OpenAI request failed (attempt $attempt/$max_attempts); retrying after backoff"
+        local sleep_time=$((sleep_base ** attempt))
+        sleep "$sleep_time"
+    done
+
     rm -f "$req_file"
 
     # Check if the request was successful
     if [ $curl_status -ne 0 ]; then
-        log_error "Failed to send request to OpenAI API at $endpoint"
+        log_error "Failed to send request to OpenAI API at $endpoint after $max_attempts attempts"
         return 1
     fi
 

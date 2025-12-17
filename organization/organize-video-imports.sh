@@ -6,6 +6,8 @@ set -o nounset
 set -o pipefail
 setopt null_glob
 
+TRAPPED_SIGNAL=""
+
 if [[ "${TRACE-0}" == "1" ]]; then
 	set -o xtrace
 fi
@@ -14,11 +16,11 @@ PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 SCRIPT_PATH="${(%):-%N}"
 SCRIPT_DIR="${SCRIPT_PATH:A:h}"
 
-DEFAULT_INTERVAL=5
+DEFAULT_INTERVAL=10
 KEEP_TEMP=0
 REUSE_DESCRIPTIONS=0
 INTERVAL="$DEFAULT_INTERVAL"
-MAX_FRAMES=100
+MAX_FRAMES=50
 VIDEO_FILE=""
 SUMMARIES_DIR=""
 TEMP_BASE_DIR=""
@@ -41,7 +43,7 @@ usage() {
 Usage: organize-video-imports.sh [options] <video_file>
 
 Options:
-	--interval <seconds>     Interval between frames (default: 12)
+	--interval <seconds>     Interval between frames (default: 10)
 	--max-frames <count>     Cap the number of frames extracted (default: 50)
 	--summaries-dir <path>   Directory to write the markdown summary
 	--keep-temp              Keep temporary working directory (for debugging)
@@ -112,6 +114,41 @@ cleanup() {
 }
 trap cleanup EXIT
 
+signal_handler() {
+	local sig="$1"
+	TRAPPED_SIGNAL="$sig"
+	local ts
+	ts=$(date -Iseconds 2>/dev/null || date)
+	local msg
+	msg="Received signal ${sig}; aborting run at ${ts}"
+	local log_fn
+	if typeset -f log_error >/dev/null 2>&1; then
+		log_fn=log_error
+	else
+		log_fn=echo
+	fi
+	"$log_fn" "$msg" >&2
+	local log_path
+	log_path="${TEMP_BASE_DIR:-/tmp}/organize-video-imports.signal.log"
+	mkdir -p "$(dirname "$log_path")" 2>/dev/null || true
+	{
+		printf '%s\n' "$msg"
+		printf 'script_pid=%s ppid=%s tty=%s\n' "$$" "$PPID" "$(ps -o tty= -p "$$" 2>/dev/null | tr -d ' ')"
+		printf 'parent_cmd=%s\n' "$(ps -o command= -p "$PPID" 2>/dev/null | sed 's/^ *//')"
+		printf 'self_cmd=%s\n' "$(ps -o command= -p "$$" 2>/dev/null | sed 's/^ *//')"
+		printf 'children=%s\n' "$(pgrep -P "$$" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+		printf 'user=%s\n' "${USER:-}"
+		printf 'pwd=%s\n' "${PWD:-}"
+		printf -- '---\n'
+	} >>"$log_path" 2>/dev/null || true
+	exit 130
+}
+
+trap 'signal_handler INT' INT
+trap 'signal_handler TERM' TERM
+trap 'signal_handler HUP' HUP
+trap 'signal_handler QUIT' QUIT
+
 safe_remove_dir() {
 	local target="$1"
 	if [[ -z "$target" || ! -d "$target" ]]; then
@@ -171,7 +208,7 @@ describe_frame() {
 					role: "user",
 					content: [
 						{"type": "text", "text": ("Video file name: " + $filename + "\nFrame time: " + $tc + "\nDescribe what is visible in 1-2 concise sentences." )},
-						{"type": "image_url", "image_url": {"url": ("data:image/jpeg;base64," + ($b64 | gsub("\n"; "")) ) }}
+						{"type": "image_url", "image_url": {"url": ("data:image/jpeg;base64," + ($b64 | gsub("[[:space:]]"; "")) ) }}
 					]
 				}
 			],
@@ -266,9 +303,9 @@ extract_frames() {
 		vframes_arg=(-vframes "$MAX_FRAMES")
 	fi
 
-	local filter="fps=1/${INTERVAL}"
+	local filter="fps=1/${INTERVAL},scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease"
 
-	if ! ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vf "$filter" -vsync vfr -q:v 2 "${vframes_arg[@]}" "$FRAMES_DIR/frame_%05d.jpg"; then
+	if ! ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vf "$filter" -vsync vfr -q:v 8 "${vframes_arg[@]}" "$FRAMES_DIR/frame_%05d.jpg"; then
 		log_error "ffmpeg frame extraction failed"
 		exit 1
 	fi
