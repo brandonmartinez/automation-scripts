@@ -80,13 +80,19 @@ get-openai-response() {
     fi
     log_debug "Sending request to $endpoint with model '$request_model'"
 
+    local req_file
+    req_file=$(mktemp)
+    printf '%s' "$request_body" >"$req_file"
+
     RESPONSE=$(curl -sS -X POST "$endpoint" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $API_KEY" \
-        -d "$request_body")
+        -d @"$req_file")
+    local curl_status=$?
+    rm -f "$req_file"
 
     # Check if the request was successful
-    if [ $? -ne 0 ]; then
+    if [ $curl_status -ne 0 ]; then
         log_error "Failed to send request to OpenAI API at $endpoint"
         return 1
     fi
