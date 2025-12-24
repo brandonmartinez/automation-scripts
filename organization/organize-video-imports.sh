@@ -485,8 +485,9 @@ extract_frames() {
         exit 1
     fi
 
-    local count=$(ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "$count" == "0" ]]; then
+    local frames=("$FRAMES_DIR"/frame_*.${FRAME_EXT})
+    local count=${#frames[@]}
+    if (( count == 0 )); then
         log_error "No frames were extracted"
         exit 1
     fi
@@ -503,8 +504,11 @@ extract_frames() {
 ensure_frames_ready() {
     local expected actual
     expected=$(expected_frame_count)
-    if ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} >/dev/null 2>&1; then
-        actual=$(ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} 2>/dev/null | wc -l | tr -d ' ')
+
+    local frames=("$FRAMES_DIR"/frame_*.${FRAME_EXT})
+
+    if (( ${#frames[@]} > 0 )); then
+        actual=${#frames[@]}
         if (( expected > 0 && actual < expected )); then
             log_warn "Frames missing ($actual/$expected); re-extracting"
             safe_remove_dir "$FRAMES_DIR"
@@ -520,11 +524,17 @@ ensure_frames_ready() {
 
 process_frames() {
     [[ -f "$FRAME_RESULTS_FILE" ]] || : >"$FRAME_RESULTS_FILE"
-    local idx=0
-    local total_frames
-    total_frames=$(ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} 2>/dev/null | wc -l | tr -d ' ')
 
-    for img in "$FRAMES_DIR"/frame_*.${FRAME_EXT}; do
+    local frames=("$FRAMES_DIR"/frame_*.${FRAME_EXT})
+    local total_frames=${#frames[@]}
+
+    if (( total_frames == 0 )); then
+        log_error "No frames found for processing"
+        exit 1
+    fi
+
+    local idx=0
+    for img in "${frames[@]}"; do
         idx=$((idx + 1))
         local ts_seconds=$(((idx - 1) * INTERVAL))
         local tc="$(format_timecode "$ts_seconds")"
