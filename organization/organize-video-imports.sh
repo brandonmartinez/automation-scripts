@@ -9,16 +9,23 @@ setopt null_glob
 TRAPPED_SIGNAL=""
 
 if [[ "${TRACE-0}" == "1" ]]; then
-	set -o xtrace
+    set -o xtrace
 fi
 
 PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 SCRIPT_PATH="${(%):-%N}"
 SCRIPT_DIR="${SCRIPT_PATH:A:h}"
 
-DEFAULT_INTERVAL=10
+DEFAULT_INTERVAL=30
 INTERVAL="$DEFAULT_INTERVAL"
-MAX_FRAMES=50
+MAX_FRAMES=100
+FRAME_MAX_WIDTH="${FRAME_MAX_WIDTH:-720}"
+FRAME_MAX_HEIGHT="${FRAME_MAX_HEIGHT:-404}"
+FRAME_QUALITY="${FRAME_QUALITY:-30}"
+FRAME_FORMAT="${FRAME_FORMAT:-webp}"
+FRAME_SIM_THRESHOLD="${FRAME_SIM_THRESHOLD:-0.92}"
+FRAME_MIME=""
+FRAME_EXT=""
 VIDEO_FILE=""
 SUMMARIES_DIR=""
 TEMP_BASE_DIR=""
@@ -36,11 +43,11 @@ AUDIO_DIR=""
 VIDEO_DURATION_SECONDS=""
 
 require_command() {
-	local cmd="$1"
-	if ! command -v "$cmd" >/dev/null 2>&1; then
-		echo "Missing required command: $cmd" >&2
-		exit 1
-	fi
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        echo "Missing required command: $cmd" >&2
+        exit 1
+    fi
 }
 
 usage() {
@@ -56,86 +63,86 @@ USAGE
 }
 
 parse_args() {
-	local args=()
-	while [[ $# -gt 0 ]]; do
-		case "$1" in
-			--interval)
-				[[ $# -lt 2 ]] && { echo "--interval requires a value" >&2; exit 1; }
-				INTERVAL="$2"
-				shift 2
-				;;
-			--max-frames)
-				[[ $# -lt 2 ]] && { echo "--max-frames requires a value" >&2; exit 1; }
-				MAX_FRAMES="$2"
-				shift 2
-				;;
-			--summaries-dir)
-				[[ $# -lt 2 ]] && { echo "--summaries-dir requires a value" >&2; exit 1; }
-				SUMMARIES_DIR="$2"
-				shift 2
-				;;
-			-h|--help)
-				usage
-				exit 0
-				;;
-			--)
-				shift
-				break
-				;;
-			-*)
-				echo "Unknown option: $1" >&2
-				usage
-				exit 1
-				;;
-			*)
-				args+=("$1")
-				shift
-				;;
-		esac
-	done
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --interval)
+                [[ $# -lt 2 ]] && { echo "--interval requires a value" >&2; exit 1; }
+                INTERVAL="$2"
+                shift 2
+            ;;
+            --max-frames)
+                [[ $# -lt 2 ]] && { echo "--max-frames requires a value" >&2; exit 1; }
+                MAX_FRAMES="$2"
+                shift 2
+            ;;
+            --summaries-dir)
+                [[ $# -lt 2 ]] && { echo "--summaries-dir requires a value" >&2; exit 1; }
+                SUMMARIES_DIR="$2"
+                shift 2
+            ;;
+            -h|--help)
+                usage
+                exit 0
+            ;;
+            --)
+                shift
+                break
+            ;;
+            -*)
+                echo "Unknown option: $1" >&2
+                usage
+                exit 1
+            ;;
+            *)
+                args+=("$1")
+                shift
+            ;;
+        esac
+    done
 
-	if (( ${#args[@]} == 0 )); then
-		echo "A video file path is required" >&2
-		usage
-		exit 1
-	fi
+    if (( ${#args[@]} == 0 )); then
+        echo "A video file path is required" >&2
+        usage
+        exit 1
+    fi
 
-	VIDEO_FILE="${args[1]}"
+    VIDEO_FILE="${args[1]}"
 }
 
 cleanup() {
-	:
+    :
 }
 trap cleanup EXIT
 
 signal_handler() {
-	local sig="$1"
-	TRAPPED_SIGNAL="$sig"
-	local ts
-	ts=$(date -Iseconds 2>/dev/null || date)
-	local msg
-	msg="Received signal ${sig}; aborting run at ${ts}"
-	local log_fn
-	if typeset -f log_error >/dev/null 2>&1; then
-		log_fn=log_error
-	else
-		log_fn=echo
-	fi
-	"$log_fn" "$msg" >&2
-	local log_path
-	log_path="${TEMP_BASE_DIR:-/tmp}/organize-video-imports.signal.log"
-	mkdir -p "$(dirname "$log_path")" 2>/dev/null || true
-	{
-		printf '%s\n' "$msg"
-		printf 'script_pid=%s ppid=%s tty=%s\n' "$$" "$PPID" "$(ps -o tty= -p "$$" 2>/dev/null | tr -d ' ')"
-		printf 'parent_cmd=%s\n' "$(ps -o command= -p "$PPID" 2>/dev/null | sed 's/^ *//')"
-		printf 'self_cmd=%s\n' "$(ps -o command= -p "$$" 2>/dev/null | sed 's/^ *//')"
-		printf 'children=%s\n' "$(pgrep -P "$$" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
-		printf 'user=%s\n' "${USER:-}"
-		printf 'pwd=%s\n' "${PWD:-}"
-		printf -- '---\n'
-	} >>"$log_path" 2>/dev/null || true
-	exit 130
+    local sig="$1"
+    TRAPPED_SIGNAL="$sig"
+    local ts
+    ts=$(date -Iseconds 2>/dev/null || date)
+    local msg
+    msg="Received signal ${sig}; aborting run at ${ts}"
+    local log_fn
+    if typeset -f log_error >/dev/null 2>&1; then
+        log_fn=log_error
+    else
+        log_fn=echo
+    fi
+    "$log_fn" "$msg" >&2
+    local log_path
+    log_path="${TEMP_BASE_DIR:-/tmp}/organize-video-imports.signal.log"
+    mkdir -p "$(dirname "$log_path")" 2>/dev/null || true
+    {
+        printf '%s\n' "$msg"
+        printf 'script_pid=%s ppid=%s tty=%s\n' "$$" "$PPID" "$(ps -o tty= -p "$$" 2>/dev/null | tr -d ' ')"
+        printf 'parent_cmd=%s\n' "$(ps -o command= -p "$PPID" 2>/dev/null | sed 's/^ *//')"
+        printf 'self_cmd=%s\n' "$(ps -o command= -p "$$" 2>/dev/null | sed 's/^ *//')"
+        printf 'children=%s\n' "$(pgrep -P "$$" 2>/dev/null | tr '\n' ' ' | sed 's/ *$//')"
+        printf 'user=%s\n' "${USER:-}"
+        printf 'pwd=%s\n' "${PWD:-}"
+        printf -- '---\n'
+    } >>"$log_path" 2>/dev/null || true
+    exit 130
 }
 
 trap 'signal_handler INT' INT
@@ -144,171 +151,206 @@ trap 'signal_handler HUP' HUP
 trap 'signal_handler QUIT' QUIT
 
 safe_remove_dir() {
-	local target="$1"
-	if [[ -z "$target" || ! -d "$target" ]]; then
-		return 0
-	fi
-	if ! rm -Rf "$target" 2>/dev/null; then
-		log_warn "Failed to remove $target (resource busy or permission issue); continuing"
-	fi
+    local target="$1"
+    if [[ -z "$target" || ! -d "$target" ]]; then
+        return 0
+    fi
+    if ! rm -Rf "$target" 2>/dev/null; then
+        log_warn "Failed to remove $target (resource busy or permission issue); continuing"
+    fi
 }
 
 format_timecode() {
-	local seconds="$1"
-	printf '%02d:%02d:%02d' $((seconds/3600)) $(((seconds%3600)/60)) $((seconds%60))
+    local seconds="$1"
+    printf '%02d:%02d:%02d' $((seconds/3600)) $(((seconds%3600)/60)) $((seconds%60))
 }
 
 detect_audio_track() {
-	local audio_stream
-	audio_stream=$(command ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$VIDEO_FILE" 2>/dev/null || true)
-	if [[ -n "$audio_stream" ]]; then
-		HAS_AUDIO_TRACK=1
-		log_info "Audio track detected"
-	else
-		HAS_AUDIO_TRACK=0
-		log_info "No audio track detected; skipping transcription"
-	fi
+    local audio_stream
+    audio_stream=$(command ffprobe -v error -select_streams a:0 -show_entries stream=index -of csv=p=0 "$VIDEO_FILE" 2>/dev/null || true)
+    if [[ -n "$audio_stream" ]]; then
+        HAS_AUDIO_TRACK=1
+        log_info "Audio track detected"
+    else
+        HAS_AUDIO_TRACK=0
+        log_info "No audio track detected; skipping transcription"
+    fi
+}
+
+set_frame_format_vars() {
+    local fmt
+    fmt=$(printf '%s' "$FRAME_FORMAT" | tr '[:upper:]' '[:lower:]')
+    case "$fmt" in
+        jpg|jpeg)
+            FRAME_FORMAT="jpg"
+            FRAME_MIME="image/jpeg"
+            FRAME_EXT="jpg"
+        ;;
+        webp)
+            FRAME_FORMAT="webp"
+            FRAME_MIME="image/webp"
+            FRAME_EXT="webp"
+        ;;
+        *)
+            log_warn "Unsupported FRAME_FORMAT '$FRAME_FORMAT'; defaulting to jpg"
+            FRAME_FORMAT="jpg"
+            FRAME_MIME="image/jpeg"
+            FRAME_EXT="jpg"
+        ;;
+    esac
 }
 
 get_video_duration_seconds() {
-	if [[ -n "$VIDEO_DURATION_SECONDS" ]]; then
-		return 0
-	fi
-	local duration
-	duration=$(command ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null || true)
-	VIDEO_DURATION_SECONDS=${duration%.*}
-	if [[ -z "$VIDEO_DURATION_SECONDS" ]]; then
-		VIDEO_DURATION_SECONDS=0
-	fi
+    if [[ -n "$VIDEO_DURATION_SECONDS" ]]; then
+        return 0
+    fi
+    local duration
+    duration=$(command ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "$VIDEO_FILE" 2>/dev/null || true)
+    VIDEO_DURATION_SECONDS=${duration%.*}
+    if [[ -z "$VIDEO_DURATION_SECONDS" ]]; then
+        VIDEO_DURATION_SECONDS=0
+    fi
 }
 
 expected_frame_count() {
-	get_video_duration_seconds
-	local expected
-	expected=$(( (VIDEO_DURATION_SECONDS / INTERVAL) + 1 ))
-	if (( MAX_FRAMES > 0 && expected > MAX_FRAMES )); then
-		expected=$MAX_FRAMES
-	fi
-	printf '%s' "$expected"
+    get_video_duration_seconds
+    local expected
+    expected=$(( (VIDEO_DURATION_SECONDS / INTERVAL) + 1 ))
+    if (( MAX_FRAMES > 0 && expected > MAX_FRAMES )); then
+        expected=$MAX_FRAMES
+    fi
+    printf '%s' "$expected"
 }
 
 extract_audio_track() {
-	if (( HAS_AUDIO_TRACK == 0 )); then
-		return 0
-	fi
+    if (( HAS_AUDIO_TRACK == 0 )); then
+        return 0
+    fi
 
-	log_info "Extracting audio to $AUDIO_FILE"
+    log_info "Extracting audio to $AUDIO_FILE"
 
-	if [[ -s "$AUDIO_FILE" ]]; then
-		log_info "Reusing existing extracted audio at $AUDIO_FILE"
-		return 0
-	fi
+    if [[ -s "$AUDIO_FILE" ]]; then
+        log_info "Reusing existing extracted audio at $AUDIO_FILE"
+        return 0
+    fi
 
-	log_info "Extracting audio to $AUDIO_FILE"
+    log_info "Extracting audio to $AUDIO_FILE"
 
-	if ! command ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le "$AUDIO_FILE"; then
-		log_warn "Failed to extract audio track; continuing without transcript"
-		HAS_AUDIO_TRACK=0
-		return 1
-	fi
+    if ! command ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vn -ac 1 -ar 16000 -c:a libopus -b:a 24k "$AUDIO_FILE"; then
+        log_warn "Failed to extract audio track; continuing without transcript"
+        HAS_AUDIO_TRACK=0
+        return 1
+    fi
 
-	if [[ ! -s "$AUDIO_FILE" ]]; then
-		log_warn "Extracted audio file is empty; skipping transcription"
-		HAS_AUDIO_TRACK=0
-		return 1
-	fi
+    if [[ ! -s "$AUDIO_FILE" ]]; then
+        log_warn "Extracted audio file is empty; skipping transcription"
+        HAS_AUDIO_TRACK=0
+        return 1
+    fi
 
-	log_info "Audio extraction complete"
+    local audio_size
+    audio_size=$(stat -f%z "$AUDIO_FILE" 2>/dev/null || echo 0)
+    if (( audio_size > 25000000 )); then
+        log_warn "Extracted audio is large ($(printf '%.1f' "$(echo "$audio_size / 1048576" | bc -l)") MB); Whisper may reject files over 25MB"
+    fi
+
+    log_info "Audio extraction complete"
 }
 
 transcribe_audio_track() {
-	if (( HAS_AUDIO_TRACK == 0 )); then
-		return 0
-	fi
+    if (( HAS_AUDIO_TRACK == 0 )); then
+        return 0
+    fi
 
-	AUDIO_TRANSCRIPT_PATH="$AUDIO_DIR/audio_transcript.txt"
-	mkdir -p "$AUDIO_DIR"
+    AUDIO_TRANSCRIPT_PATH="$AUDIO_DIR/audio_transcript.txt"
+    mkdir -p "$AUDIO_DIR"
 
-	local endpoint
-	endpoint="${OPENAI_API_BASE_URL%/}/audio/transcriptions"
+    if [[ ! -r "$AUDIO_FILE" ]]; then
+        log_warn "Audio file not readable for transcription: $AUDIO_FILE"
+        return 1
+    fi
 
-	log_info "Transcribing audio with model $AUDIO_MODEL"
-	local tmp_response
-	tmp_response=$(mktemp)
+    local endpoint
+    endpoint="${OPENAI_API_BASE_URL%/}/audio/transcriptions"
 
-	local http_status
-	if ! http_status=$(command curl -sS -o "$tmp_response" -w "%{http_code}" -X POST "$endpoint" \
-		-H "Authorization: Bearer $API_KEY" \
-		-F "file=@$AUDIO_FILE" \
-		-F "model=$AUDIO_MODEL" \
-		-F "response_format=text"); then
-		log_warn "Audio transcription request failed"
-		rm -f "$tmp_response"
-		return 1
-	fi
+    log_info "Transcribing audio with model $AUDIO_MODEL"
+    local tmp_response
+    tmp_response=$(mktemp)
 
-	local body
-	body=$(cat "$tmp_response")
-	rm -f "$tmp_response"
+    local http_status
+    if ! http_status=$(command curl -sS -o "$tmp_response" -w "%{http_code}" -X POST "$endpoint" \
+        -H "Authorization: Bearer $API_KEY" \
+        -F "file=@\"${AUDIO_FILE}\";type=audio/ogg" \
+        -F "model=$AUDIO_MODEL" \
+        -F "response_format=text"); then
+        log_warn "Audio transcription request failed"
+        rm -f "$tmp_response"
+        return 1
+    fi
 
-	if [[ "$http_status" != "200" ]]; then
-		log_warn "Transcription failed (HTTP $http_status)"
-		log_debug "Transcription response: ${body:0:500}"
-		return 1
-	fi
+    local body
+    body=$(cat "$tmp_response")
+    rm -f "$tmp_response"
 
-	printf '%s\n' "$body" >"$AUDIO_TRANSCRIPT_PATH"
-	log_info "Transcript saved to $AUDIO_TRANSCRIPT_PATH"
+    if [[ "$http_status" != "200" ]]; then
+        log_warn "Transcription failed (HTTP $http_status)"
+        log_debug "Transcription response: ${body:0:500}"
+        return 1
+    fi
 
-	prepare_transcript_snippet
+    printf '%s\n' "$body" >"$AUDIO_TRANSCRIPT_PATH"
+    log_info "Transcript saved to $AUDIO_TRANSCRIPT_PATH"
+
+    prepare_transcript_snippet
 }
 
 prepare_transcript_snippet() {
-	if [[ -z "$AUDIO_TRANSCRIPT_PATH" || ! -f "$AUDIO_TRANSCRIPT_PATH" ]]; then
-		TRANSCRIPT_SNIPPET=""
-		return
-	fi
+    if [[ -z "$AUDIO_TRANSCRIPT_PATH" || ! -f "$AUDIO_TRANSCRIPT_PATH" ]]; then
+        TRANSCRIPT_SNIPPET=""
+        return
+    fi
 
-	local max_chars=4000
-	local raw_snippet
-	raw_snippet=$(command head -c "$max_chars" "$AUDIO_TRANSCRIPT_PATH" 2>/dev/null || true)
-	TRANSCRIPT_SNIPPET=$(printf '%s' "$raw_snippet" | tr -d '\r')
+    local max_chars=4000
+    local raw_snippet
+    raw_snippet=$(command head -c "$max_chars" "$AUDIO_TRANSCRIPT_PATH" 2>/dev/null || true)
+    TRANSCRIPT_SNIPPET=$(printf '%s' "$raw_snippet" | tr -d '\r')
 }
 
 describe_frame() {
-	local frame_path="$1"
-	local frame_index="$2"
-	local timecode="$3"
-	local time_seconds="$4"
+    local frame_path="$1"
+    local frame_index="$2"
+    local timecode="$3"
+    local time_seconds="$4"
 
-	log_info "Describing frame $frame_index at $timecode"
-	local start_ts
-	start_ts=$(date +%s)
+    log_info "Describing frame $frame_index at $timecode"
+    local start_ts
+    start_ts=$(date +%s)
 
-	# Heartbeat while waiting on the vision API
-	local heartbeat_pid
-	{
-		while true; do
-			sleep 30
-			log_info "Still describing frame $frame_index (time $timecode)..."
-		done
-	} &
-	heartbeat_pid=$!
+    # Heartbeat while waiting on the vision API
+    local heartbeat_pid
+    {
+        while true; do
+            sleep 30
+            log_info "Still describing frame $frame_index (time $timecode)..."
+        done
+    } &
+    heartbeat_pid=$!
 
-	local b64_file
-	b64_file="$WORK_DIR/frame_${frame_index}.b64"
-	if ! base64 < "$frame_path" | tr -d '\n' >"$b64_file"; then
-		log_warn "Failed to base64 encode $frame_path"
-		return 0
-	fi
+    local b64_file
+    b64_file="$WORK_DIR/frame_${frame_index}.b64"
+    if ! base64 < "$frame_path" | tr -d '\n' >"$b64_file"; then
+        log_warn "Failed to base64 encode $frame_path"
+        return 0
+    fi
 
-	local payload
-	payload=$(jq -n \
-		--rawfile b64 "$b64_file" \
-		--arg filename "$VIDEO_BASENAME" \
-		--arg tc "$timecode" \
-		--arg model "$VISION_MODEL" \
-		'{
+    local payload
+    payload=$(jq -n \
+        --rawfile b64 "$b64_file" \
+        --arg filename "$VIDEO_BASENAME" \
+        --arg tc "$timecode" \
+        --arg model "$VISION_MODEL" \
+        --arg mime "$FRAME_MIME" \
+        '{
 			model: $model,
 			messages: [
 				{
@@ -319,60 +361,60 @@ describe_frame() {
 					role: "user",
 					content: [
 						{"type": "text", "text": ("Video file name: " + $filename + "\nFrame time: " + $tc + "\nDescribe what is visible in 1-2 concise sentences." )},
-						{"type": "image_url", "image_url": {"url": ("data:image/jpeg;base64," + ($b64 | gsub("[[:space:]]"; "")) ) }}
+						{"type": "image_url", "image_url": {"url": ("data:" + $mime + ";base64," + ($b64 | gsub("[[:space:]]"; "")) ) }}
 					]
 				}
 			],
 			temperature: 0.2,
 			max_completion_tokens: 200
-		}')
+    }')
 
-	local desc
-	if ! desc=$(get-openai-response "$payload"); then
-		log_warn "AI description failed for frame $frame_index ($timecode)"
-		if [[ -n "${heartbeat_pid:-}" ]]; then
-			kill "$heartbeat_pid" 2>/dev/null || true
-			wait "$heartbeat_pid" 2>/dev/null || true
-		fi
-		return 0
-	fi
+    local desc
+    if ! desc=$(get-openai-response "$payload"); then
+        log_warn "AI description failed for frame $frame_index ($timecode)"
+        if [[ -n "${heartbeat_pid:-}" ]]; then
+            kill "$heartbeat_pid" 2>/dev/null || true
+            wait "$heartbeat_pid" 2>/dev/null || true
+        fi
+        return 0
+    fi
 
-	if [[ -n "${heartbeat_pid:-}" ]]; then
-		kill "$heartbeat_pid" 2>/dev/null || true
-		wait "$heartbeat_pid" 2>/dev/null || true
-	fi
+    if [[ -n "${heartbeat_pid:-}" ]]; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        wait "$heartbeat_pid" 2>/dev/null || true
+    fi
 
-	local end_ts
-	end_ts=$(date +%s)
-	local duration=$((end_ts - start_ts))
+    local end_ts
+    end_ts=$(date +%s)
+    local duration=$((end_ts - start_ts))
 
-	log_info "Described frame $frame_index"
-	log_info "Frame $frame_index duration: ${duration}s"
+    log_info "Described frame $frame_index"
+    log_info "Frame $frame_index duration: ${duration}s"
 
-	jq -n --arg idx "$frame_index" --arg tc "$timecode" --arg desc "$desc" --arg ts "$time_seconds" \
-		'{frame: ($idx|tonumber), timecode: $tc, description: $desc, timeSeconds: ($ts|tonumber)}'
+    jq -n --arg idx "$frame_index" --arg tc "$timecode" --arg desc "$desc" --arg ts "$time_seconds" \
+    '{frame: ($idx|tonumber), timecode: $tc, description: $desc, timeSeconds: ($ts|tonumber)}'
 }
 
 summarize_video() {
-	local scenes_json="$1"
-	local transcript_snippet="${2:-}"
+    local scenes_json="$1"
+    local transcript_snippet="${2:-}"
 
-	local timeline
-	timeline=$(printf '%s' "$scenes_json" | jq -r '.[] | "[\(.timecode)] \(.description)"' | paste -sd '\n' -)
+    local timeline
+    timeline=$(printf '%s' "$scenes_json" | jq -r '.[] | "[\(.timecode)] \(.description)"' | paste -sd '\n' -)
 
-	local transcript_section=""
-	if [[ -n "$transcript_snippet" ]]; then
-		transcript_section=$'\n\nAudio transcript excerpt (may be partial, clean as needed):\n'
-		transcript_section+="$transcript_snippet"
-	fi
+    local transcript_section=""
+    if [[ -n "$transcript_snippet" ]]; then
+        transcript_section=$'\n\nAudio transcript excerpt (may be partial, clean as needed):\n'
+        transcript_section+="$transcript_snippet"
+    fi
 
-	local payload_template
-	payload_template=$(jq -n \
-		--arg filename "$VIDEO_BASENAME" \
-		--arg timeline "$timeline" \
-		--arg transcript "$transcript_section" \
-		--arg model "$SUMMARY_MODEL" \
-		'{
+    local payload_template
+    payload_template=$(jq -n \
+        --arg filename "$VIDEO_BASENAME" \
+        --arg timeline "$timeline" \
+        --arg transcript "$transcript_section" \
+        --arg model "$SUMMARY_MODEL" \
+        '{
 			model: $model,
 			messages: [
 				{
@@ -386,161 +428,182 @@ summarize_video() {
 			],
 			temperature: 0.25,
 			max_completion_tokens: 500
-		}')
+    }')
 
-	local attempt=0
-	local response=""
-	while (( attempt < 3 )); do
-		attempt=$((attempt + 1))
-		log_info "Summarizing video (attempt $attempt)"
-		response=$(get-openai-response "$payload_template" || true)
-		if [[ -n "$response" && "$response" != "null" ]]; then
-			# strip whitespace to detect truly empty content
-			local trimmed
-			trimmed=$(printf '%s' "$response" | tr -d '\r\n[:space:]')
-			if [[ -n "$trimmed" ]]; then
-				log_info "Summary attempt $attempt succeeded"
-				printf '%s' "$response"
-				return 0
-			fi
-		fi
-		log_warn "Empty summary response (attempt $attempt); retrying..."
-		sleep 1
-	done
+    local attempt=0
+    local response=""
+    while (( attempt < 3 )); do
+        attempt=$((attempt + 1))
+        log_info "Summarizing video (attempt $attempt)"
+        response=$(get-openai-response "$payload_template" || true)
+        if [[ -n "$response" && "$response" != "null" ]]; then
+            # strip whitespace to detect truly empty content
+            local trimmed
+            trimmed=$(printf '%s' "$response" | tr -d '\r\n[:space:]')
+            if [[ -n "$trimmed" ]]; then
+                log_info "Summary attempt $attempt succeeded"
+                printf '%s' "$response"
+                return 0
+            fi
+        fi
+        log_warn "Empty summary response (attempt $attempt); retrying..."
+        sleep 1
+    done
 
-	log_error "Failed to obtain non-empty summary after 3 attempts"
-	return 1
+    log_error "Failed to obtain non-empty summary after 3 attempts"
+    return 1
 }
 
 extract_frames() {
-	log_info "Extracting frames every ${INTERVAL}s${MAX_FRAMES:+ (cap: ${MAX_FRAMES} frame(s))}"
-	mkdir -p "$FRAMES_DIR"
+    log_info "Extracting frames every ${INTERVAL}s${MAX_FRAMES:+ (cap: ${MAX_FRAMES} frame(s))}"
+    mkdir -p "$FRAMES_DIR"
+    log_info "Frame resize: max ${FRAME_MAX_WIDTH}x${FRAME_MAX_HEIGHT}, quality: ${FRAME_QUALITY}"
+    log_info "Frame format: ${FRAME_FORMAT} (${FRAME_MIME})"
 
-	local vframes_arg=()
-	if (( MAX_FRAMES > 0 )); then
-		vframes_arg=(-vframes "$MAX_FRAMES")
-	fi
+    local vframes_arg=()
+    local limit_args=()
+    local codec_args=()
+    if (( MAX_FRAMES > 0 )); then
+        vframes_arg=(-vframes "$MAX_FRAMES")
+        local limit_seconds=$(( (INTERVAL * MAX_FRAMES) + 1 ))
+        limit_args=(-t "$limit_seconds")
+    fi
 
-	local filter="fps=1/${INTERVAL},scale='min(1280,iw)':'min(720,ih)':force_original_aspect_ratio=decrease"
+    case "$FRAME_FORMAT" in
+        webp)
+            codec_args=(-f image2 -vcodec libwebp)
+            ;;
+        *)
+            codec_args=()
+            ;;
+    esac
 
-	if ! ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" -vf "$filter" -vsync vfr -q:v 8 "${vframes_arg[@]}" "$FRAMES_DIR/frame_%05d.jpg"; then
-		log_error "ffmpeg frame extraction failed"
-		exit 1
-	fi
+    local filter="fps=1/${INTERVAL},scale='min(${FRAME_MAX_WIDTH},iw)':'min(${FRAME_MAX_HEIGHT},ih)':force_original_aspect_ratio=decrease"
 
-	local count=$(ls "$FRAMES_DIR"/frame_*.jpg 2>/dev/null | wc -l | tr -d ' ')
-	if [[ "$count" == "0" ]]; then
-		log_error "No frames were extracted"
-		exit 1
-	fi
+    if ! ffmpeg -hide_banner -loglevel error -i "$VIDEO_FILE" "${limit_args[@]}" -vf "$filter" -fps_mode vfr -q:v "$FRAME_QUALITY" "${codec_args[@]}" "${vframes_arg[@]}" "$FRAMES_DIR/frame_%05d.${FRAME_EXT}"; then
+        log_error "ffmpeg frame extraction failed"
+        exit 1
+    fi
 
-	log_info "Extracted $count frame(s)"
+    local count=$(ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$count" == "0" ]]; then
+        log_error "No frames were extracted"
+        exit 1
+    fi
+
+    local expected
+    expected=$(expected_frame_count)
+    if (( expected > 1 && count < 2 )); then
+        log_warn "Unexpectedly low frame count ($count/$expected); check source duration or ffmpeg output"
+    fi
+
+    log_info "Extracted $count frame(s)"
 }
 
 ensure_frames_ready() {
-	local expected actual
-	expected=$(expected_frame_count)
-	if ls "$FRAMES_DIR"/frame_*.jpg >/dev/null 2>&1; then
-		actual=$(ls "$FRAMES_DIR"/frame_*.jpg 2>/dev/null | wc -l | tr -d ' ')
-		if (( expected > 0 && actual < expected )); then
-			log_warn "Frames missing ($actual/$expected); re-extracting"
-			safe_remove_dir "$FRAMES_DIR"
-			mkdir -p "$FRAMES_DIR"
-			extract_frames
-		else
-			log_info "Frames present: $actual/${expected:-unknown}; reusing"
-		fi
-	else
-		extract_frames
-	fi
+    local expected actual
+    expected=$(expected_frame_count)
+    if ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} >/dev/null 2>&1; then
+        actual=$(ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} 2>/dev/null | wc -l | tr -d ' ')
+        if (( expected > 0 && actual < expected )); then
+            log_warn "Frames missing ($actual/$expected); re-extracting"
+            safe_remove_dir "$FRAMES_DIR"
+            mkdir -p "$FRAMES_DIR"
+            extract_frames
+        else
+            log_info "Frames present: $actual/${expected:-unknown}; reusing"
+        fi
+    else
+        extract_frames
+    fi
 }
 
 process_frames() {
-	[[ -f "$FRAME_RESULTS_FILE" ]] || : >"$FRAME_RESULTS_FILE"
-	local idx=0
-	local total_frames
-	total_frames=$(ls "$FRAMES_DIR"/frame_*.jpg 2>/dev/null | wc -l | tr -d ' ')
+    [[ -f "$FRAME_RESULTS_FILE" ]] || : >"$FRAME_RESULTS_FILE"
+    local idx=0
+    local total_frames
+    total_frames=$(ls "$FRAMES_DIR"/frame_*.${FRAME_EXT} 2>/dev/null | wc -l | tr -d ' ')
 
-	for img in "$FRAMES_DIR"/frame_*.jpg; do
-		idx=$((idx + 1))
-		local ts_seconds=$(((idx - 1) * INTERVAL))
-		local tc="$(format_timecode "$ts_seconds")"
+    for img in "$FRAMES_DIR"/frame_*.${FRAME_EXT}; do
+        idx=$((idx + 1))
+        local ts_seconds=$(((idx - 1) * INTERVAL))
+        local tc="$(format_timecode "$ts_seconds")"
 
-		if command jq -e --argjson frame "$idx" 'select(.frame == $frame)' "$FRAME_RESULTS_FILE" >/dev/null 2>&1; then
-			log_info "Reusing existing description for frame $idx"
-			continue
-		fi
+        if command jq -e --argjson frame "$idx" 'select(.frame == $frame)' "$FRAME_RESULTS_FILE" >/dev/null 2>&1; then
+            log_info "Reusing existing description for frame $idx"
+            continue
+        fi
 
-		describe_frame "$img" "$idx" "$tc" "$ts_seconds" >>"$FRAME_RESULTS_FILE"
+        describe_frame "$img" "$idx" "$tc" "$ts_seconds" >>"$FRAME_RESULTS_FILE"
 
-		if (( idx % 5 == 0 )); then
-			log_info "Progress: described $idx/$total_frames frame(s)"
-		fi
-	done
+        if (( idx % 5 == 0 )); then
+            log_info "Progress: described $idx/$total_frames frame(s)"
+        fi
+    done
 
-	local described_count
-	described_count=$(jq -s 'map(select(.description != null)) | length' "$FRAME_RESULTS_FILE" 2>/dev/null || echo 0)
-	if (( described_count < total_frames )); then
-		log_warn "Descriptions missing for some frames ($described_count/$total_frames); reprocessing missing frames"
-		local tmp_file
-		tmp_file=$(mktemp)
-		command mv "$FRAME_RESULTS_FILE" "$tmp_file"
-		: >"$FRAME_RESULTS_FILE"
-		idx=0
-		for img in "$FRAMES_DIR"/frame_*.jpg; do
-			idx=$((idx + 1))
-			if command jq -e --argjson frame "$idx" 'select(.frame == $frame and .description != null)' "$tmp_file" >/dev/null 2>&1; then
-				command jq -c --argjson frame "$idx" 'select(.frame == $frame)' "$tmp_file" >>"$FRAME_RESULTS_FILE"
-				continue
-			fi
-			local ts_seconds=$(((idx - 1) * INTERVAL))
-			local tc="$(format_timecode "$ts_seconds")"
-			describe_frame "$img" "$idx" "$tc" "$ts_seconds" >>"$FRAME_RESULTS_FILE"
-		done
-		rm -f "$tmp_file"
-	fi
+    local described_count
+    described_count=$(jq -s 'map(select(.description != null)) | length' "$FRAME_RESULTS_FILE" 2>/dev/null || echo 0)
+    if (( described_count < total_frames )); then
+        log_warn "Descriptions missing for some frames ($described_count/$total_frames); reprocessing missing frames"
+        local tmp_file
+        tmp_file=$(mktemp)
+        command mv "$FRAME_RESULTS_FILE" "$tmp_file"
+        : >"$FRAME_RESULTS_FILE"
+        idx=0
+        for img in "$FRAMES_DIR"/frame_*.${FRAME_EXT}; do
+            idx=$((idx + 1))
+            if command jq -e --argjson frame "$idx" 'select(.frame == $frame and .description != null)' "$tmp_file" >/dev/null 2>&1; then
+                command jq -c --argjson frame "$idx" 'select(.frame == $frame)' "$tmp_file" >>"$FRAME_RESULTS_FILE"
+                continue
+            fi
+            local ts_seconds=$(((idx - 1) * INTERVAL))
+            local tc="$(format_timecode "$ts_seconds")"
+            describe_frame "$img" "$idx" "$tc" "$ts_seconds" >>"$FRAME_RESULTS_FILE"
+        done
+        rm -f "$tmp_file"
+    fi
 }
 
 write_summary() {
-	mkdir -p "$SUMMARIES_DIR"
-	local summary_path="$SUMMARIES_DIR/$VIDEO_BASENAME.md"
+    mkdir -p "$SUMMARIES_DIR"
+    local summary_path="$SUMMARIES_DIR/$VIDEO_BASENAME.md"
 
-	if [[ -s "$summary_path" ]]; then
-		log_info "Summary already exists at $summary_path; skipping rewrite"
-		SUMMARY_PATH="$summary_path"
-		return 0
-	fi
+    if [[ -s "$summary_path" ]]; then
+        log_info "Summary already exists at $summary_path; skipping rewrite"
+        SUMMARY_PATH="$summary_path"
+        return 0
+    fi
 
-	local scenes_json
-	scenes_json=$(jq -s 'map(select(.description != null)) | sort_by(.timeSeconds // 0)' "$FRAME_RESULTS_FILE")
+    local scenes_json
+    scenes_json=$(jq -s 'map(select(.description != null)) | sort_by(.timeSeconds // 0)' "$FRAME_RESULTS_FILE")
 
-	if [[ "$(printf '%s' "$scenes_json" | jq 'length')" == "0" ]]; then
-		log_warn "No frame descriptions available for summary; reprocessing frames"
-		process_frames
-		scenes_json=$(jq -s 'map(select(.description != null)) | sort_by(.timeSeconds // 0)' "$FRAME_RESULTS_FILE")
-		if [[ "$(printf '%s' "$scenes_json" | jq 'length')" == "0" ]]; then
-			log_error "No frame descriptions available for summary after retry"
-			exit 1
-		fi
-	fi
+    if [[ "$(printf '%s' "$scenes_json" | jq 'length')" == "0" ]]; then
+        log_warn "No frame descriptions available for summary; reprocessing frames"
+        process_frames
+        scenes_json=$(jq -s 'map(select(.description != null)) | sort_by(.timeSeconds // 0)' "$FRAME_RESULTS_FILE")
+        if [[ "$(printf '%s' "$scenes_json" | jq 'length')" == "0" ]]; then
+            log_error "No frame descriptions available for summary after retry"
+            exit 1
+        fi
+    fi
 
-	local summary
-	summary=$(summarize_video "$scenes_json" "$TRANSCRIPT_SNIPPET")
+    local summary
+    summary=$(summarize_video "$scenes_json" "$TRANSCRIPT_SNIPPET")
 
-	local summary_json
-	if ! summary_json=$(printf '%s' "$summary" | jq '.' 2>/dev/null); then
-		log_error "Summary response was not valid JSON"
-		exit 1
-	fi
+    local summary_json
+    if ! summary_json=$(printf '%s' "$summary" | jq '.' 2>/dev/null); then
+        log_error "Summary response was not valid JSON"
+        exit 1
+    fi
 
-	local title description
-	title=$(printf '%s' "$summary_json" | jq -r '.title // empty')
-	description=$(printf '%s' "$summary_json" | jq -r '.description // empty')
+    local title description
+    title=$(printf '%s' "$summary_json" | jq -r '.title // empty')
+    description=$(printf '%s' "$summary_json" | jq -r '.description // empty')
 
-	if [[ -z "$title" || -z "$description" ]]; then
-		log_error "Summary JSON missing title or description"
-		exit 1
-	fi
+    if [[ -z "$title" || -z "$description" ]]; then
+        log_error "Summary JSON missing title or description"
+        exit 1
+    fi
 
     local formatted
     formatted=$(printf '# %s\n\n%s\n\n%s\n' "$title" "AI-generated video summary; check for accuracy." "$description" | perl -0pe '
@@ -550,83 +613,85 @@ write_summary() {
     s/\n{3,}/\n\n/g;
     s/\n +/\n/g;
     END { $_ .= "\n" unless /\n\z/; }
-')
+    ')
 
-	printf '%s' "$formatted" >"$summary_path"
-	log_info "Wrote summary to $summary_path"
-	SUMMARY_PATH="$summary_path"
-	if command -v open >/dev/null 2>&1; then
-		open -R "$summary_path" || true
-	fi
+    printf '%s' "$formatted" >"$summary_path"
+    log_info "Wrote summary to $summary_path"
+    SUMMARY_PATH="$summary_path"
+    if command -v open >/dev/null 2>&1; then
+        open -R "$summary_path" || true
+    fi
 }
 
 main() {
-	parse_args "$@"
+    parse_args "$@"
 
-	require_command ffmpeg
-	require_command ffprobe
-	require_command jq
-	require_command base64
-	require_command stat
-	require_command curl
+    set_frame_format_vars
 
-	VIDEO_FILE="$(cd "$(dirname "$VIDEO_FILE")" &>/dev/null && pwd)/$(basename "$VIDEO_FILE")"
-	[[ -f "$VIDEO_FILE" ]] || { echo "Video file not found: $VIDEO_FILE" >&2; exit 1; }
+    require_command ffmpeg
+    require_command ffprobe
+    require_command jq
+    require_command base64
+    require_command stat
+    require_command curl
 
-	VIDEO_DIR="$(cd "$(dirname "$VIDEO_FILE")" &>/dev/null && pwd)"
-	VIDEO_BASENAME="${VIDEO_FILE##*/}"
-	VIDEO_BASENAME="${VIDEO_BASENAME%.*}"
-	VIDEO_EXT="${VIDEO_FILE##*.}"
-	MOVED_VIDEO_PATH="$VIDEO_FILE"
+    VIDEO_FILE="$(cd "$(dirname "$VIDEO_FILE")" &>/dev/null && pwd)/$(basename "$VIDEO_FILE")"
+    [[ -f "$VIDEO_FILE" ]] || { echo "Video file not found: $VIDEO_FILE" >&2; exit 1; }
 
-	if [[ -z "$SUMMARIES_DIR" ]]; then
-		SUMMARIES_DIR="$VIDEO_DIR"
-	fi
+    VIDEO_DIR="$(cd "$(dirname "$VIDEO_FILE")" &>/dev/null && pwd)"
+    VIDEO_BASENAME="${VIDEO_FILE##*/}"
+    VIDEO_BASENAME="${VIDEO_BASENAME%.*}"
+    VIDEO_EXT="${VIDEO_FILE##*.}"
+    MOVED_VIDEO_PATH="$VIDEO_FILE"
 
-	export LOG_LEVEL=0
-	export LOG_FD=2
-	if [[ ! -f "$SCRIPT_DIR/../utilities/logging.sh" ]]; then
-		ALT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
-		if [[ -f "$ALT_DIR/../utilities/logging.sh" ]]; then
-			SCRIPT_DIR="$ALT_DIR"
-		fi
-	fi
-	source "$SCRIPT_DIR/../utilities/logging.sh"
-	setup_script_logging
-	set_log_level "INFO"
-	log_header "organize-video-imports.sh"
+    if [[ -z "$SUMMARIES_DIR" ]]; then
+        SUMMARIES_DIR="$VIDEO_DIR"
+    fi
 
-	source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
+    export LOG_LEVEL=0
+    export LOG_FD=2
+    if [[ ! -f "$SCRIPT_DIR/../utilities/logging.sh" ]]; then
+        ALT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
+        if [[ -f "$ALT_DIR/../utilities/logging.sh" ]]; then
+            SCRIPT_DIR="$ALT_DIR"
+        fi
+    fi
+    source "$SCRIPT_DIR/../utilities/logging.sh"
+    setup_script_logging
+    set_log_level "INFO"
+    log_header "organize-video-imports.sh"
 
-	TEMP_BASE_DIR="$VIDEO_DIR/_temp"
-	WORK_DIR="$TEMP_BASE_DIR/$VIDEO_BASENAME"
-	FRAME_RESULTS_FILE="$WORK_DIR/scenes.jsonl"
-	FRAMES_DIR="$WORK_DIR/frames"
-	AUDIO_DIR="$WORK_DIR/audio"
-	AUDIO_TRANSCRIPT_PATH="$WORK_DIR/audio_transcript.txt"
+    source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
 
-	mkdir -p "$TEMP_BASE_DIR" "$WORK_DIR" "$FRAMES_DIR" "$AUDIO_DIR"
+    TEMP_BASE_DIR="$VIDEO_DIR/_temp"
+    WORK_DIR="$TEMP_BASE_DIR/$VIDEO_BASENAME"
+    FRAME_RESULTS_FILE="$WORK_DIR/scenes.jsonl"
+    FRAMES_DIR="$WORK_DIR/frames"
+    AUDIO_DIR="$WORK_DIR/audio"
+    AUDIO_TRANSCRIPT_PATH="$WORK_DIR/audio_transcript.txt"
 
-	log_info "Processing video: $(basename "$VIDEO_FILE")"
-	log_info "Interval: ${INTERVAL}s | Summaries dir: $SUMMARIES_DIR"
-	AUDIO_FILE="$AUDIO_DIR/audio.wav"
+    mkdir -p "$TEMP_BASE_DIR" "$WORK_DIR" "$FRAMES_DIR" "$AUDIO_DIR"
 
-	detect_audio_track
-	ensure_frames_ready
-	process_frames
+    log_info "Processing video: $(basename "$VIDEO_FILE")"
+    log_info "Interval: ${INTERVAL}s | Summaries dir: $SUMMARIES_DIR"
+    AUDIO_FILE="$AUDIO_DIR/audio.ogg"
 
-	if [[ -f "$AUDIO_TRANSCRIPT_PATH" ]]; then
-		log_info "Reusing cached audio transcript from $AUDIO_TRANSCRIPT_PATH"
-		prepare_transcript_snippet
-	elif (( HAS_AUDIO_TRACK )); then
-		extract_audio_track || true
-		transcribe_audio_track || log_warn "Audio transcription failed; continuing with visual summary only"
-	fi
-	write_summary
+    detect_audio_track
+    ensure_frames_ready
+    process_frames
 
-	log_divider "DONE"
-	log_info "Summary: ${SUMMARY_PATH:-n/a}"
-	log_info "Processed video: ${MOVED_VIDEO_PATH:-n/a}"
+    if [[ -f "$AUDIO_TRANSCRIPT_PATH" ]]; then
+        log_info "Reusing cached audio transcript from $AUDIO_TRANSCRIPT_PATH"
+        prepare_transcript_snippet
+        elif (( HAS_AUDIO_TRACK )); then
+        extract_audio_track || true
+        transcribe_audio_track || log_warn "Audio transcription failed; continuing with visual summary only"
+    fi
+    write_summary
+
+    log_divider "DONE"
+    log_info "Summary: ${SUMMARY_PATH:-n/a}"
+    log_info "Processed video: ${MOVED_VIDEO_PATH:-n/a}"
 }
 
 main "$@"
