@@ -617,7 +617,7 @@ write_summary() {
     fi
 
     local formatted
-    formatted=$(printf '# %s\n\n%s\n\nApproximate date: %s\n\n%s\n' "$title" "AI-generated video summary; check for accuracy." "$approximate_date" "$description" | perl -0pe '
+    formatted=$(printf '# %s\n\n%s\n\n%s\n\nApproximate date: %s\n' "$title" "AI-generated video summary; check for accuracy." "$description" "$approximate_date" | perl -0pe '
     s/\r\n?/\n/g;
     s/[ \t]+/ /g;
     s/^# */# /;
