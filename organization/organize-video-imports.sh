@@ -408,23 +408,23 @@ summarize_video() {
         transcript_section+="$transcript_snippet"
     fi
 
+    local system_prompt
+    system_prompt="You are a concise video summarizer for home videos. Return ONLY strict JSON (no markdown, no code fences) that conforms to this JSON Schema: {\"type\": \"object\", \"required\": [\"title\", \"description\", \"approximateDate\", \"approximateDateSource\"], \"properties\": {\"title\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 120}, \"description\": {\"type\": \"string\", \"minLength\": 40, \"maxLength\": 2000, \"description\": \"One paragraph, 3-10 sentences, personable and friendly home-video tone; no bullets, no lists, no timestamps, no markers. Describe what viewers will see.\"}, \"approximateDate\": {\"type\": \"string\", \"minLength\": 2, \"maxLength\": 30, \"description\": \"Approximate date in ISO format (YYYY-MM-DD) when possible, otherwise 'unknown'.\"}, \"approximateDateSource\": {\"type\": \"string\", \"minLength\": 3, \"maxLength\": 120, \"description\": \"Concise phrase describing how the date was inferred (e.g., 'from audio', 'timestamp overlay in frame', 'from filename pattern', 'inferred from context').\"}}, \"additionalProperties\": false}. Derive approximateDate from: (1) explicit dates in the audio transcript excerpt, (2) timestamp or date overlays mentioned in timeline frame descriptions, or (3) absolute or relative dates encoded in the video filename. Prefer ISO 8601 YYYY-MM-DD when you can; if no reasonable date is inferable, use \"unknown\". For approximateDateSource, clearly name the strongest evidence used (audio, frame overlay, filename, contextual inference, or unknown). Include nothing else."
+
+    local user_prompt
+    user_prompt=$'Video file: %s\nTimeline entries (ordered):\n%s%s\n\nReturn only JSON with fields title, description, approximateDate, approximateDateSource. For approximateDate, use dates mentioned in the audio excerpt, visible timestamp overlays described in the timeline, or absolute/relative dates in the filename (e.g., 2023-07-04, 20230704, July 4 2023). Prefer ISO YYYY-MM-DD; if nothing is clear, respond with "unknown". For approximateDateSource, state the strongest evidence used (e.g., "audio transcript", "frame timestamp overlay", "filename date", "inferred context", or "unknown"). No markdown, no labels, no code fences.'
+    user_prompt=$(printf "$user_prompt" "$VIDEO_BASENAME" "$timeline" "$transcript_section")
+
     local payload_template
     payload_template=$(jq -n \
-        --arg filename "$VIDEO_BASENAME" \
-        --arg timeline "$timeline" \
-        --arg transcript "$transcript_section" \
         --arg model "$SUMMARY_MODEL" \
+        --arg system_prompt "$system_prompt" \
+        --arg user_prompt "$user_prompt" \
         '{
 			model: $model,
 			messages: [
-                {
-                    role: "system",
-                    content: "You are a concise video summarizer for home videos. Return ONLY strict JSON (no markdown, no code fences) that conforms to this JSON Schema: {\"type\": \"object\", \"required\": [\"title\", \"description\", \"approximateDate\"], \"properties\": {\"title\": {\"type\": \"string\", \"minLength\": 1, \"maxLength\": 120}, \"description\": {\"type\": \"string\", \"minLength\": 40, \"maxLength\": 2000, \"description\": \"One paragraph, 3-10 sentences, personable and friendly home-video tone; no bullets, no lists, no timestamps, no markers. Describe what viewers will see.\"}, \"approximateDate\": {\"type\": \"string\", \"minLength\": 2, \"maxLength\": 30, \"description\": \"Approximate date in ISO format (YYYY-MM-DD) when possible, otherwise 'unknown'.\"}}, \"additionalProperties\": false}. Derive approximateDate from: (1) explicit dates in the audio transcript excerpt, (2) timestamp or date overlays mentioned in timeline frame descriptions, or (3) absolute or relative dates encoded in the video filename. Prefer ISO 8601 YYYY-MM-DD when you can; if no reasonable date is inferable, use \"unknown\". Include nothing else."
-                },
-				{
-					role: "user",
-                    content: ("Video file: " + $filename + "\nTimeline entries (ordered):\n" + $timeline + $transcript + "\n\nReturn only JSON with fields title, description, approximateDate. For approximateDate, use dates mentioned in the audio excerpt, visible timestamp overlays described in the timeline, or absolute/relative dates in the filename (e.g., 2023-07-04, 20230704, July 4 2023). Prefer ISO YYYY-MM-DD; if nothing is clear, respond with \"unknown\". No markdown, no labels, no code fences.")
-				}
+                { role: "system", content: $system_prompt },
+			{ role: "user", content: $user_prompt }
 			],
 			temperature: 0.25,
 			max_completion_tokens: 500
@@ -606,18 +606,19 @@ write_summary() {
         exit 1
     fi
 
-    local title description approximate_date
+    local title description approximate_date approximate_date_source
     title=$(printf '%s' "$summary_json" | jq -r '.title // empty')
     description=$(printf '%s' "$summary_json" | jq -r '.description // empty')
     approximate_date=$(printf '%s' "$summary_json" | jq -r '.approximateDate // empty')
+    approximate_date_source=$(printf '%s' "$summary_json" | jq -r '.approximateDateSource // empty')
 
-    if [[ -z "$title" || -z "$description" || -z "$approximate_date" ]]; then
-        log_error "Summary JSON missing title, description, or approximateDate"
+    if [[ -z "$title" || -z "$description" || -z "$approximate_date" || -z "$approximate_date_source" ]]; then
+        log_error "Summary JSON missing title, description, approximateDate, or approximateDateSource"
         exit 1
     fi
 
     local formatted
-    formatted=$(printf '# %s\n\n%s\n\n%s\n\nApproximate date: %s\n' "$title" "AI-generated video summary; check for accuracy." "$description" "$approximate_date" | perl -0pe '
+    formatted=$(printf '# %s\n\n%s\n\n%s\n\nApproximate date: %s\n\nApproximate date source: %s\n' "$title" "AI-generated video summary; check for accuracy." "$description" "$approximate_date" "$approximate_date_source" | perl -0pe '
     s/\r\n?/\n/g;
     s/[ \t]+/ /g;
     s/^# */# /;
