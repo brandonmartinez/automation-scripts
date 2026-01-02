@@ -29,7 +29,7 @@ Usage: organize-guitar-tabs.sh [--dry-run] <text-file>
 
 Formats a raw lyrics/chords text file into OnSong-style tab output using OpenAI
 and writes the result to $GUITAR_TAB_OUTPUT (or a default folder) with the name
-"ARTIST - SONG.tab".
+"ARTIST - SONG.txt".
 
 Options:
 	--dry-run   Print the formatted tab to stdout only (no file writes)
@@ -208,6 +208,35 @@ rebuild_formatted_tab() {
 	TAB_CONTENT="$tab_content" ARTIST_FB="$artist_fallback" TITLE_FB="$title_fallback" FILE_BASE="$file_base" python - <<'PY'
 import os, re
 
+CHORD_RE = re.compile(
+	r"\b(?P<root>[A-G](?:#|b)?)(?P<qual>maj7|maj|min7|m7|m|min|dim|aug|sus2|sus4|add9|6|7|9|11|13|m6|m9|maj9)?(?:/[A-G](?:#|b)?)?\b"
+)
+
+
+def detect_key(body: str) -> str:
+	root_counts: dict[str, int] = {}
+	minor_counts: dict[str, int] = {}
+
+	for match in CHORD_RE.finditer(body):
+		root = match.group("root")
+		qual = match.group("qual") or ""
+		is_minor = qual.startswith("m") and not qual.startswith("maj")
+
+		root_counts[root] = root_counts.get(root, 0) + 1
+		if is_minor:
+			minor_counts[root] = minor_counts.get(root, 0) + 1
+
+	if not root_counts:
+		return ""
+
+	best_root = max(root_counts.items(), key=lambda item: item[1])[0]
+	minor_hits = minor_counts.get(best_root, 0)
+	total_hits = root_counts[best_root]
+
+	if total_hits > 0 and minor_hits / total_hits >= 0.5:
+		return f"{best_root}m"
+	return best_root
+
 tab = os.environ['TAB_CONTENT']
 artist_fb = os.environ['ARTIST_FB']
 title_fb = os.environ['TITLE_FB']
@@ -249,6 +278,9 @@ if not meta['Capo']:
 	meta['Capo'] = '0'
 if not meta['Tuning']:
 	meta['Tuning'] = 'Standard'
+
+if not meta['Key']:
+	meta['Key'] = detect_key(body)
 
 if not meta['Flow']:
 	section_tokens = []
