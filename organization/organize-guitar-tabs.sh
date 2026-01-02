@@ -19,7 +19,7 @@ fi
 PATH="/opt/homebrew/bin/:/usr/local/bin:$PATH"
 
 readonly SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
-readonly OUTPUT_DIR="${GUITAR_TAB_OUTPUT:-$HOME/Documents/Guitar Tabs/Formatted}"
+readonly OUTPUT_DIR="${GUITAR_TAB_OUTPUT:-$HOME/Documents/Guitar Tabs}"
 readonly LOG_LEVEL_NAME="${LOG_LEVEL_NAME:-INFO}"
 readonly MODEL_NAME="${OPENAI_MODEL:-gpt-5.1}"
 
