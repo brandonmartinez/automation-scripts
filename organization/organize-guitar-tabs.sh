@@ -114,6 +114,13 @@ FLOW (REQUIRED)
 - Small variation: note with parenthetical line before changed lines. Large
   variation: create distinct sections (e.g., Chorus 1 / Chorus 2) and reference
   accordingly.
+- If more than one distinct section of the same type exists (e.g., multiple
+	verses, pre-choruses, choruses), number ALL of them sequentially (Verse 1,
+	Verse 2, PC1, PC2, C1, C2, etc.) and ensure Flow uses the numbered tokens.
+- If later sections of the same type are lyrically/chordally identical to an
+	earlier one, do not duplicate the content; keep a single canonical section
+	and reference it multiple times in Flow (e.g., one Chorus 1 with multiple C1
+	entries in Flow).
 - Check for repeated sections (esp. choruses/pre-choruses). If a later version
 	is not meaningfully different, consolidate to a single section and rely on
 	Flow to indicate repetition instead of duplicating content.
@@ -282,7 +289,142 @@ if not meta['Tuning']:
 if not meta['Key']:
 	meta['Key'] = detect_key(body)
 
-if not meta['Flow']:
+header_re = re.compile(r'^([A-Za-z][A-Za-z0-9 \-\'/]+):\s*$')
+
+def parse_section_header(raw: str) -> tuple[str, str, int | None]:
+	name = raw.strip()
+	m = re.match(r'^(.*?)(?:\s+(\d+))?$', name)
+	base_part = m.group(1).strip() if m else name
+	num = int(m.group(2)) if m and m.group(2) else None
+	base = base_part.lower().replace('-', ' ').strip()
+	if 'pre' in base and 'chorus' in base:
+		return 'Pre-Chorus', 'PC', num
+	if base.startswith('verse'):
+		return 'Verse', 'V', num
+	if base.startswith('chorus'):
+		return 'Chorus', 'C', num
+	if base.startswith('intro'):
+		return 'Intro', 'Intro', num
+	if base.startswith('outro'):
+		return 'Outro', 'Outro', num
+	if base.startswith('bridge') or base == 'b':
+		return 'Bridge', 'B', num
+	if base.startswith('instrument') or base.startswith('instr'):
+		return 'Instrumental', 'Instr', num
+	if base.startswith('solo'):
+		return 'Solo', 'Solo', num
+	if base.startswith('tag'):
+		return 'Tag', 'Tag', num
+	if base.startswith('interlude'):
+		return 'Interlude', 'Interlude', num
+	if base.startswith('pre'):
+		return 'Pre-Chorus', 'PC', num
+	clean = base_part.title()
+	return clean, clean.replace(' ', ''), num
+
+lines_in_body = body.split('\n')
+sections: list[dict] = []
+leading_lines: list[str] = []
+current_header: str | None = None
+current_lines: list[str] = []
+headers_found = 0
+
+for line in lines_in_body:
+	m = header_re.match(line.strip())
+	if m:
+		headers_found += 1
+		if current_header is not None:
+			sections.append({'header': current_header, 'lines': current_lines})
+		current_header = m.group(1).strip()
+		current_lines = []
+	else:
+		if current_header is None:
+			leading_lines.append(line)
+		else:
+			current_lines.append(line)
+
+if current_header is not None:
+	sections.append({'header': current_header, 'lines': current_lines})
+
+def normalize_content(content_lines: list[str]) -> str:
+	return '\n'.join(content_lines).strip()
+
+if headers_found > 0:
+	type_stats: dict[str, dict[str, list]] = {}
+	unique_order: list[tuple[str, int]] = []
+	occurrences: list[dict] = []
+
+	for entry in sections:
+		type_name, prefix, _ = parse_section_header(entry['header'])
+		content_key = normalize_content(entry['lines'])
+		stats = type_stats.setdefault(type_name, {'unique': [], 'prefix': prefix, 'count': 0})
+		stats['count'] += 1
+		match_idx = None
+		for idx, u in enumerate(stats['unique'], start=1):
+			if u['key'] == content_key:
+				match_idx = idx
+				break
+		if match_idx is None:
+			stats['unique'].append({'key': content_key, 'lines': entry['lines']})
+			match_idx = len(stats['unique'])
+			unique_id = (type_name, match_idx)
+			if unique_id not in unique_order:
+				unique_order.append(unique_id)
+		occurrences.append({
+			'type': type_name,
+			'prefix': prefix,
+			'unique_idx': match_idx,
+		})
+
+	numbering_types = {'Verse', 'Pre-Chorus', 'Chorus', 'Bridge'}
+
+	def needs_numbering(type_name: str) -> bool:
+		stats = type_stats[type_name]
+		return len(stats['unique']) > 1 or (stats['count'] > 1 and type_name in numbering_types)
+
+	display_map: dict[tuple[str, int], dict[str, str | list[str]]] = {}
+	for type_name, stats in type_stats.items():
+		prefix = stats['prefix']
+		number_required = needs_numbering(type_name)
+		for idx, unique in enumerate(stats['unique'], start=1):
+			number = idx if number_required else None
+			if number is None and stats['count'] > 1 and type_name in numbering_types:
+				number = idx
+			display_name = f"{type_name} {number}" if number else type_name
+			token = f"{prefix}{number}" if number else prefix
+			display_map[(type_name, idx)] = {
+				'display_name': display_name,
+				'token': token,
+				'lines': unique['lines'],
+			}
+
+	tokens_in_flow: list[str] = []
+	for occ in occurrences:
+		key = (occ['type'], occ['unique_idx'])
+		mapping = display_map.get(key)
+		if mapping:
+			tokens_in_flow.append(mapping['token'])
+
+	body_blocks: list[str] = []
+	if leading_lines:
+		leading = '\n'.join(leading_lines).rstrip()
+		if leading:
+			body_blocks.append(leading)
+
+	for unique_id in unique_order:
+		mapping = display_map[unique_id]
+		section_lines = mapping['lines']
+		header_line = f"{mapping['display_name']}:"
+		block_parts = [header_line]
+		if section_lines and (len(section_lines) == 0 or section_lines[0].strip() != ''):
+			block_parts.append('')
+		block_parts.append('\n'.join(section_lines).rstrip())
+		body_blocks.append('\n'.join(part for part in block_parts if part != ''))
+
+	body = '\n\n'.join(blocks for blocks in body_blocks if blocks.strip() != '').rstrip() + '\n'
+	if tokens_in_flow:
+		meta['Flow'] = ', '.join(tokens_in_flow)
+elif not meta['Flow']:
 	section_tokens = []
 	for line in body.split('\n'):
 		if not line.strip():
