@@ -246,50 +246,28 @@ VPROMPT
 parse_response() {
 	local response_json="$1"
 
-	response_json=$(RAW="$response_json" python - <<'PY'
-import os, json, re, sys
+	local raw sanitized artist title tab compact_raw
+	raw="${response_json//$'\r'/}"
+	sanitized="$raw"
 
-raw = os.environ.get("RAW", "")
-raw = raw.replace("\r", "")
-
-def escape_invalid_backslashes(text: str) -> str:
-	# Any backslash not starting a valid JSON escape gets doubled so json.loads can parse.
-	return re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
-
-sanitized = escape_invalid_backslashes(raw)
-sanitized = sanitized.replace("\n", "\\n").replace("\t", "\\t")
-
-try:
-	data = json.loads(sanitized)
-except json.JSONDecodeError as exc:
-	sys.stderr.write(f"Failed to parse JSON response: {exc}\n")
-	# Fallback: best-effort extraction of expected fields from sloppy JSON
-	artist = ""
-	title = ""
-	tab_match = None
-	artist_m = re.search(r'"artist"\s*:\s*"([^"]*)"', raw)
-	title_m = re.search(r'"song_title"\s*:\s*"([^"]*)"', raw)
-	if artist_m:
-		artist = artist_m.group(1)
-	if title_m:
-		title = title_m.group(1)
-	tab_match = re.search(r'"formatted_tab"\s*:\s*"(.*?)(?:(?:"\s*,\s*"debug_notes")|"\s*}\s*$)', raw, re.DOTALL)
-	if not tab_match:
-		raise SystemExit(1)
-	data = {
-		"artist": artist,
-		"song_title": title,
-		"formatted_tab": tab_match.group(1)
-	}
-
-print(json.dumps(data))
-PY
-)
-
-	local artist title tab
-	artist=$(printf '%s' "$response_json" | jq -r '.artist // .Artist // empty')
-	title=$(printf '%s' "$response_json" | jq -r '.song_title // .title // empty')
-	tab=$(printf '%s' "$response_json" | jq -r '.formatted_tab // .formatted // .content // empty')
+	if printf '%s' "$sanitized" | jq -e . >/dev/null 2>&1; then
+		artist=$(printf '%s' "$sanitized" | jq -r '.artist // .Artist // empty')
+		title=$(printf '%s' "$sanitized" | jq -r '.song_title // .title // empty')
+		tab=$(printf '%s' "$sanitized" | jq -r '.formatted_tab // .formatted // .content // empty')
+	else
+		print -ru2 -- "Failed to parse JSON response; attempting fallback extraction"
+		fallback=$(printf '%s' "$raw" | jq -R -s '
+			def grab(re): (capture(re) // empty);
+			{
+			  artist:      (grab("(?s).*\"artist\"\\s*:\\s*\"(?<v>[^\"]*)\".*").v // ""),
+			  song_title:  (grab("(?s).*\"song_title\"\\s*:\\s*\"(?<v>[^\"]*)\".*").v // ""),
+			  formatted_tab: (grab("(?s).*\"formatted_tab\"\\s*:\\s*\"(?<v>.*)\"\\s*\\}?\\s*$").v // "")
+			}
+		')
+		artist=$(printf '%s' "$fallback" | jq -r '.artist // empty')
+		title=$(printf '%s' "$fallback" | jq -r '.song_title // empty')
+		tab=$(printf '%s' "$fallback" | jq -r '.formatted_tab // empty')
+	fi
 
 	[[ -z "$artist" ]] && artist="Unknown Artist"
 	[[ -z "$title" ]] && title="Unknown Song"
