@@ -65,17 +65,12 @@ single song. Output a clean, refactored OnSong-style chart wrapped in JSON.
 
 OUTPUT FORMAT (JSON ONLY)
 - Return ONLY a single JSON object (no markdown, no code fences, no commentary).
-- JSON must include at least these keys: "artist", "song_title",
-	"formatted_tab". You may include an optional "debug_notes" array of strings
-	describing the key cleanup/normalization steps you performed.
+- JSON must include exactly these keys: "artist", "song_title", "formatted_tab".
+- Do NOT include any other keys (no debug or notes fields).
 - "artist": normalized artist name (string).
 - "song_title": normalized song title (string).
 - "formatted_tab": the FULL OnSong text exactly as it should be written to the
 	.tab file (string). Include newlines in the string via literal "\n".
-DEBUG NOTES (OPTIONAL)
-- If provided, "debug_notes" should be a concise list of changes such as
-	consolidating duplicate choruses, moving chords above lyrics, normalizing
-	headers/flow, bar-notation fixes, and section renames.
 
 HARD REQUIREMENTS
 - Plain text only inside formatted_tab. ASCII only (straight quotes, normal
@@ -252,11 +247,41 @@ parse_response() {
 	local response_json="$1"
 
 	response_json=$(RAW="$response_json" python - <<'PY'
-import os, json
+import os, json, re, sys
+
 raw = os.environ.get("RAW", "")
 raw = raw.replace("\r", "")
-raw_escaped = raw.replace("\n", "\\n").replace("\t", "\\t")
-data = json.loads(raw_escaped)
+
+def escape_invalid_backslashes(text: str) -> str:
+	# Any backslash not starting a valid JSON escape gets doubled so json.loads can parse.
+	return re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
+
+sanitized = escape_invalid_backslashes(raw)
+sanitized = sanitized.replace("\n", "\\n").replace("\t", "\\t")
+
+try:
+	data = json.loads(sanitized)
+except json.JSONDecodeError as exc:
+	sys.stderr.write(f"Failed to parse JSON response: {exc}\n")
+	# Fallback: best-effort extraction of expected fields from sloppy JSON
+	artist = ""
+	title = ""
+	tab_match = None
+	artist_m = re.search(r'"artist"\s*:\s*"([^"]*)"', raw)
+	title_m = re.search(r'"song_title"\s*:\s*"([^"]*)"', raw)
+	if artist_m:
+		artist = artist_m.group(1)
+	if title_m:
+		title = title_m.group(1)
+	tab_match = re.search(r'"formatted_tab"\s*:\s*"(.*?)(?:(?:"\s*,\s*"debug_notes")|"\s*}\s*$)', raw, re.DOTALL)
+	if not tab_match:
+		raise SystemExit(1)
+	data = {
+		"artist": artist,
+		"song_title": title,
+		"formatted_tab": tab_match.group(1)
+	}
+
 print(json.dumps(data))
 PY
 )
@@ -677,17 +702,28 @@ main() {
 	local debug_notes=""
 	if [[ $debug_notes_flag -eq 1 ]]; then
 		debug_notes=$(RAW="$response_json" python - <<'PY'
-import os, json
+import os, json, re, sys
+
 raw = os.environ.get("RAW", "").replace("\r", "")
-raw_escaped = raw.replace("\n", "\\n").replace("\t", "\\t")
-data = json.loads(raw_escaped)
-notes = data.get("debug_notes")
+
+def sanitize(text: str) -> str:
+	text = re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
+	return text.replace("\n", "\\n").replace("\t", "\\t")
+
+data = {}
+try:
+	data = json.loads(sanitize(raw))
+except json.JSONDecodeError as exc:
+	sys.stderr.write(f"Failed to parse debug notes JSON: {exc}\n")
+	data = {}
+
+notes = data.get("debug_notes") if isinstance(data, dict) else None
 if isinstance(notes, str):
-    notes_list = [notes]
+	notes_list = [notes]
 elif isinstance(notes, list):
-    notes_list = [str(n) for n in notes]
+	notes_list = [str(n) for n in notes]
 else:
-    notes_list = []
+	notes_list = []
 print("\n".join(notes_list))
 PY
 )
@@ -717,13 +753,34 @@ PY
 		validator_response=$(get-openai-response "$validator_payload")
 
 		validator_tab=$(RAW="$validator_response" python - <<'PY'
-import os, json
+import os, json, re, sys
+
 raw = os.environ.get("RAW", "").replace("\r", "")
-raw_esc = raw.replace("\n", "\\n").replace("\t", "\\t")
-data = json.loads(raw_esc)
-tab = data.get("formatted_tab") or data.get("chart") or ""
+
+def sanitize(text: str) -> str:
+	text = re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
+	return text.replace("\n", "\\n").replace("\t", "\\t")
+
+def fallback_extract(text: str) -> dict:
+	tab_match = re.search(r'"formatted_tab"\s*:\s*"(.*?)(?:(?:"\s*,)|"\s*}\s*$)', text, re.DOTALL)
+	tab = tab_match.group(1) if tab_match else ""
+	issues: list[str] = []
+	fixed = False
+	return {"tab": tab, "issues": issues, "fixed": fixed}
+
+try:
+	data = json.loads(sanitize(raw))
+except json.JSONDecodeError as exc:
+	sys.stderr.write(f"Failed to parse validator JSON: {exc}\n")
+	data = fallback_extract(raw)
+
+if not isinstance(data, dict):
+	data = {}
+
+tab = data.get("formatted_tab") or data.get("chart") or data.get("tab") or ""
 issues = data.get("issues") or []
 fixed = bool(data.get("fixed")) if "fixed" in data else False
+
 print(json.dumps({"tab": tab, "issues": issues, "fixed": fixed}))
 PY
 )
