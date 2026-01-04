@@ -25,7 +25,7 @@ readonly MODEL_NAME="${OPENAI_MODEL:-gpt-5.1}"
 
 usage() {
 	cat <<'USAGE'
-Usage: organize-guitar-tabs.sh [--dry-run] <text-file>
+Usage: organize-guitar-tabs.sh [--dry-run] [--no-validate] <text-file>
 
 Formats a raw lyrics/chords text file into OnSong-style tab output using OpenAI
 and writes the result to $GUITAR_TAB_OUTPUT (or a default folder) with the name
@@ -34,6 +34,7 @@ and writes the result to $GUITAR_TAB_OUTPUT (or a default folder) with the name
 Options:
 	--dry-run   Print the formatted tab to stdout only (no file writes)
 	--debug-notes Print a list of model-described changes (does not alter tab)
+	--no-validate Skip the second AI validation/fix pass (validation runs by default)
 USAGE
 }
 
@@ -121,6 +122,13 @@ FLOW (REQUIRED)
 	earlier one, do not duplicate the content; keep a single canonical section
 	and reference it multiple times in Flow (e.g., one Chorus 1 with multiple C1
 	entries in Flow).
+- If a later chorus starts with the entirety of Chorus 1 and then adds new
+	lines, keep Chorus 1 as the canonical full chorus and create Chorus 2 with
+	ONLY the additional lines. Flow should indicate "C1, C2" to represent the
+	base chorus followed by its tagged extension.
+- If a section repeats identical content within the same block (e.g., a chorus
+	written twice in one section), collapse it to a single canonical section and
+	represent the repeats in Flow by repeating its token (e.g., "C1 C1").
 - Check for repeated sections (esp. choruses/pre-choruses). If a later version
 	is not meaningfully different, consolidate to a single section and rely on
 	Flow to indicate repetition instead of duplicating content.
@@ -147,9 +155,12 @@ CLEANUP / NORMALIZATION
 - Trim trailing spaces (except inside tab alignment). Collapse multiple blank
   lines to max one between blocks. Remove noise (credits/URLs) unless musically
   unique. Deduplicate identical sections (use Flow).
-- If extra notes or instructions are present in the user input that are not
-	part of the chart (e.g., recording notes, reminders), you may use them to
-	infer structure/sections but DO NOT include them in formatted_tab.
+- If chord diagram blocks (e.g., "Chord  D   x x 0 2 3 2") appear at the
+	start, use them only to verify chord spellings; do NOT include them in
+	formatted_tab.
+- If extra notes or instructions (legends, comment blocks, how-to-play notes)
+	appear at the end or inline and are not part of the chart, you may use them
+	to infer structure/sections but DO NOT include them in formatted_tab.
 
 METADATA LOOKUP + SAFETY
 - Prefer confident lookups for Key/Capo/Tempo/Time; otherwise leave blank. If
@@ -174,6 +185,65 @@ PROMPT
 			messages: [
 				{role: "system", content: $system},
 				{role: "user", content: ("Format the following raw text into the target OnSong structure and respond only with the JSON object described above.\n\nRaw input:\n" + $raw)}
+			]
+		}'
+}
+
+build_validator_body() {
+	local formatted_tab="$1"
+
+	local system_prompt
+
+	system_prompt=$(cat <<'VPROMPT'
+You are a strict validator and minimal fixer for formatted OnSong charts. Input
+is an already-formatted chart string. Verify the chart follows all rules below
+and return JSON only.
+
+OUTPUT FORMAT (JSON ONLY)
+- Return ONLY a single JSON object with keys: "formatted_tab" (string),
+  "issues" (array of strings), "fixed" (boolean).
+- If no issues, return the input chart unchanged and set fixed to false.
+
+RULES TO ENFORCE
+- Header lines present: Title, Artist, then metadata block (Key, Capo, Tempo,
+  Time, Flow, Tuning, TransposedKey), blank line, then sections.
+- Tuning must be present (default Standard acceptable). Capo present (0 if
+  unknown). Flow present.
+- Section headers colon-suffixed with numbering where needed.
+- Flow uses compact tokens (Intro, V1, V2, PC1, C1, C2, B, Solo, Outro, Tag).
+- If multiple distinct sections of a type exist, number all (Verse 1/2, PC1/2,
+  C1/2, etc.).
+- If later sections are identical to earlier ones, do not duplicate content;
+  Flow should repeat the token instead.
+- If a chorus starts with the entirety of Chorus 1 and then adds new lines,
+  keep Chorus 1 canonical and make Chorus 2 contain only the additional lines;
+  Flow should show C1 then C2.
+- If a section repeats identical content within its own block, collapse to one
+  block and repeat its token in Flow (e.g., C1 C1).
+- Chords-over-lyrics only; no inline chords. Bar lines for instrumentals.
+
+FIX STRATEGY
+- If violations are found, minimally repair the chart to comply with rules and
+  return the corrected chart in formatted_tab with fixed=true. Preserve song
+  content; do not invent chords/lyrics.
+
+FAIL-SAFE
+- If you cannot confidently fix, return the original chart, fixed=false, and
+  include issues describing blockers.
+VPROMPT
+)
+
+	jq -n \
+		--arg system "$system_prompt" \
+		--arg formatted "$formatted_tab" \
+		--arg model "$MODEL_NAME" \
+		'{
+			model: $model,
+			temperature: 0.2,
+			response_format: {type: "json_object"},
+			messages: [
+				{role: "system", content: $system},
+				{role: "user", content: ("Validate and minimally fix the following formatted chart. Respond only with JSON as specified.\n\nChart:\n" + $formatted)}
 			]
 		}'
 }
@@ -349,6 +419,28 @@ if current_header is not None:
 def normalize_content(content_lines: list[str]) -> str:
 	return '\n'.join(content_lines).strip()
 
+def clean_lines(content_lines: list[str]) -> list[str]:
+	return [line.rstrip() for line in content_lines]
+
+def starts_with_lines(candidate: list[str], prefix: list[str]) -> bool:
+	if len(candidate) < len(prefix):
+		return False
+	return all(candidate[i] == prefix[i] for i in range(len(prefix)))
+
+def extract_repeated_block(lines: list[str]) -> tuple[list[str], int]:
+	"""If the content is the same block repeated, return block and count."""
+	n = len(lines)
+	if n == 0:
+		return lines, 1
+	for size in range(1, (n // 2) + 1):
+		if n % size:
+			continue
+		block = lines[:size]
+		count = n // size
+		if all(lines[i * size : (i + 1) * size] == block for i in range(count)):
+			return block, count
+	return lines, 1
+
 if headers_found > 0:
 	type_stats: dict[str, dict[str, list]] = {}
 	unique_order: list[tuple[str, int]] = []
@@ -356,25 +448,58 @@ if headers_found > 0:
 
 	for entry in sections:
 		type_name, prefix, _ = parse_section_header(entry['header'])
-		content_key = normalize_content(entry['lines'])
+		content_clean_raw = clean_lines(entry['lines'])
+		base_block, repeat_count = extract_repeated_block(content_clean_raw)
+		content_clean = base_block
+		content_key = '\n'.join(content_clean).strip()
 		stats = type_stats.setdefault(type_name, {'unique': [], 'prefix': prefix, 'count': 0})
-		stats['count'] += 1
+		stats['count'] += repeat_count
 		match_idx = None
+		extension_created = False
 		for idx, u in enumerate(stats['unique'], start=1):
+			# Exact match
 			if u['key'] == content_key:
 				match_idx = idx
 				break
+			# Chorus extension: new section starts with prior chorus content
+			if type_name == 'Chorus' and starts_with_lines(content_clean, u['lines_clean']):
+				extension_lines = content_clean[len(u['lines_clean']):]
+				extension_key = '\n'.join(extension_lines).strip()
+				if extension_key == '':
+					match_idx = idx
+					break
+				# If extension already exists, reuse it
+				for jdx, uj in enumerate(stats['unique'], start=1):
+					if uj.get('extension_of') == idx and uj['key'] == extension_key:
+						match_idx = jdx
+						break
+				if match_idx is not None:
+					break
+				stats['unique'].append({
+					'key': extension_key,
+					'lines': extension_lines,
+					'lines_clean': extension_lines,
+					'extension_of': idx,
+				})
+				match_idx = len(stats['unique'])
+				extension_created = True
+				unique_id = (type_name, match_idx)
+				if unique_id not in unique_order:
+					unique_order.append(unique_id)
+				break
 		if match_idx is None:
-			stats['unique'].append({'key': content_key, 'lines': entry['lines']})
+			stats['unique'].append({'key': content_key, 'lines': content_clean, 'lines_clean': content_clean})
 			match_idx = len(stats['unique'])
 			unique_id = (type_name, match_idx)
 			if unique_id not in unique_order:
 				unique_order.append(unique_id)
-		occurrences.append({
-			'type': type_name,
-			'prefix': prefix,
-			'unique_idx': match_idx,
-		})
+		for _ in range(repeat_count):
+			occurrences.append({
+				'type': type_name,
+				'prefix': prefix,
+				'unique_idx': match_idx,
+				'extension': extension_created,
+			})
 
 	numbering_types = {'Verse', 'Pre-Chorus', 'Chorus', 'Bridge'}
 
@@ -396,6 +521,7 @@ if headers_found > 0:
 				'display_name': display_name,
 				'token': token,
 				'lines': unique['lines'],
+				'extension_of': unique.get('extension_of'),
 			}
 
 	tokens_in_flow: list[str] = []
@@ -473,7 +599,7 @@ PY
 }
 
 main() {
-	local input_file="" dry_run=0 debug_notes_flag=0
+	local input_file="" dry_run=0 debug_notes_flag=0 validate_flag=1
 
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
@@ -483,6 +609,10 @@ main() {
 				;;
 			--debug-notes)
 				debug_notes_flag=1
+				shift
+			;;
+			--no-validate)
+				validate_flag=0
 				shift
 				;;
 			--help|-h)
@@ -579,6 +709,43 @@ PY
 
 	# Rebuild header with fallbacks and derived flow
 	tab=$(rebuild_formatted_tab "$tab" "$artist" "$title" "$(basename "$absolute_input")")
+
+	if [[ $validate_flag -eq 1 ]]; then
+		log_info "Running validation pass"
+		local validator_payload validator_response validator_fixed validator_tab validator_issues
+		validator_payload=$(build_validator_body "$tab")
+		validator_response=$(get-openai-response "$validator_payload")
+
+		validator_tab=$(RAW="$validator_response" python - <<'PY'
+import os, json
+raw = os.environ.get("RAW", "").replace("\r", "")
+raw_esc = raw.replace("\n", "\\n").replace("\t", "\\t")
+data = json.loads(raw_esc)
+tab = data.get("formatted_tab") or data.get("chart") or ""
+issues = data.get("issues") or []
+fixed = bool(data.get("fixed")) if "fixed" in data else False
+print(json.dumps({"tab": tab, "issues": issues, "fixed": fixed}))
+PY
+)
+
+		validator_fixed=$(printf '%s' "$validator_tab" | jq -r '.fixed')
+		validator_issues=$(printf '%s' "$validator_tab" | jq -r '.issues[]?' || true)
+		local candidate_tab
+		candidate_tab=$(printf '%s' "$validator_tab" | jq -r '.tab')
+		if [[ -n "$candidate_tab" ]]; then
+			tab="$candidate_tab"
+			if [[ "$validator_fixed" == "true" ]]; then
+				log_info "Validator applied fixes"
+			fi
+		else
+			log_warn "Validator returned empty tab; keeping original"
+		fi
+		if [[ -n "$validator_issues" ]]; then
+			while IFS= read -r line; do
+				log_info "Validation issue: $line"
+			done <<< "$validator_issues"
+		fi
+	fi
 
 	artist=$(sanitize_component "$artist")
 	title=$(sanitize_component "$title")
