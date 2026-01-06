@@ -68,7 +68,9 @@ OUTPUT FORMAT (JSON ONLY)
 - "artist": normalized artist name (string).
 - "song_title": normalized song title (string).
 - "formatted_tab": the FULL OnSong text exactly as it should be written to the
-	.tab file (string). Include newlines in the string via literal "\n".
+	.tab file (string). All newlines MUST be escaped as literal "\\n" inside the
+	JSON string (no raw newlines inside JSON strings). Emit compact, single-line
+JSON.
 
 HARD REQUIREMENTS
 - Plain text only inside formatted_tab. ASCII only (straight quotes, normal
@@ -221,6 +223,9 @@ RULES TO ENFORCE
 - Chords-over-lyrics only; no inline chords. Bar lines for instrumentals.
 - Mixed chord+lyric sections must retain both the bar/chord lines AND the lyric
 	lines beneath; do not convert to instrumental-only.
+- If unlabeled hook/vocal lines immediately follow any section (or its bars),
+	keep them within that section instead of creating a new section; only start
+	a new section when a clear heading/title is present.
 
 FIX STRATEGY
 - If violations are found, minimally repair the chart to comply with rules and
@@ -251,14 +256,35 @@ VPROMPT
 parse_response() {
 	local response_json="$1"
 
-	local raw sanitized artist title tab compact_raw
+	local raw sanitized artist title tab compact_raw reparsed
 	raw="${response_json//$'\r'/}"
 	sanitized="$raw"
 
+	# If JSON parse fails due to unescaped newlines, try reparsing by slurping as raw text
+	# If sanitized is a JSON string, decode it; otherwise try raw parse, then fallback to slurped parse
+	if reparsed=$(printf '%s' "$sanitized" | jq -e 'if type=="string" then fromjson else . end' 2>/dev/null); then
+		sanitized="$reparsed"
+	fi
+
+	if ! printf '%s' "$sanitized" | jq -e . >/dev/null 2>&1; then
+		reparsed=$(printf '%s' "$sanitized" | jq -R -s 'fromjson?') || true
+		if [[ -n "$reparsed" && "$reparsed" != "null" ]]; then
+			sanitized="$reparsed"
+		fi
+	fi
+
+	# If still not parseable, try decoding in case the entire payload is a quoted JSON string
+	if ! printf '%s' "$sanitized" | jq -e . >/dev/null 2>&1; then
+		reparsed=$(printf '%s' "$raw" | jq -R -s 'fromjson?') || true
+		if [[ -n "$reparsed" && "$reparsed" != "null" ]]; then
+			sanitized="$reparsed"
+		fi
+	fi
+
 	if printf '%s' "$sanitized" | jq -e . >/dev/null 2>&1; then
-		artist=$(printf '%s' "$sanitized" | jq -r '.artist // .Artist // empty')
-		title=$(printf '%s' "$sanitized" | jq -r '.song_title // .title // empty')
-		tab=$(printf '%s' "$sanitized" | jq -r '.formatted_tab // .formatted // .content // empty')
+		artist=$(printf '%s' "$sanitized" | jq -r 'if type=="string" then (gsub("\n"; "\\n") | fromjson? // {}) else . end | .artist // .Artist // empty')
+		title=$(printf '%s' "$sanitized" | jq -r 'if type=="string" then (gsub("\n"; "\\n") | fromjson? // {}) else . end | .song_title // .title // empty')
+		tab=$(printf '%s' "$sanitized" | jq -r 'if type=="string" then (gsub("\n"; "\\n") | fromjson? // {}) else . end | .formatted_tab // .formatted // .content // empty')
 	else
 		print -ru2 -- "Failed to parse JSON response; attempting fallback extraction"
 		fallback=$(printf '%s' "$raw" | jq -R -s '
@@ -290,320 +316,11 @@ rebuild_formatted_tab() {
 	local title_fallback="$3"
 	local file_base="$4"
 
-	TAB_CONTENT="$tab_content" ARTIST_FB="$artist_fallback" TITLE_FB="$title_fallback" FILE_BASE="$file_base" python - <<'PY'
-import os, re
-
-CHORD_RE = re.compile(
-	r"\b(?P<root>[A-G](?:#|b)?)(?P<qual>maj7|maj|min7|m7|m|min|dim|aug|sus2|sus4|add9|6|7|9|11|13|m6|m9|maj9)?(?:/[A-G](?:#|b)?)?\b"
-)
-
-
-def detect_key(body: str) -> str:
-	root_counts: dict[str, int] = {}
-	minor_counts: dict[str, int] = {}
-
-	for match in CHORD_RE.finditer(body):
-		root = match.group("root")
-		qual = match.group("qual") or ""
-		is_minor = qual.startswith("m") and not qual.startswith("maj")
-
-		root_counts[root] = root_counts.get(root, 0) + 1
-		if is_minor:
-			minor_counts[root] = minor_counts.get(root, 0) + 1
-
-	if not root_counts:
-		return ""
-
-	best_root = max(root_counts.items(), key=lambda item: item[1])[0]
-	minor_hits = minor_counts.get(best_root, 0)
-	total_hits = root_counts[best_root]
-
-	if total_hits > 0 and minor_hits / total_hits >= 0.5:
-		return f"{best_root}m"
-	return best_root
-
-tab = os.environ['TAB_CONTENT']
-artist_fb = os.environ['ARTIST_FB']
-title_fb = os.environ['TITLE_FB']
-file_base = os.environ['FILE_BASE']
-
-lines = tab.split('\n')
-
-file_artist = ""
-file_title = ""
-if file_base:
-	base_no_ext = file_base.rsplit('.', 1)[0]
-	parts = base_no_ext.split(' - ', 1)
-	if len(parts) == 2:
-		file_artist, file_title = parts[0].strip(), parts[1].strip()
-	else:
-		file_title = base_no_ext.strip()
-
-hdr_title = lines[0].strip() if len(lines) > 0 else ""
-hdr_artist = lines[1].strip() if len(lines) > 1 else ""
-
-meta_names = ['Key', 'Capo', 'Tempo', 'Time', 'Flow', 'Tuning', 'TransposedKey']
-meta = {name: '' for name in meta_names}
-
-for offset, name in enumerate(meta_names, start=2):
-	if offset < len(lines):
-		m = re.match(rf"^{name}:\s*(.*)$", lines[offset])
-		if m:
-			meta[name] = m.group(1).strip()
-
-body_start = 2 + len(meta_names)
-if body_start < len(lines) and lines[body_start].strip() == '':
-	body_start += 1
-body = '\n'.join(lines[body_start:]).lstrip('\n')
-
-artist = hdr_artist or artist_fb or file_artist or "Unknown Artist"
-title = hdr_title or title_fb or file_title or "Unknown Song"
-
-if not meta['Capo']:
-	meta['Capo'] = '0'
-if not meta['Tuning']:
-	meta['Tuning'] = 'Standard'
-
-if not meta['Key']:
-	meta['Key'] = detect_key(body)
-
-header_re = re.compile(r'^([A-Za-z][A-Za-z0-9 \-\'/]+):\s*$')
-
-def parse_section_header(raw: str) -> tuple[str, str, int | None]:
-	name = raw.strip()
-	m = re.match(r'^(.*?)(?:\s+(\d+))?$', name)
-	base_part = m.group(1).strip() if m else name
-	num = int(m.group(2)) if m and m.group(2) else None
-	base = base_part.lower().replace('-', ' ').strip()
-	if 'pre' in base and 'chorus' in base:
-		return 'Pre-Chorus', 'PC', num
-	if base.startswith('verse'):
-		return 'Verse', 'V', num
-	if base.startswith('chorus'):
-		return 'Chorus', 'C', num
-	if base.startswith('intro'):
-		return 'Intro', 'Intro', num
-	if base.startswith('outro'):
-		return 'Outro', 'Outro', num
-	if base.startswith('bridge') or base == 'b':
-		return 'Bridge', 'B', num
-	if base.startswith('instrument') or base.startswith('instr'):
-		return 'Instrumental', 'Instr', num
-	if base.startswith('solo'):
-		return 'Solo', 'Solo', num
-	if base.startswith('tag'):
-		return 'Tag', 'Tag', num
-	if base.startswith('interlude'):
-		return 'Interlude', 'Interlude', num
-	if base.startswith('pre'):
-		return 'Pre-Chorus', 'PC', num
-	clean = base_part.title()
-	return clean, clean.replace(' ', ''), num
-
-lines_in_body = body.split('\n')
-sections: list[dict] = []
-leading_lines: list[str] = []
-current_header: str | None = None
-current_lines: list[str] = []
-headers_found = 0
-
-for line in lines_in_body:
-	m = header_re.match(line.strip())
-	if m:
-		headers_found += 1
-		if current_header is not None:
-			sections.append({'header': current_header, 'lines': current_lines})
-		current_header = m.group(1).strip()
-		current_lines = []
-	else:
-		if current_header is None:
-			leading_lines.append(line)
-		else:
-			current_lines.append(line)
-
-if current_header is not None:
-	sections.append({'header': current_header, 'lines': current_lines})
-
-def normalize_content(content_lines: list[str]) -> str:
-	return '\n'.join(content_lines).strip()
-
-def clean_lines(content_lines: list[str]) -> list[str]:
-	return [line.rstrip() for line in content_lines]
-
-def starts_with_lines(candidate: list[str], prefix: list[str]) -> bool:
-	if len(candidate) < len(prefix):
-		return False
-	return all(candidate[i] == prefix[i] for i in range(len(prefix)))
-
-def extract_repeated_block(lines: list[str]) -> tuple[list[str], int]:
-	"""If the content is the same block repeated, return block and count."""
-	n = len(lines)
-	if n == 0:
-		return lines, 1
-	for size in range(1, (n // 2) + 1):
-		if n % size:
-			continue
-		block = lines[:size]
-		count = n // size
-		if all(lines[i * size : (i + 1) * size] == block for i in range(count)):
-			return block, count
-	return lines, 1
-
-if headers_found > 0:
-	type_stats: dict[str, dict[str, list]] = {}
-	unique_order: list[tuple[str, int]] = []
-	occurrences: list[dict] = []
-
-	for entry in sections:
-		type_name, prefix, _ = parse_section_header(entry['header'])
-		content_clean_raw = clean_lines(entry['lines'])
-		base_block, repeat_count = extract_repeated_block(content_clean_raw)
-		content_clean = base_block
-		content_key = '\n'.join(content_clean).strip()
-		stats = type_stats.setdefault(type_name, {'unique': [], 'prefix': prefix, 'count': 0})
-		stats['count'] += repeat_count
-		match_idx = None
-		extension_created = False
-		for idx, u in enumerate(stats['unique'], start=1):
-			# Exact match
-			if u['key'] == content_key:
-				match_idx = idx
-				break
-			# Chorus extension: new section starts with prior chorus content
-			if type_name == 'Chorus' and starts_with_lines(content_clean, u['lines_clean']):
-				extension_lines = content_clean[len(u['lines_clean']):]
-				extension_key = '\n'.join(extension_lines).strip()
-				if extension_key == '':
-					match_idx = idx
-					break
-				# If extension already exists, reuse it
-				for jdx, uj in enumerate(stats['unique'], start=1):
-					if uj.get('extension_of') == idx and uj['key'] == extension_key:
-						match_idx = jdx
-						break
-				if match_idx is not None:
-					break
-				stats['unique'].append({
-					'key': extension_key,
-					'lines': extension_lines,
-					'lines_clean': extension_lines,
-					'extension_of': idx,
-				})
-				match_idx = len(stats['unique'])
-				extension_created = True
-				unique_id = (type_name, match_idx)
-				if unique_id not in unique_order:
-					unique_order.append(unique_id)
-				break
-		if match_idx is None:
-			stats['unique'].append({'key': content_key, 'lines': content_clean, 'lines_clean': content_clean})
-			match_idx = len(stats['unique'])
-			unique_id = (type_name, match_idx)
-			if unique_id not in unique_order:
-				unique_order.append(unique_id)
-		for _ in range(repeat_count):
-			occurrences.append({
-				'type': type_name,
-				'prefix': prefix,
-				'unique_idx': match_idx,
-				'extension': extension_created,
-			})
-
-	numbering_types = {'Verse', 'Pre-Chorus', 'Chorus', 'Bridge'}
-
-	def needs_numbering(type_name: str) -> bool:
-		stats = type_stats[type_name]
-		return len(stats['unique']) > 1 or (stats['count'] > 1 and type_name in numbering_types)
-
-	display_map: dict[tuple[str, int], dict[str, str | list[str]]] = {}
-	for type_name, stats in type_stats.items():
-		prefix = stats['prefix']
-		number_required = needs_numbering(type_name)
-		for idx, unique in enumerate(stats['unique'], start=1):
-			number = idx if number_required else None
-			if number is None and stats['count'] > 1 and type_name in numbering_types:
-				number = idx
-			display_name = f"{type_name} {number}" if number else type_name
-			token = f"{prefix}{number}" if number else prefix
-			display_map[(type_name, idx)] = {
-				'display_name': display_name,
-				'token': token,
-				'lines': unique['lines'],
-				'extension_of': unique.get('extension_of'),
-			}
-
-	tokens_in_flow: list[str] = []
-	for occ in occurrences:
-		key = (occ['type'], occ['unique_idx'])
-		mapping = display_map.get(key)
-		if mapping:
-			tokens_in_flow.append(mapping['token'])
-
-	body_blocks: list[str] = []
-	if leading_lines:
-		leading = '\n'.join(leading_lines).rstrip()
-		if leading:
-			body_blocks.append(leading)
-
-	for unique_id in unique_order:
-		mapping = display_map[unique_id]
-		section_lines = mapping['lines']
-		header_line = f"{mapping['display_name']}:"
-		block_parts = [header_line]
-		if section_lines and (len(section_lines) == 0 or section_lines[0].strip() != ''):
-			block_parts.append('')
-		block_parts.append('\n'.join(section_lines).rstrip())
-		body_blocks.append('\n'.join(part for part in block_parts if part != ''))
-
-	body = '\n\n'.join(blocks for blocks in body_blocks if blocks.strip() != '').rstrip() + '\n'
-	if tokens_in_flow:
-		meta['Flow'] = ', '.join(tokens_in_flow)
-elif not meta['Flow']:
-	section_tokens = []
-	for line in body.split('\n'):
-		if not line.strip():
-			continue
-		m = re.match(r'^([A-Za-z ]+):\s*$', line.strip())
-		if not m:
-			continue
-		name = m.group(1).strip()
-		low = name.lower()
-		token = None
-		if low.startswith('intro'):
-			token = 'Intro'
-		elif low.startswith('verse'):
-			num = ''.join(ch for ch in name if ch.isdigit()) or '1'
-			token = f'V{num}'
-		elif 'pre' in low:
-			num = ''.join(ch for ch in name if ch.isdigit()) or '1'
-			token = f'PC{num}'
-		elif 'chorus' in low:
-			num = ''.join(ch for ch in name if ch.isdigit()) or '1'
-			token = f'C{num}'
-		elif 'bridge' in low or low == 'b':
-			token = 'B'
-		elif 'solo' in low:
-			token = 'Solo'
-		elif 'outro' in low:
-			token = 'Outro'
-		elif 'tag' in low:
-			token = 'Tag'
-		if token and token not in section_tokens:
-			section_tokens.append(token)
-	if section_tokens:
-		meta['Flow'] = ' '.join(section_tokens)
-
-header_lines = [
-	title,
-	artist,
-	*(f"{name}: {meta[name]}" for name in meta_names),
-	'',
-	''
-]
-
-rebuilt = '\n'.join(header_lines) + body
-print(rebuilt)
-PY
+	TAB_CONTENT="$tab_content" \
+		ARTIST_FB="$artist_fallback" \
+		TITLE_FB="$title_fallback" \
+		FILE_BASE="$file_base" \
+		python "$SCRIPT_DIR/organize-guitar-tabs-format.py"
 }
 
 main() {
@@ -702,10 +419,12 @@ main() {
 	validator_tab=$(
 		set -o pipefail
 		raw=$(printf '%s' "$validator_response" | tr -d '\r')
-		if jq -e . >/dev/null 2>&1 <<<"$raw"; then
-			tab=$(jq -r '.formatted_tab // .chart // .tab // ""' <<<"$raw")
-			issues_json=$(jq -c '.issues // []' <<<"$raw")
-			fixed_val=$(jq -r 'if has("fixed") then (.fixed|tostring) else "false" end' <<<"$raw")
+		# Decode validator response even if it returns a JSON string with literal newlines
+		decoded=$(printf '%s' "$raw" | jq -R -s 'fromjson? // .')
+		if jq -e . >/dev/null 2>&1 <<<"$decoded"; then
+			tab=$(jq -r 'if type=="string" then (gsub("\n"; "\\n") | fromjson? // {}) else . end | .formatted_tab // .chart // .tab // ""' <<<"$decoded")
+			issues_json=$(jq -c 'if type=="string" then (gsub("\n"; "\\n") | fromjson? // {}) else . end | .issues // []' <<<"$decoded")
+			fixed_val=$(jq -r 'if type=="string" then (gsub("\n"; "\\n") | fromjson? // {}) else . end | if has("fixed") then (.fixed|tostring) else "false" end' <<<"$decoded")
 		else
 			tab=$(printf '%s' "$raw" | LC_ALL=C sed -n 's/.*"formatted_tab"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | head -n1)
 			issues_json='[]'

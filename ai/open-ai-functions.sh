@@ -121,10 +121,10 @@ get-openai-response() {
     CLEANED_RESPONSE="$RESPONSE"
 
     # First, let's check if we can extract content without validating the entire JSON
-    CONTENT=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+    CONTENT_RAW=$(printf '%s' "$RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
 
-    if [[ -n "$CONTENT" && "$CONTENT" != "null" && "$CONTENT" != "empty" ]]; then
-        log_debug "Content extracted directly from raw response (length: ${#CONTENT})"
+    if [[ -n "$CONTENT_RAW" && "$CONTENT_RAW" != "null" && "$CONTENT_RAW" != "empty" ]]; then
+        log_debug "Content extracted directly from raw response (length: ${#CONTENT_RAW})"
     else
         # If direct extraction failed, try with full JSON validation
         if echo "$RESPONSE" | jq . >/dev/null 2>&1; then
@@ -144,13 +144,13 @@ get-openai-response() {
         fi
 
         # Re-extract content from cleaned response if needed
-        if [[ -z "$CONTENT" || "$CONTENT" == "null" || "$CONTENT" == "empty" ]]; then
-            CONTENT=$(echo "$CLEANED_RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+        if [[ -z "$CONTENT_RAW" || "$CONTENT_RAW" == "null" || "$CONTENT_RAW" == "empty" ]]; then
+            CONTENT_RAW=$(echo "$CLEANED_RESPONSE" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
         fi
     fi
 
     # Check if response contains an error (skip if we already have content)
-    if [[ -z "$CONTENT" || "$CONTENT" == "null" || "$CONTENT" == "empty" ]]; then
+    if [[ -z "$CONTENT_RAW" || "$CONTENT_RAW" == "null" || "$CONTENT_RAW" == "empty" ]]; then
         ERROR_MESSAGE=$(echo "${CLEANED_RESPONSE:-$RESPONSE}" | jq -r '.error.message // empty' 2>/dev/null)
         if [[ -n "$ERROR_MESSAGE" ]]; then
             log_error "API Error: $ERROR_MESSAGE"
@@ -158,12 +158,10 @@ get-openai-response() {
         fi
     fi
 
-    # Normalize control characters that can break downstream JSON parsing
-    CONTENT="$(printf '%s' "$CONTENT" | tr '\r\n' '  ')"
-    CONTENT="${CONTENT//$'\t'/ }"
-
-    # Final content validation
-    log_debug "Final content validation - length: ${#CONTENT}, preview: '${CONTENT:0:100}...'"
+    # Encode content as JSON string to preserve escapes (newlines/tabs)
+    if ! CONTENT=$(printf '%s' "$CONTENT_RAW" | jq -Rs '.'); then
+        CONTENT="$CONTENT_RAW"
+    fi
 
     if [[ -z "$CONTENT" || "$CONTENT" == "null" || "$CONTENT" == "empty" ]]; then
         log_error "No content found in API response after all attempts"
@@ -172,7 +170,6 @@ get-openai-response() {
         return 1
     fi
 
-    # Parse the response to get the categorization and date
     echo "$CONTENT"
 }
 
