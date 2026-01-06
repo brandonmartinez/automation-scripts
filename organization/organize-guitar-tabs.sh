@@ -130,6 +130,11 @@ SECTION FORMATTING
 - Section headers with colon and blank line after: "Intro:", "Verse 1:",
   "Chorus 1:", etc. Normalize common names; consistent numbering.
 
+MIXED SECTIONS (CHORD + LYRIC)
+- If a section contains chord measures followed by lyrics (e.g., Intro with a
+	bar line then sung words), keep BOTH the chord block and the lyric lines in
+	that section. Do NOT collapse it to an instrumental-only bar line.
+
 CHORDS-OVER-LYRICS RULES
 - Convert inline chords to separate chord lines above lyrics. Keep chord names
   (slash, extensions, accidentals). Do not invent chords.
@@ -214,6 +219,8 @@ RULES TO ENFORCE
 - If a section repeats identical content within its own block, collapse to one
   block and repeat its token in Flow (e.g., C1 C1).
 - Chords-over-lyrics only; no inline chords. Bar lines for instrumentals.
+- Mixed chord+lyric sections must retain both the bar/chord lines AND the lyric
+	lines beneath; do not convert to instrumental-only.
 
 FIX STRATEGY
 - If violations are found, minimally repair the chart to comply with rules and
@@ -742,7 +749,6 @@ PY
 				log_info "Validation issue: $line"
 			done <<< "$validator_issues"
 		fi
-	fi
 
 	artist=$(sanitize_component "$artist")
 	title=$(sanitize_component "$title")
