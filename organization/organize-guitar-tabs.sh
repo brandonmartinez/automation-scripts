@@ -699,38 +699,23 @@ main() {
 	validator_payload=$(build_validator_body "$tab")
 	validator_response=$(get-openai-response "$validator_payload")
 
-	validator_tab=$(RAW="$validator_response" python - <<'PY'
-import os, json, re, sys
-
-raw = os.environ.get("RAW", "").replace("\r", "")
-
-def sanitize(text: str) -> str:
-	text = re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
-	return text.replace("\n", "\\n").replace("\t", "\\t")
-
-def fallback_extract(text: str) -> dict:
-	tab_match = re.search(r'"formatted_tab"\s*:\s*"(.*?)(?:(?:"\s*,)|"\s*}\s*$)', text, re.DOTALL)
-	tab = tab_match.group(1) if tab_match else ""
-	issues: list[str] = []
-	fixed = False
-	return {"tab": tab, "issues": issues, "fixed": fixed}
-
-try:
-	data = json.loads(sanitize(raw))
-except json.JSONDecodeError as exc:
-	sys.stderr.write(f"Failed to parse validator JSON: {exc}\n")
-	data = fallback_extract(raw)
-
-if not isinstance(data, dict):
-	data = {}
-
-tab = data.get("formatted_tab") or data.get("chart") or data.get("tab") or ""
-issues = data.get("issues") or []
-fixed = bool(data.get("fixed")) if "fixed" in data else False
-
-print(json.dumps({"tab": tab, "issues": issues, "fixed": fixed}))
-PY
-)
+	validator_tab=$(
+		set -o pipefail
+		raw=$(printf '%s' "$validator_response" | tr -d '\r')
+		if jq -e . >/dev/null 2>&1 <<<"$raw"; then
+			tab=$(jq -r '.formatted_tab // .chart // .tab // ""' <<<"$raw")
+			issues_json=$(jq -c '.issues // []' <<<"$raw")
+			fixed_val=$(jq -r 'if has("fixed") then (.fixed|tostring) else "false" end' <<<"$raw")
+		else
+			tab=$(printf '%s' "$raw" | LC_ALL=C sed -n 's/.*"formatted_tab"[[:space:]]*:[[:space:]]*"\(.*\)".*/\1/p' | head -n1)
+			issues_json='[]'
+			fixed_val='false'
+		fi
+		printf '{"tab":%s,"issues":%s,"fixed":%s}\n' \
+			"$(printf '%s' "$tab" | jq -Rs .)" \
+			"$issues_json" \
+			"$(printf '%s' "$fixed_val" | jq -r 'if .=="true" or .=="1" then "true" else "false" end')"
+	)
 
 		validator_fixed=$(printf '%s' "$validator_tab" | jq -r '.fixed')
 		validator_issues=$(printf '%s' "$validator_tab" | jq -r '.issues[]?' || true)
@@ -762,6 +747,7 @@ PY
 	if [[ $debug_mode -eq 1 ]]; then
 		print -r -- "$tab" > "$debug_target"
 		log_info "Debug mode: wrote formatted tab to $debug_target (original preserved)"
+		log_info "Debug mode: original left in place at $absolute_input"
 	else
 		print -r -- "$tab" > "$target_path"
 		log_info "Wrote formatted tab to $target_path"
