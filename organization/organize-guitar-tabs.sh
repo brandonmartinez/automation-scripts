@@ -82,8 +82,8 @@ HARD REQUIREMENTS
   repetition.
 
 TITLE + ARTIST NORMALIZATION
-- Normalize title/artist using standard conventions; look up canonical if
-  confidently possible. If not confident, keep best normalized input.
+- Normalize title/artist using standard conventions based solely on provided
+	text. If not confident, keep best normalized input.
 - If title and artist appear on a single line (e.g., "Song 123 by Artist X" or
 	similar), split and normalize them into separate Title and Artist values.
 
@@ -162,10 +162,10 @@ CLEANUP / NORMALIZATION
 	appear at the end or inline and are not part of the chart, you may use them
 	to infer structure/sections but DO NOT include them in formatted_tab.
 
-METADATA LOOKUP + SAFETY
-- Prefer confident lookups for Key/Capo/Tempo/Time; otherwise leave blank. If
-  Capo unknown, set "Capo: 0". Default Tuning to Standard if not specified.
-- TransposedKey only if confidently determinable; otherwise blank.
+METADATA FILL + SAFETY
+- Derive Key/Capo/Tempo/Time only from provided text; otherwise leave blank.
+	If Capo unknown, set "Capo: 0". Default Tuning to Standard if not specified.
+- TransposedKey only if determinable from provided text; otherwise blank.
 
 FINAL OUTPUT CHECK
 - Must be valid JSON. formatted_tab must contain: Title, Artist, full metadata
