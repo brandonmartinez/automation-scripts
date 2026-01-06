@@ -25,16 +25,14 @@ readonly MODEL_NAME="${OPENAI_MODEL:-gpt-5.1}"
 
 usage() {
 	cat <<'USAGE'
-Usage: organize-guitar-tabs.sh [--dry-run] [--no-validate] <text-file>
+Usage: organize-guitar-tabs.sh [--debug] <text-file>
 
 Formats a raw lyrics/chords text file into OnSong-style tab output using OpenAI
 and writes the result to $GUITAR_TAB_OUTPUT (or a default folder) with the name
 "ARTIST - SONG.txt".
 
 Options:
-	--dry-run   Print the formatted tab to stdout only (no file writes)
-	--debug-notes Print a list of model-described changes (does not alter tab)
-	--no-validate Skip the second AI validation/fix pass (validation runs by default)
+	--debug   Write formatted tab next to original with a -debug suffix (keeps original)
 USAGE
 }
 
@@ -602,20 +600,12 @@ PY
 }
 
 main() {
-	local input_file="" dry_run=0 debug_notes_flag=0 validate_flag=1
+	local input_file="" debug_mode=0
 
 	while [[ $# -gt 0 ]]; do
 		case "$1" in
-			--dry-run)
-				dry_run=1
-				shift
-				;;
-			--debug-notes)
-				debug_notes_flag=1
-				shift
-			;;
-			--no-validate)
-				validate_flag=0
+			--debug)
+				debug_mode=1
 				shift
 				;;
 			--help|-h)
@@ -660,10 +650,13 @@ main() {
 	fi
 	source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
 
-	[[ $dry_run -eq 1 ]] || mkdir -p "$OUTPUT_DIR"
+	if [[ $debug_mode -eq 0 ]]; then
+		mkdir -p "$OUTPUT_DIR"
+	fi
 
-	local absolute_input
+	local absolute_input input_dir
 	absolute_input="$(cd "$(dirname "$input_file")" &>/dev/null && pwd)/$(basename "$input_file")"
+	input_dir="$(dirname "$absolute_input")"
 	local raw_text
 	raw_text=$(cat "$absolute_input")
 
@@ -676,36 +669,6 @@ main() {
 	local payload response_json parsed artist title tab filename target_path
 	payload=$(build_request_body "$raw_text")
 	response_json=$(get-openai-response "$payload")
-
-	local debug_notes=""
-	if [[ $debug_notes_flag -eq 1 ]]; then
-		debug_notes=$(RAW="$response_json" python - <<'PY'
-import os, json, re, sys
-
-raw = os.environ.get("RAW", "").replace("\r", "")
-
-def sanitize(text: str) -> str:
-	text = re.sub(r"\\(?![\\\"/bfnrtu])", r"\\\\", text)
-	return text.replace("\n", "\\n").replace("\t", "\\t")
-
-data = {}
-try:
-	data = json.loads(sanitize(raw))
-except json.JSONDecodeError as exc:
-	sys.stderr.write(f"Failed to parse debug notes JSON: {exc}\n")
-	data = {}
-
-notes = data.get("debug_notes") if isinstance(data, dict) else None
-if isinstance(notes, str):
-	notes_list = [notes]
-elif isinstance(notes, list):
-	notes_list = [str(n) for n in notes]
-else:
-	notes_list = []
-print("\n".join(notes_list))
-PY
-)
-	fi
 
 	# Persist raw response for debugging
 	print -r -- "$response_json" > "$HOME/Library/Logs/automation-scripts/organization/organize-guitar-tabs-last-response.txt"
@@ -724,13 +687,12 @@ PY
 	# Rebuild header with fallbacks and derived flow
 	tab=$(rebuild_formatted_tab "$tab" "$artist" "$title" "$(basename "$absolute_input")")
 
-	if [[ $validate_flag -eq 1 ]]; then
-		log_info "Running validation pass"
-		local validator_payload validator_response validator_fixed validator_tab validator_issues
-		validator_payload=$(build_validator_body "$tab")
-		validator_response=$(get-openai-response "$validator_payload")
+	log_info "Running validation pass"
+	local validator_payload validator_response validator_fixed validator_tab validator_issues
+	validator_payload=$(build_validator_body "$tab")
+	validator_response=$(get-openai-response "$validator_payload")
 
-		validator_tab=$(RAW="$validator_response" python - <<'PY'
+	validator_tab=$(RAW="$validator_response" python - <<'PY'
 import os, json, re, sys
 
 raw = os.environ.get("RAW", "").replace("\r", "")
@@ -785,25 +747,18 @@ PY
 	artist=$(sanitize_component "$artist")
 	title=$(sanitize_component "$title")
 
-	filename="$artist - $title.txt"
+	local filename_base filename target_path debug_target
+	filename_base="$artist - $title"
+	filename="$filename_base.txt"
 	target_path="$OUTPUT_DIR/$filename"
+	debug_target="$input_dir/${filename_base}-debug.txt"
 
-	if [[ $dry_run -eq 1 ]]; then
-		log_info "Dry-run: printing formatted tab"
-		print -r -- "$tab"
-		if [[ $debug_notes_flag -eq 1 && -n "$debug_notes" ]]; then
-			while IFS= read -r line; do
-				log_info "Debug change: $line"
-			done <<< "$debug_notes"
-		fi
+	if [[ $debug_mode -eq 1 ]]; then
+		print -r -- "$tab" > "$debug_target"
+		log_info "Debug mode: wrote formatted tab to $debug_target (original preserved)"
 	else
 		print -r -- "$tab" > "$target_path"
 		log_info "Wrote formatted tab to $target_path"
-		if [[ $debug_notes_flag -eq 1 && -n "$debug_notes" ]]; then
-			while IFS= read -r line; do
-				log_info "Debug change: $line"
-			done <<< "$debug_notes"
-		fi
 		# Remove the working copy so Hazel can clean up the original separately
 		rm -f "$absolute_input"
 	fi
