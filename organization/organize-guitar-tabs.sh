@@ -139,7 +139,9 @@ MIXED SECTIONS (CHORD + LYRIC)
 
 CHORDS-OVER-LYRICS RULES
 - Convert inline chords to separate chord lines above lyrics. Keep chord names
-  (slash, extensions, accidentals). Do not invent chords.
+	(slash, extensions, accidentals). Do not invent chords.
+- Preserve lyric-only lines that intentionally continue the previous chord even
+	if no chord line appears directly above; never drop standalone lyric lines.
 
 INSTRUMENTAL / BAR NOTATION
 - For chord-only measures, use bars with pipes and sensible spacing. Keep
@@ -221,6 +223,8 @@ RULES TO ENFORCE
 - If a section repeats identical content within its own block, collapse to one
   block and repeat its token in Flow (e.g., C1 C1).
 - Chords-over-lyrics only; no inline chords. Bar lines for instrumentals.
+- Preserve lyric-only lines that continue the prior chord even when no chord
+  line is immediately above; do not delete standalone lyric lines.
 - Mixed chord+lyric sections must retain both the bar/chord lines AND the lyric
 	lines beneath; do not convert to instrumental-only.
 - If unlabeled hook/vocal lines immediately follow any section (or its bars),

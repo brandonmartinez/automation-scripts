@@ -10,6 +10,229 @@ CHORD_RE = re.compile(
     r"\b(?P<root>[A-G](?:#|b)?)(?P<qual>maj7|maj|min7|m7|m|min|dim|aug|sus2|sus4|add9|6|7|9|11|13|m6|m9|maj9)?(?:/[A-G](?:#|b)?)?\b"
 )
 
+FLAT_NAMES = ["C", "Db", "D", "Eb", "E", "F", "Gb", "G", "Ab", "A", "Bb", "B"]
+STANDARD_STRINGS = ["E", "A", "D", "G", "B", "E"]
+
+
+def normalize_note_token(token: str) -> Optional[str]:
+    t = token.strip().replace("♭", "b").replace("♯", "#")
+    m = re.match(r"^([A-Ga-g])([b#])?$", t)
+    if not m:
+        return None
+    root = m.group(1).upper()
+    accidental = m.group(2) or ""
+    return root + accidental
+
+
+def note_to_index(note: str) -> Optional[int]:
+    normalized = normalize_note_token(note)
+    if not normalized:
+        return None
+    sharp_map = {
+        "C": 0,
+        "C#": 1,
+        "Db": 1,
+        "D": 2,
+        "D#": 3,
+        "Eb": 3,
+        "E": 4,
+        "F": 5,
+        "F#": 6,
+        "Gb": 6,
+        "G": 7,
+        "G#": 8,
+        "Ab": 8,
+        "A": 9,
+        "A#": 10,
+        "Bb": 10,
+        "B": 11,
+    }
+    return sharp_map.get(normalized)
+
+
+def shift_note(note: str, delta: int) -> str:
+    idx = note_to_index(note)
+    if idx is None:
+        return note
+    new_idx = (idx + delta) % 12
+    return FLAT_NAMES[new_idx]
+
+
+def shift_notes(notes: List[str], delta: int) -> List[str]:
+    return [shift_note(n, delta) for n in notes]
+
+
+def join_notes(notes: List[str]) -> str:
+    return " ".join(notes)
+
+
+def parse_pitch_list(raw: str) -> Optional[List[str]]:
+    tokens = re.split(r"[\s,]+", raw.strip())
+    if len(tokens) < 2:
+        return None
+    parsed: List[str] = []
+    for tok in tokens:
+        n = normalize_note_token(tok)
+        if not n:
+            return None
+        parsed.append(n)
+    return parsed
+
+
+def best_flat_name(note: str) -> str:
+    idx = note_to_index(note)
+    if idx is None:
+        return note
+    return FLAT_NAMES[idx]
+
+
+def compute_drop_tuning(target_low: str) -> List[str]:
+    idx = note_to_index(target_low)
+    if idx is None:
+        return STANDARD_STRINGS
+    base_idx = note_to_index("E")
+    if base_idx is None:
+        return STANDARD_STRINGS
+    low_shift = (idx - base_idx) % 12
+    if low_shift > 6:
+        low_shift -= 12
+    rest_shift = low_shift + 2
+    low_note = best_flat_name(target_low)
+    rest_notes = shift_notes(STANDARD_STRINGS[1:], rest_shift)
+    return [low_note] + rest_notes
+
+
+def compute_standard_shift(target_low: str) -> List[str]:
+    idx = note_to_index(target_low)
+    if idx is None:
+        return STANDARD_STRINGS
+    base_idx = note_to_index("E")
+    if base_idx is None:
+        return STANDARD_STRINGS
+    delta = (idx - base_idx) % 12
+    if delta > 6:
+        delta -= 12
+    return shift_notes(STANDARD_STRINGS, delta)
+
+
+def canonical_tuning(raw: str) -> Tuple[str, Optional[str]]:
+    raw_clean = raw.strip()
+    if not raw_clean or raw_clean.lower() == "standard":
+        return "Standard", None
+
+    norm = re.sub(r"[^a-z0-9#b]+", " ", raw_clean.lower()).strip()
+
+    common_map: List[Dict[str, object]] = [
+        {
+            "aliases": ["half step down", "half-step down", "eb standard", "e flat", "eb tuning"],
+            "label": "Half-Step Down",
+            "pitches": ["Eb", "Ab", "Db", "Gb", "Bb", "Eb"],
+        },
+        {
+            "aliases": ["whole step down", "d standard", "d std", "d tuning"],
+            "label": "D Standard",
+            "pitches": compute_standard_shift("D"),
+        },
+        {
+            "aliases": ["c standard", "c std"],
+            "label": "C Standard",
+            "pitches": compute_standard_shift("C"),
+        },
+        {
+            "aliases": ["b standard", "b std"],
+            "label": "B Standard",
+            "pitches": compute_standard_shift("B"),
+        },
+        {
+            "aliases": ["drop d"],
+            "label": "Drop D",
+            "pitches": compute_drop_tuning("D"),
+        },
+        {
+            "aliases": ["drop c"],
+            "label": "Drop C",
+            "pitches": compute_drop_tuning("C"),
+        },
+        {
+            "aliases": ["drop b"],
+            "label": "Drop B",
+            "pitches": compute_drop_tuning("B"),
+        },
+        {
+            "aliases": ["drop bb", "drop a#"],
+            "label": "Drop Bb",
+            "pitches": compute_drop_tuning("Bb"),
+        },
+        {
+            "aliases": ["drop a"],
+            "label": "Drop A",
+            "pitches": compute_drop_tuning("A"),
+        },
+        {
+            "aliases": ["dadgad"],
+            "label": "DADGAD",
+            "pitches": ["D", "A", "D", "G", "A", "D"],
+        },
+        {
+            "aliases": ["double drop d", "double-drop d"],
+            "label": "Double Drop D",
+            "pitches": ["D", "A", "D", "G", "B", "D"],
+        },
+        {
+            "aliases": ["open d"],
+            "label": "Open D",
+            "pitches": ["D", "A", "D", "F#", "A", "D"],
+        },
+        {
+            "aliases": ["open g"],
+            "label": "Open G",
+            "pitches": ["D", "G", "D", "G", "B", "D"],
+        },
+        {
+            "aliases": ["open c"],
+            "label": "Open C",
+            "pitches": ["C", "G", "C", "G", "C", "E"],
+        },
+        {
+            "aliases": ["open e"],
+            "label": "Open E",
+            "pitches": ["E", "B", "E", "G#", "B", "E"],
+        },
+        {
+            "aliases": ["open a"],
+            "label": "Open A",
+            "pitches": ["E", "A", "E", "A", "C#", "E"],
+        },
+    ]
+
+    for entry in common_map:
+        aliases = entry["aliases"]  # type: ignore[assignment]
+        if any(a in norm for a in aliases):
+            pitches = entry["pitches"]  # type: ignore[assignment]
+            label = entry["label"]  # type: ignore[assignment]
+            return join_notes([best_flat_name(p) for p in pitches]), label
+
+    drop_match = re.match(r"drop\s+([a-g][#b]?)", norm)
+    if drop_match:
+        note = drop_match.group(1)
+        pitches = compute_drop_tuning(note)
+        label = f"Drop {best_flat_name(note)}"
+        return join_notes(pitches), label
+
+    std_match = re.match(r"([a-g][#b]?)\s+standard", norm)
+    if std_match:
+        note = std_match.group(1)
+        pitches = compute_standard_shift(note)
+        label = f"{best_flat_name(note)} Standard"
+        return join_notes(pitches), label
+
+    pitch_list = parse_pitch_list(raw_clean)
+    if pitch_list:
+        canonical = [best_flat_name(p) for p in pitch_list]
+        return join_notes(canonical), raw_clean
+
+    return raw_clean, raw_clean
+
 
 def detect_key(body: str) -> str:
     root_counts: Dict[str, int] = {}
@@ -136,6 +359,9 @@ def rebuild_formatted_tab(tab: str, artist_fb: str, title_fb: str, file_base: st
 
     if not meta["Key"]:
         meta["Key"] = detect_key(body)
+
+    tuning_value, tuning_label = canonical_tuning(meta["Tuning"])
+    meta["Tuning"] = tuning_value
 
     header_re = re.compile(r"^([A-Za-z][A-Za-z0-9 \-'\/]+):\s*$")
 
@@ -304,13 +530,25 @@ def rebuild_formatted_tab(tab: str, artist_fb: str, title_fb: str, file_base: st
         if section_tokens:
             meta["Flow"] = " ".join(section_tokens)
 
+    guitar_tuning_line: Optional[str] = None
+    tuning_value = meta["Tuning"].strip()
+    if tuning_value and tuning_value.lower() != "standard":
+        tuning_label = tuning_label or tuning_value
+        guitar_tuning_line = f"Guitar Tuning: {tuning_label}"
+
     header_lines = [
         title,
         artist,
         *(f"{name}: {meta[name]}" for name in meta_names),
-        "",
-        "",
     ]
+
+    if guitar_tuning_line:
+        header_lines.append(guitar_tuning_line)
+
+    header_lines.extend([
+        "",
+        "",
+    ])
 
     rebuilt = "\n".join(header_lines) + body
     return rebuilt
