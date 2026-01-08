@@ -16,18 +16,14 @@ if [[ "$0" == "${(%):-%N}" ]]; then
     log_info "Initializing OpenAI functions script"
 fi
 
-# Get tokens and keys from 1Password
-***REMOVED***
-OP_KEY_NAME="cli/openai-api"
-API_KEY=$(op read -n "op://$OP_KEY_NAME/credential")
+# Require OPENAI_API_KEY to be set in the environment
+if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    log_error "OPENAI_API_KEY is not set"
+    exit 1
+fi
 
 OPENAI_API_BASE_URL="${OPENAI_API_BASE_URL:-https://api.openai.com/v1}"
 OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.1}"
-
-if [[ -z "$API_KEY" ]]; then
-    log_error "Failed to load OpenAI API key from 1Password item '$OP_KEY_NAME' (credential field)"
-    exit 1
-fi
 
 set +a
 
@@ -95,7 +91,7 @@ get-openai-response() {
 
         RESPONSE=$(curl -sS --max-time 60 -X POST "$endpoint" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $API_KEY" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
             -d @"$req_file")
         curl_status=$?
 
@@ -184,7 +180,7 @@ test-openai-connectivity() {
 
     local http_status
     if ! http_status=$(curl -sS -o "$tmp_response" -w "%{http_code}" \
-        -H "Authorization: Bearer $API_KEY" \
+        -H "Authorization: Bearer $OPENAI_API_KEY" \
         -H "Content-Type: application/json" \
         "$endpoint"); then
         log_error "Failed to reach OpenAI API during connectivity test"
