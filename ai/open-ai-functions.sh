@@ -192,19 +192,25 @@ get-openai-response() {
         fi
     fi
 
-    # Encode content as JSON string to preserve escapes (newlines/tabs)
-    if ! CONTENT=$(printf '%s' "$CONTENT_RAW" | jq -Rs '.'); then
-        CONTENT="$CONTENT_RAW"
+    local content_json
+    if echo "$CONTENT_RAW" | jq -e . >/dev/null 2>&1; then
+        # AI already returned valid JSON (expected for json_schema); normalize to compact form
+        content_json=$(printf '%s' "$CONTENT_RAW" | jq -c .)
+    else
+        # Fall back to JSON-string encoding for plain text responses
+        if ! content_json=$(printf '%s' "$CONTENT_RAW" | jq -Rs '.'); then
+            content_json="$CONTENT_RAW"
+        fi
     fi
 
-    if [[ -z "$CONTENT" || "$CONTENT" == "null" || "$CONTENT" == "empty" ]]; then
+    if [[ -z "$content_json" || "$content_json" == "null" || "$content_json" == "empty" ]]; then
         log_error "No content found in API response after all attempts"
         log_debug "Response structure: $(echo "${CLEANED_RESPONSE:-$RESPONSE}" | jq 'keys' 2>/dev/null || echo "Could not analyze")"
         log_error "Raw response: ${CLEANED_RESPONSE:-$RESPONSE}"
         return 1
     fi
 
-    echo "$CONTENT"
+    echo "$content_json"
 }
 
 test-openai-connectivity() {

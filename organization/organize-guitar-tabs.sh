@@ -65,6 +65,9 @@ OUTPUT FORMAT (JSON ONLY)
 - Return ONLY a single JSON object (no markdown, no code fences, no commentary).
 - JSON must include exactly these keys: "artist", "song_title", "formatted_tab".
 - Do NOT include any other keys (no debug or notes fields).
+- Do NOT wrap the entire object in quotes; the top level must be a JSON object.
+- Output must be valid JSON on a single line. ABSOLUTELY NO literal newlines in
+  any string; every newline in formatted_tab must be escaped as "\\n".
 - "artist": normalized artist name (string).
 - "song_title": normalized song title (string).
 - "formatted_tab": the FULL OnSong text exactly as it should be written to the
@@ -173,6 +176,8 @@ FINAL OUTPUT CHECK
 - Must be valid JSON. formatted_tab must contain: Title, Artist, full metadata
   block (all fields, blanks allowed), blank line, then section blocks. No
   markdown, commentary, links, or citations.
+- If you cannot fully comply, return a valid JSON object with formatted_tab set
+	to an empty string and include the best available artist/song_title values.
 PROMPT
 )
 
@@ -282,6 +287,31 @@ parse_response() {
 		reparsed=$(printf '%s' "$raw" | jq -R -s 'fromjson?') || true
 		if [[ -n "$reparsed" && "$reparsed" != "null" ]]; then
 			sanitized="$reparsed"
+		fi
+	fi
+
+	# Fallback: Python attempt to repair near-valid JSON (e.g., literal newlines in strings)
+	if ! printf '%s' "$sanitized" | jq -e . >/dev/null 2>&1; then
+		python_parsed=$(RAW_JSON="$raw" python - <<'PY'
+import json, os, sys
+raw = os.environ.get("RAW_JSON", "")
+candidates = [raw, raw.replace("\r", ""), raw.replace("\n", "\\n").replace("\r", "")]
+seen = set()
+for candidate in candidates:
+	if candidate in seen:
+		continue
+	seen.add(candidate)
+	try:
+		obj = json.loads(candidate)
+		print(json.dumps(obj))
+		sys.exit(0)
+	except Exception:
+		continue
+sys.exit(1)
+PY
+)
+		if [[ $? -eq 0 && -n "$python_parsed" ]]; then
+			sanitized="$python_parsed"
 		fi
 	fi
 

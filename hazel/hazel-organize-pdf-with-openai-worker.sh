@@ -10,9 +10,21 @@ organizer="$HOME/src/automation-scripts/organization/organize-pdf-with-openai.sh
 
 # Only one worker at a time
 if ! mkdir "$lock" 2>/dev/null; then
-    exit 0
+    if [[ -f "$lock/pid" ]]; then
+        stale_pid=$(<"$lock/pid")
+        if ! kill -0 "$stale_pid" 2>/dev/null; then
+            rmdir "$lock" 2>/dev/null || true
+            mkdir "$lock" 2>/dev/null || exit 0
+        else
+            exit 0
+        fi
+    else
+        rmdir "$lock" 2>/dev/null || true
+        mkdir "$lock" 2>/dev/null || exit 0
+    fi
 fi
-trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+echo "$$" > "$lock/pid"
+trap 'rm -f "$lock/pid" 2>/dev/null; rmdir "$lock" 2>/dev/null || true' EXIT
 
 [[ -f "$queue" ]] || exit 0
 
