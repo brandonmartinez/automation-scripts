@@ -16,8 +16,46 @@ if [[ "$0" == "${(%):-%N}" ]]; then
     log_info "Initializing OpenAI functions script"
 fi
 
-# Require OPENAI_API_KEY to be set in the environment
-if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+ensure_openai_key() {
+    [[ -n "${OPENAI_API_KEY:-}" ]] && return 0
+
+    # Some headless contexts may not have $USER; derive it
+    local user_name="${USER:-}"
+    [[ -z "$user_name" ]] && user_name=$(id -un 2>/dev/null || printf '')
+    [[ -z "$user_name" ]] && user_name=""
+
+    local key_name="${OP_KEY_NAME:-cli/openai-api}"
+
+    # Try op first
+    if command -v op >/dev/null 2>&1; then
+        # Load service token from Keychain if not already present
+        if [[ -z "${OP_SERVICE_ACCOUNT_TOKEN:-}" ]] && command -v security >/dev/null 2>&1 && [[ -n "$user_name" ]]; then
+            if OP_SERVICE_ACCOUNT_TOKEN=$(security find-generic-password -w -a "$user_name" -s "op-service-token-openai-api" 2>/dev/null); then
+                export OP_SERVICE_ACCOUNT_TOKEN
+            fi
+        fi
+
+        if OPENAI_API_KEY=$(op read "op://$key_name/credential" 2>/dev/null); then
+            export OPENAI_API_KEY
+            return 0
+        fi
+        log_warn "op read failed; trying Keychain fallback for OPENAI_API_KEY"
+    else
+        log_warn "op CLI not found; trying Keychain fallback for OPENAI_API_KEY"
+    fi
+
+    # Fallback: macOS Keychain item named openai-api-key (user-scoped)
+    if command -v security >/dev/null 2>&1 && [[ -n "$user_name" ]]; then
+        if OPENAI_API_KEY=$(security find-generic-password -w -a "$user_name" -s "openai-api-key" 2>/dev/null); then
+            export OPENAI_API_KEY
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+if ! ensure_openai_key; then
     log_error "OPENAI_API_KEY is not set"
     exit 1
 fi
