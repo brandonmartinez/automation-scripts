@@ -1,0 +1,22 @@
+{
+  "universe_usage_history": [
+    {
+      "universe": "The Matrix",
+      "assignment_id": "automation-scripts-init-2026-07-06",
+      "used_at": "2026-07-06T16:26:54-04:00"
+    }
+  ],
+  "assignment_cast_snapshots": {
+    "automation-scripts-init-2026-07-06": {
+      "universe": "The Matrix",
+      "agents": {
+        "lead": "Morpheus",
+        "shell-engineer": "Trinity",
+        "orchestration-engineer": "Tank",
+        "media-engineer": "Dozer",
+        "ai-engineer": "Mouse"
+      },
+      "created_at": "2026-07-06T16:26:54-04:00"
+    }
+  }
+}
