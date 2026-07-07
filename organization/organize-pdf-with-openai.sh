@@ -61,6 +61,18 @@ unset _structure_cache_ttl
 readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/organize-pdf-with-openai"
 readonly AGENTIC_TEXT_SAMPLE_LIMIT=8000
 
+# Canonical sender aliases: map known legal-entity names and variants to the
+# preferred brand name used for filing, so the same organization does not get
+# split across multiple folders. Keys are matched case-insensitively after
+# trimming surrounding whitespace and trailing punctuation. Extend as new
+# aliases are discovered.
+typeset -gA SENDER_ALIASES=(
+    "fca us llc"  "Jeep"
+    "fca us"      "Jeep"
+    "stellantis"  "Jeep"
+    "chrysler"    "Jeep"
+)
+
 # Documents below this confidence (0-1) are routed to the manual review lane
 # instead of being auto-filed into the taxonomy.
 readonly REVIEW_CONFIDENCE_THRESHOLD="${OPENAI_CONFIDENCE_THRESHOLD:-0.7}"
@@ -773,11 +785,11 @@ generate_concise_description() {
     text=$(printf '%s' "$text" | sed -e 's/  */ /g' -e 's/^ //; s/ $//')
 
     if (( ${#text} > limit )); then
-        local truncated="${text:0:limit}"
-        if [[ "${text:limit:1}" != "" && "${text:limit:1}" != " " ]]; then
+        local truncated="${text:0:$limit}"
+        if [[ "${text:$limit:1}" != "" && "${text:$limit:1}" != " " ]]; then
             truncated="${truncated% *}"
         fi
-        [[ -z "$truncated" ]] && truncated="${text:0:limit}"
+        [[ -z "$truncated" ]] && truncated="${text:0:$limit}"
         text="${truncated}..."
     fi
 
@@ -987,11 +999,11 @@ generate_file_name_description() {
     [[ -z "$text" ]] && text="Document"
 
     if (( ${#text} > limit )); then
-        local truncated="${text:0:limit}"
-        if [[ "${text:limit:1}" != "" && "${text:limit:1}" != " " ]]; then
+        local truncated="${text:0:$limit}"
+        if [[ "${text:$limit:1}" != "" && "${text:$limit:1}" != " " ]]; then
             truncated="${truncated% *}"
         fi
-        [[ -z "$truncated" ]] && truncated="${text:0:limit}"
+        [[ -z "$truncated" ]] && truncated="${text:0:$limit}"
         text="$truncated"
     fi
 
@@ -1174,6 +1186,11 @@ TAXONOMY REUSE (most important):
 - context.folderStructure lists the folders that already exist. When the document matches an existing category or sender, reuse that EXACT name (same spelling, spacing, and casing). Do not invent a near-duplicate (e.g. do not create 'Fifth Third' when 'Fifth Third Bank' already exists).
 - Only propose a NEW category or sender when nothing in the taxonomy reasonably fits.
 
+SENDER IDENTITY:
+- The sender is the ORGANIZATION OR ENTITY THAT ISSUED the document (the company, agency, institution, or person named on the document itself). It is NOT a folder name, a category, a document type, or a mailing/postal address.
+- Never return a grouping label (e.g. 'Student Loan', 'Cars', 'Checks', 'Manuals') or a street address (e.g. '1101 Monona Dr') as the sender. If the nearest label is a folder or an address, identify the actual issuer from the document text instead.
+- Prefer the widely recognized brand name over a parent or legal entity when they denote the same organization (e.g. use the consumer brand a manufacturer sells under, not its holding-company legal name). Always reuse an existing taxonomy sender verbatim when one matches.
+
 FIELD FORMAT (these become folder and file names — follow strictly):
 - category, sender, and department must each be a SINGLE plain folder name. Never include a slash (/ or \\), a '>' character, a colon, or any path fragment. Never return an absolute path or repeat parent folders inside a child field.
 - The hierarchy is at most Category / Sender / optional Department. Do not encode more than one level into a single field.
@@ -1285,6 +1302,28 @@ validate_ai_response() {
     fi
 }
 
+# Map a model-returned sender to its canonical brand name via SENDER_ALIASES.
+# Matching is case-insensitive and ignores surrounding whitespace and trailing
+# punctuation. Unknown senders pass through unchanged.
+normalize_sender() {
+    emulate -L zsh
+    setopt extendedglob
+    local raw="$1"
+    [[ -z "$raw" || "$raw" == "null" ]] && { print -r -- "$raw"; return 0; }
+    local key="${(L)raw}"
+    # trim leading/trailing whitespace
+    key="${key##[[:space:]]##}"
+    key="${key%%[[:space:]]##}"
+    # drop trailing punctuation (periods/commas)
+    key="${key%%[.,]##}"
+    if [[ -n "${SENDER_ALIASES[$key]:-}" ]]; then
+        log_debug "Canonicalized sender '$raw' -> '${SENDER_ALIASES[$key]}'"
+        print -r -- "${SENDER_ALIASES[$key]}"
+    else
+        print -r -- "$raw"
+    fi
+}
+
 extract_categorization_data() {
     local response="$1"
 
@@ -1293,6 +1332,7 @@ extract_categorization_data() {
     # Extract categorization data
     local sender department additional_context sent_on category short_summary organizer_description
     sender=$(echo "$response" | jq -r '.categorization.sender')
+    sender=$(normalize_sender "$sender")
     department=$(echo "$response" | jq -r '.categorization.department')
     additional_context=$(echo "$response" | jq -r '.categorization.additionalContext')
     sent_on=$(echo "$response" | jq -r '.categorization.sentOn' | tr '/: ' '-')
@@ -1390,6 +1430,12 @@ apply_ai_suggestions() {
     fi
 
     check_confidence_level "$confidence"
+
+    # Canonicalize the sender one final time: apply_ai_suggestions may have
+    # overwritten SENDER from existingFolderMatch or suggestedSender (raw model
+    # values), so re-run the alias map here as the single choke point before the
+    # plan is recorded.
+    SENDER=$(normalize_sender "$SENDER")
 
     log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, ADDITIONAL_CONTEXT: $ADDITIONAL_CONTEXT, ORGANIZER_DESCRIPTION: $ORGANIZER_DESCRIPTION, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
 }
@@ -1564,28 +1610,31 @@ generate_unique_filename() {
     local descriptor="$sender_sanitized"
     descriptor+="$department_sanitized"
     descriptor+="$descriptor_sanitized"
+    # Defensive: strip a leading separator if the sender component was empty.
+    descriptor="${descriptor# - }"
     [[ -z "$descriptor" ]] && descriptor="Document"
 
-    local base_filename="${date_component}-${descriptor}.pdf"
+    local base_filename="${date_component} - ${descriptor}.pdf"
 
     if [[ ${#base_filename} -gt $max_filename_length ]]; then
         log_warn "Filename too long (${#base_filename} chars), tightening components"
 
         if [[ -n "$descriptor_sanitized" ]]; then
             descriptor="$sender_sanitized$department_sanitized"
-            base_filename="${date_component}-${descriptor}.pdf"
+            descriptor="${descriptor# - }"
+            base_filename="${date_component} - ${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length && -n "$department_sanitized" ]]; then
             descriptor="$sender_sanitized"
-            base_filename="${date_component}-${descriptor}.pdf"
+            base_filename="${date_component} - ${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length && -n "$sender_sanitized" ]]; then
-            local available_length=$((max_filename_length - ${#date_component} - 1 - 4))
+            local available_length=$((max_filename_length - ${#date_component} - 3 - 4))
             descriptor="${sender_sanitized:0:$available_length}"
             [[ -z "$descriptor" ]] && descriptor="Doc"
-            base_filename="${date_component}-${descriptor}.pdf"
+            base_filename="${date_component} - ${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length ]]; then
@@ -1666,7 +1715,7 @@ prepare_initial_data() {
     fi
     local state_sample="$PDF_TEXT"
     if (( ${#state_sample} > AGENTIC_TEXT_SAMPLE_LIMIT )); then
-        state_sample="${state_sample:0:AGENTIC_TEXT_SAMPLE_LIMIT} ... [STATE_TRUNCATED]"
+        state_sample="${state_sample:0:$AGENTIC_TEXT_SAMPLE_LIMIT} ... [STATE_TRUNCATED]"
     fi
     record_discovery_snapshot "$state_sample" "${#PDF_TEXT}" "$state_structure" "$SCANNED_AT" "$filename_date_candidates"
     record_phase_note "discovery" "Indexed ${#PDF_TEXT} chars of text and captured folder snapshot"
@@ -1772,13 +1821,13 @@ organize_and_move_file() {
     file_descriptor_sanitized=$(sanitize-text "$descriptor_source")
 
     if [[ -n "$department_sanitized" && "$department_sanitized" != "null" ]]; then
-        department_sanitized="-${department_sanitized}"
+        department_sanitized=" - ${department_sanitized}"
     else
         department_sanitized=""
     fi
 
     if [[ -n "$file_descriptor_sanitized" && "$file_descriptor_sanitized" != "null" ]]; then
-        file_descriptor_sanitized="-${file_descriptor_sanitized}"
+        file_descriptor_sanitized=" - ${file_descriptor_sanitized}"
     else
         file_descriptor_sanitized=""
     fi
