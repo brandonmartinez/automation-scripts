@@ -773,11 +773,11 @@ generate_concise_description() {
     text=$(printf '%s' "$text" | sed -e 's/  */ /g' -e 's/^ //; s/ $//')
 
     if (( ${#text} > limit )); then
-        local truncated="${text:0:limit}"
-        if [[ "${text:limit:1}" != "" && "${text:limit:1}" != " " ]]; then
+        local truncated="${text:0:$limit}"
+        if [[ "${text:$limit:1}" != "" && "${text:$limit:1}" != " " ]]; then
             truncated="${truncated% *}"
         fi
-        [[ -z "$truncated" ]] && truncated="${text:0:limit}"
+        [[ -z "$truncated" ]] && truncated="${text:0:$limit}"
         text="${truncated}..."
     fi
 
@@ -987,11 +987,11 @@ generate_file_name_description() {
     [[ -z "$text" ]] && text="Document"
 
     if (( ${#text} > limit )); then
-        local truncated="${text:0:limit}"
-        if [[ "${text:limit:1}" != "" && "${text:limit:1}" != " " ]]; then
+        local truncated="${text:0:$limit}"
+        if [[ "${text:$limit:1}" != "" && "${text:$limit:1}" != " " ]]; then
             truncated="${truncated% *}"
         fi
-        [[ -z "$truncated" ]] && truncated="${text:0:limit}"
+        [[ -z "$truncated" ]] && truncated="${text:0:$limit}"
         text="$truncated"
     fi
 
@@ -1564,28 +1564,31 @@ generate_unique_filename() {
     local descriptor="$sender_sanitized"
     descriptor+="$department_sanitized"
     descriptor+="$descriptor_sanitized"
+    # Defensive: strip a leading separator if the sender component was empty.
+    descriptor="${descriptor# - }"
     [[ -z "$descriptor" ]] && descriptor="Document"
 
-    local base_filename="${date_component}-${descriptor}.pdf"
+    local base_filename="${date_component} - ${descriptor}.pdf"
 
     if [[ ${#base_filename} -gt $max_filename_length ]]; then
         log_warn "Filename too long (${#base_filename} chars), tightening components"
 
         if [[ -n "$descriptor_sanitized" ]]; then
             descriptor="$sender_sanitized$department_sanitized"
-            base_filename="${date_component}-${descriptor}.pdf"
+            descriptor="${descriptor# - }"
+            base_filename="${date_component} - ${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length && -n "$department_sanitized" ]]; then
             descriptor="$sender_sanitized"
-            base_filename="${date_component}-${descriptor}.pdf"
+            base_filename="${date_component} - ${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length && -n "$sender_sanitized" ]]; then
-            local available_length=$((max_filename_length - ${#date_component} - 1 - 4))
+            local available_length=$((max_filename_length - ${#date_component} - 3 - 4))
             descriptor="${sender_sanitized:0:$available_length}"
             [[ -z "$descriptor" ]] && descriptor="Doc"
-            base_filename="${date_component}-${descriptor}.pdf"
+            base_filename="${date_component} - ${descriptor}.pdf"
         fi
 
         if [[ ${#base_filename} -gt $max_filename_length ]]; then
@@ -1666,7 +1669,7 @@ prepare_initial_data() {
     fi
     local state_sample="$PDF_TEXT"
     if (( ${#state_sample} > AGENTIC_TEXT_SAMPLE_LIMIT )); then
-        state_sample="${state_sample:0:AGENTIC_TEXT_SAMPLE_LIMIT} ... [STATE_TRUNCATED]"
+        state_sample="${state_sample:0:$AGENTIC_TEXT_SAMPLE_LIMIT} ... [STATE_TRUNCATED]"
     fi
     record_discovery_snapshot "$state_sample" "${#PDF_TEXT}" "$state_structure" "$SCANNED_AT" "$filename_date_candidates"
     record_phase_note "discovery" "Indexed ${#PDF_TEXT} chars of text and captured folder snapshot"
@@ -1772,13 +1775,13 @@ organize_and_move_file() {
     file_descriptor_sanitized=$(sanitize-text "$descriptor_source")
 
     if [[ -n "$department_sanitized" && "$department_sanitized" != "null" ]]; then
-        department_sanitized="-${department_sanitized}"
+        department_sanitized=" - ${department_sanitized}"
     else
         department_sanitized=""
     fi
 
     if [[ -n "$file_descriptor_sanitized" && "$file_descriptor_sanitized" != "null" ]]; then
-        file_descriptor_sanitized="-${file_descriptor_sanitized}"
+        file_descriptor_sanitized=" - ${file_descriptor_sanitized}"
     else
         file_descriptor_sanitized=""
     fi
