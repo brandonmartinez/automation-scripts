@@ -220,7 +220,10 @@ analyze_one() {
     } >>"$ENGINE_LOG" 2>&1 || true
 
     rm -f "$work" 2>/dev/null || true
-    [[ -s "$state" ]] && echo "$state" || echo ""
+    # NOTE: Must NOT be called via $(...) — that runs in a subshell and would
+    # discard the NEEDS_OCR/OCR_STATUS/STATE_PATH globals set above. Callers
+    # invoke analyze_one as a plain statement and read STATE_PATH afterward.
+    if [[ -s "$state" ]]; then STATE_PATH="$state"; else STATE_PATH=""; fi
 }
 
 # Build one report row (JSON) from a state file + original path facts.
@@ -354,8 +357,9 @@ while IFS= read -r orig; do
     processed=$((processed + 1))
     log_info "[$processed] $rel"
 
-    NEEDS_OCR="no"; OCR_STATUS="skipped"
-    state=$(analyze_one "$orig")
+    NEEDS_OCR="no"; OCR_STATUS="skipped"; STATE_PATH=""
+    analyze_one "$orig"
+    state="$STATE_PATH"
     emit_row "$orig" "$state" "$NEEDS_OCR" "$OCR_STATUS"
     [[ -n "$state" ]] && rm -f "$state" 2>/dev/null || true
 
