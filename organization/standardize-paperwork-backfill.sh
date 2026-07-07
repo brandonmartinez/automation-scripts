@@ -49,8 +49,10 @@ readonly BACKFILL_BASE_DIR="${PAPERWORK_BACKFILL_DIR:-$PAPERWORK_DIR/_Backfill}"
 # Folders (relative to PAPERWORK_DIR) excluded from the backfill entirely.
 # - underscore-prefixed working dirs (_Needs Review, _Backfill, ...)
 # - Cornerstone Baptist Church worship media (not paperwork; relocated elsewhere)
+# - Radiant Church song charts / SongSelect sheet music (not paperwork)
 readonly -a EXCLUDE_REL_PATHS=(
     "Organizations/Cornerstone Baptist Church"
+    "Organizations/Radiant Church/Song Charts"
 )
 
 LIMIT=0                    # 0 = no limit
