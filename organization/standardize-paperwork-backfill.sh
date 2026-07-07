@@ -58,9 +58,19 @@ readonly -a EXCLUDE_REL_PATHS=(
 LIMIT=0                    # 0 = no limit
 CATEGORY_FILTER=""         # restrict to a single top-level category
 FORCE=0                    # reprocess files already in the ledger
-APPLY=0                    # Pass 2 (guarded, not yet implemented)
+APPLY=0                    # Pass 2 apply mode
 RESUME_DIR=""              # reuse an existing run directory (append + resume)
 BATCH_PAUSE="${BACKFILL_BATCH_PAUSE:-0}"  # seconds to sleep between files
+
+# ---- Pass 2 (apply) configuration ----
+BACKUP_DEST=""             # tarball backup destination (D1); required to mutate
+SKIP_BACKUP=0              # bypass the backup gate (advanced / repeat runs)
+ASSUME_YES=0              # actually mutate; without it apply is a dry-run plan
+UNDO_MODE=0                # reverse a prior apply run (uses --resume dir)
+RELOCATE_MODE=0            # one-time relocation of excluded worship media (D4)
+OCR_MAX_MB="${BACKFILL_OCR_MAX_MB:-25}"          # skip OCR at/above this size (D2)
+CONFIDENCE_MIN="${BACKFILL_CONFIDENCE_MIN:-0.75}" # below this -> review lane (D5)
+RELOCATE_DEST="${BACKFILL_RELOCATE_DEST:-$HOME/Documents/OnSong/SongSelect}" # (D4)
 
 usage() {
     cat >&2 <<'EOF'
@@ -76,7 +86,18 @@ Options:
   --force              Reprocess files even if present in the ledger
   --paperwork-dir <p>  Override archive root (default: ~/Documents/Paperwork)
   --pause <seconds>    Sleep between files (gentle throttling). Default: 0
-  --apply              Pass 2 apply mode (NOT YET IMPLEMENTED - guarded)
+
+Pass 2 (apply) options:
+  --apply              Apply an approved report. REQUIRES --resume <run_dir>.
+                       Without --yes this is a dry-run that only prints the plan.
+  --yes                Actually mutate the filesystem (OCR/move/rename/tag).
+  --backup-dest <p>    Tar the whole archive here before mutating (D1). Required
+                       to mutate unless --skip-backup or a marker already exists.
+  --skip-backup        Bypass the backup gate (advanced / repeat runs).
+  --ocr-max-mb <N>     Skip OCR for files at/above this size in MB. Default: 25
+  --confidence-min <f> Route rows below this confidence to review. Default: 0.75
+  --undo               Reverse a prior apply run. REQUIRES --resume <run_dir>.
+  --relocate-excluded  One-time move of excluded worship media out of Paperwork.
   --help, -h           Show this help
 EOF
 }
@@ -103,17 +124,30 @@ while [[ $# -gt 0 ]]; do
             BATCH_PAUSE="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --apply) APPLY=1; shift ;;
+        --yes) ASSUME_YES=1; shift ;;
+        --skip-backup) SKIP_BACKUP=1; shift ;;
+        --undo) UNDO_MODE=1; shift ;;
+        --relocate-excluded) RELOCATE_MODE=1; shift ;;
+        --backup-dest)
+            [[ $# -ge 2 ]] || { echo "Error: --backup-dest requires a path" >&2; exit 1; }
+            BACKUP_DEST="$2"; shift 2 ;;
+        --ocr-max-mb)
+            [[ $# -ge 2 ]] || { echo "Error: --ocr-max-mb requires a value" >&2; exit 1; }
+            OCR_MAX_MB="$2"; shift 2 ;;
+        --confidence-min)
+            [[ $# -ge 2 ]] || { echo "Error: --confidence-min requires a value" >&2; exit 1; }
+            CONFIDENCE_MIN="$2"; shift 2 ;;
         --help | -h) usage; exit 0 ;;
         *) echo "Error: unknown argument '$1'" >&2; usage; exit 1 ;;
     esac
 done
 
 [[ "$LIMIT" == <-> ]] || { echo "Error: --limit must be an integer" >&2; exit 1; }
+[[ "$OCR_MAX_MB" == <-> ]] || { echo "Error: --ocr-max-mb must be an integer" >&2; exit 1; }
 
-if [[ $APPLY -eq 1 ]]; then
-    log_error "Pass 2 (--apply) is not yet implemented."
-    log_error "This tool currently runs report-only Pass 1. Review the report first."
-    exit 2
+if [[ ( $APPLY -eq 1 || $UNDO_MODE -eq 1 ) && -z "$RESUME_DIR" ]]; then
+    echo "Error: --apply and --undo require --resume <run_dir> containing report.jsonl" >&2
+    exit 1
 fi
 
 # --paperwork-dir override (PAPERWORK_DIR is readonly above; use a resolved var)
@@ -148,6 +182,15 @@ readonly REPORT_CSV="$RUN_DIR/report.csv"
 readonly LEDGER="$RUN_DIR/ledger.jsonl"
 readonly ENGINE_LOG="$RUN_DIR/engine.log"
 readonly TMP_ROOT="$RUN_DIR/tmp"
+# ---- Pass 2 (apply) artifacts, all under the same run dir ----
+readonly APPLY_LOG="$RUN_DIR/apply.log"
+readonly APPLY_LEDGER="$RUN_DIR/apply-ledger.jsonl"
+readonly UNDO_LOG="$RUN_DIR/undo.jsonl"
+readonly APPLY_REPORT_JSONL="$RUN_DIR/applied-report.jsonl"
+readonly APPLY_REPORT_CSV="$RUN_DIR/applied-report.csv"
+readonly BACKUP_MARKER="$RUN_DIR/.backup.json"
+readonly DUP_INDEX="$RUN_DIR/dup-index.tsv"
+readonly OCR_ORIG_DIR="$RUN_DIR/ocr-originals"
 mkdir -p "$TMP_ROOT"
 : >>"$REPORT_JSONL"
 : >>"$LEDGER"
@@ -320,6 +363,520 @@ write_csv() {
             "$REPORT_JSONL"
     } >"$REPORT_CSV"
 }
+
+# ============================================================================
+# Pass 2 (apply) — turn an approved report into real filesystem changes.
+# All mutations are gated behind --yes; without it every step is a printed plan.
+# ============================================================================
+
+# Normalize a folder/sender name for fuzzy comparison: lowercase, strip
+# everything but [a-z0-9].
+_norm_name() {
+    local s="${1:l}"
+    print -r -- "${s//[^a-z0-9]/}"
+}
+
+# True (0) if confidence ($1) is a number strictly below threshold ($2).
+conf_below() {
+    local c="$1" t="$2"
+    [[ -n "$c" ]] || return 1
+    awk -v a="$c" -v b="$t" 'BEGIN { exit (a+0 < b+0) ? 0 : 1 }'
+}
+
+# SHA-256 of a PDF's extracted text (content identity for dup detection).
+text_sha() {
+    local pdf="$1"
+    pdftotext "$pdf" - 2>/dev/null | tr -d '[:space:]' | shasum -a 256 | awk '{print $1}'
+}
+
+apply_ledger_has() {
+    grep -qF "\"old_path\":\"$1\"" "$APPLY_LEDGER" 2>/dev/null
+}
+
+apply_ledger_add() {
+    jq -cn --arg old_path "$1" --arg result "$2" --arg detail "${3:-}" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{old_path:$old_path, result:$result, detail:$detail, at:$at}' >>"$APPLY_LEDGER"
+}
+
+# Append an applied-report row (one per processed file).
+apply_report_add() {
+    jq -cn --arg old_path "$1" --arg new_path "$2" --arg result "$3" \
+        --arg ocr "$4" --arg dup_of "$5" \
+        '{old_path:$old_path, new_path:$new_path, result:$result, ocr:$ocr, dup_of:$dup_of}' \
+        >>"$APPLY_REPORT_JSONL"
+}
+
+# Record a reversible operation (moves, ocr backups) for --undo.
+undo_add() {
+    jq -cn --arg old_path "$1" --arg new_path "$2" --arg ocr_backup "${3:-}" \
+        '{old_path:$old_path, new_path:$new_path, ocr_backup:$ocr_backup}' >>"$UNDO_LOG"
+}
+
+# Finder comment (kMDItemFinderComment) via Finder scripting. Guarded with a
+# timeout: setting Finder comments needs Automation (TCC) permission, which is
+# granted in the user's normal/Hazel environment but may hang elsewhere. On
+# timeout we warn and continue rather than stalling the whole run.
+set_finder_comment() {
+    local file_path="$1" comment="$2"
+    [[ -n "$comment" ]] || return 0
+    local -a runner
+    if command -v timeout &>/dev/null; then
+        runner=(timeout 20 osascript)
+    else
+        runner=(osascript)
+    fi
+    "${runner[@]}" -e 'on run {f, c}' \
+        -e 'tell app "Finder" to set comment of (POSIX file f as alias) to c' \
+        -e end "$file_path" "$comment" >>"$APPLY_LOG" 2>&1 \
+        || log_warn "    finder comment skipped (timeout/permission): ${file_path:t}"
+}
+
+# Finder tags (_kMDItemUserTags) via the `tag` CLI.
+add_finder_tags() {
+    local file_path="$1"; shift
+    local -a tags; tags=()
+    local t
+    for t in "$@"; do
+        [[ -n "$t" ]] && tags+=("$t")
+    done
+    [[ ${#tags} -gt 0 ]] || return 0
+    tag --add "${(j:,:)tags}" "$file_path" >>"$APPLY_LOG" 2>&1 \
+        || log_warn "    tag failed: ${file_path:t}"
+}
+
+# D2: should this file skip OCR (manual / guide / oversized reference)?
+should_skip_ocr() {
+    local orig="$1" category="$2" doc_type="$3"
+    [[ "$category" == "Manuals" ]] && return 0
+    local dt="${doc_type:l}"
+    [[ "$dt" == *manual* || "$dt" == *guide* || "$dt" == *handbook* ]] && return 0
+    local bytes mb
+    bytes=$(wc -c < "$orig" 2>/dev/null | tr -d ' ' || echo 0)
+    [[ "$bytes" == <-> ]] || bytes=0
+    mb=$(( bytes / 1024 / 1024 ))
+    [[ $mb -ge $OCR_MAX_MB ]] && return 0
+    return 1
+}
+
+# OCR a file in place (--skip-text), keeping a pre-OCR copy under ocr-originals/.
+# On success sets LAST_OCR_BACKUP to the backup path; returns non-zero on failure.
+LAST_OCR_BACKUP=""
+ocr_in_place() {
+    local orig="$1"
+    LAST_OCR_BACKUP=""
+    local rel="${orig#$PAPERWORK_ROOT/}"
+    local backup="$OCR_ORIG_DIR/$rel"
+    mkdir -p "${backup:h}"
+    cp "$orig" "$backup"
+    local tmp="$TMP_ROOT/ocr-$$-$RANDOM.pdf"
+    if ocrmypdf --skip-text -l eng --output-type pdf --rotate-pages \
+        "$orig" "$tmp" >>"$APPLY_LOG" 2>&1; then
+        mv "$tmp" "$orig"
+        touch -r "$backup" "$orig" 2>/dev/null || true
+        LAST_OCR_BACKUP="$backup"
+        return 0
+    fi
+    rm -f "$tmp" 2>/dev/null || true
+    rm -f "$backup" 2>/dev/null || true
+    return 1
+}
+
+# D3: given a category dir and proposed sender name, return an existing sibling
+# folder whose name closely matches (exact, or one is a prefix of the other on
+# the normalized form). Empty if no close match.
+resolve_existing_sender() {
+    local category_dir="$1" proposed="$2"
+    [[ -d "$category_dir" && -n "$proposed" ]] || { print -r -- ""; return; }
+    local norm_prop; norm_prop="$(_norm_name "$proposed")"
+    [[ ${#norm_prop} -ge 3 ]] || { print -r -- ""; return; }
+    local d name norm
+    for d in "$category_dir"/*(/N); do
+        name="${d:t}"
+        [[ "$name" == "$proposed" ]] && { print -r -- ""; return; }  # already canonical
+        norm="$(_norm_name "$name")"
+        [[ ${#norm} -ge 3 ]] || continue
+        if [[ "$norm" == "$norm_prop" \
+           || "$norm" == "$norm_prop"* \
+           || "$norm_prop" == "$norm"* ]]; then
+            print -r -- "$name"; return
+        fi
+    done
+    print -r -- ""
+}
+
+# Move src -> dest with collision handling. Echoes the final destination path,
+# or "DUP" when an identical file already exists at dest.
+safe_move() {
+    local src="$1" dest="$2"
+    mkdir -p "${dest:h}"
+    if [[ -e "$dest" ]]; then
+        if cmp -s "$src" "$dest"; then
+            print -r -- "DUP"; return
+        fi
+        local base="${dest:r}" ext="${dest:e}" n=2 cand
+        while :; do
+            cand="$base ($n).$ext"
+            [[ -e "$cand" ]] || break
+            n=$((n + 1))
+        done
+        dest="$cand"
+    fi
+    mv "$src" "$dest"
+    print -r -- "$dest"
+}
+
+# Quarantine a duplicate file into _Duplicates/, preserving its name.
+quarantine_dup() {
+    local src="$1"
+    local qdir="$PAPERWORK_ROOT/_Duplicates"
+    local dest; dest="$(safe_move "$src" "$qdir/${src:t}")"
+    print -r -- "$dest"
+}
+
+# ----------------------------------------------------------------------------
+# Backup gate (D1): tar the archive to --backup-dest, write a marker.
+# ----------------------------------------------------------------------------
+do_backup() {
+    local dest="$1"
+    mkdir -p "$dest" || { log_error "Cannot create backup dest: $dest"; return 1; }
+    local stamp; stamp="$(date +%Y%m%d-%H%M%S)"
+    local tarball="$dest/paperwork-backup-$stamp.tar.gz"
+    local parent="${PAPERWORK_ROOT:h}" leaf="${PAPERWORK_ROOT:t}"
+    log_info "Backing up archive -> $tarball (this can take several minutes)..."
+    if tar -czf "$tarball" --exclude="$leaf/_Backfill" -C "$parent" "$leaf"; then
+        local sz; sz=$(wc -c < "$tarball" 2>/dev/null | tr -d ' ' || echo 0)
+        [[ "$sz" == <-> ]] || sz=0
+        jq -cn --arg tarball "$tarball" --arg archive "$PAPERWORK_ROOT" \
+            --argjson bytes "${sz:-0}" --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            '{tarball:$tarball, archive:$archive, bytes:$bytes, at:$at}' >"$BACKUP_MARKER"
+        log_info "Backup complete ($(( ${sz:-0} / 1024 / 1024 )) MB). Marker written."
+        return 0
+    fi
+    log_error "Backup failed; refusing to mutate."
+    return 1
+}
+
+# Enforce the backup gate before any mutation.
+ensure_backup() {
+    [[ -f "$BACKUP_MARKER" ]] && { log_info "Backup marker present; continuing."; return 0; }
+    if [[ $SKIP_BACKUP -eq 1 ]]; then
+        log_warn "--skip-backup set: proceeding WITHOUT a backup. You are on your own."
+        return 0
+    fi
+    if [[ -n "$BACKUP_DEST" ]]; then
+        do_backup "$BACKUP_DEST"; return $?
+    fi
+    log_error "No backup marker and no --backup-dest given."
+    log_error "Provide --backup-dest <path> (recommended) or --skip-backup to proceed."
+    return 1
+}
+
+# ----------------------------------------------------------------------------
+# run_apply — Pass 2 main
+# ----------------------------------------------------------------------------
+run_apply() {
+    : >>"$APPLY_LOG"; : >>"$APPLY_LEDGER"; : >>"$UNDO_LOG"
+    : >"$APPLY_REPORT_JSONL"
+
+    if [[ ! -s "$REPORT_JSONL" ]]; then
+        log_error "No report.jsonl (or empty) in run dir: $RUN_DIR"
+        return 1
+    fi
+
+    local total; total=$(grep -c '' "$REPORT_JSONL" 2>/dev/null || echo 0)
+    log_header "Paperwork standardization backfill - Pass 2 (apply)"
+    log_info "Archive:    $PAPERWORK_ROOT"
+    log_info "Run dir:    $RUN_DIR"
+    log_info "Report:     $REPORT_JSONL ($total rows)"
+    log_info "OCR skip:   >= ${OCR_MAX_MB} MB or manual/guide/handbook"
+    log_info "Review min: confidence < ${CONFIDENCE_MIN}"
+    if [[ $ASSUME_YES -eq 1 ]]; then
+        log_warn "MUTATE mode: filesystem WILL be changed."
+        ensure_backup || return 1
+    else
+        log_info "DRY-RUN: printing the plan only. Re-run with --yes to apply."
+    fi
+
+    local applied=0 moved=0 renamed=0 ocrd=0 reviewed=0 dups=0 skipped=0 errs=0
+
+    local old_path prop_loc prop_name action category sender department \
+          date doc_type confidence needs_ocr review_lane summary
+    while IFS=$'\x1f' read -r old_path prop_loc prop_name action category sender \
+        department date doc_type confidence needs_ocr review_lane summary; do
+        [[ -n "$old_path" ]] || continue
+
+        if [[ $ASSUME_YES -eq 1 ]] && apply_ledger_has "$old_path"; then
+            skipped=$((skipped + 1)); continue
+        fi
+
+        local rel="${old_path#$PAPERWORK_ROOT/}"
+
+        # Re-validate the source still exists.
+        if [[ ! -f "$old_path" ]]; then
+            log_warn "[missing] $rel — skipping (not found)"
+            [[ $ASSUME_YES -eq 1 ]] && apply_ledger_add "$old_path" "missing"
+            skipped=$((skipped + 1)); continue
+        fi
+
+        # Excluded subtrees (worship media, working dirs) are handled by
+        # --relocate-excluded, never by the standard apply.
+        if is_excluded "$rel"; then
+            log_info "[excluded] $rel — skipping (see --relocate-excluded)"
+            [[ $ASSUME_YES -eq 1 ]] && apply_ledger_add "$old_path" "excluded"
+            skipped=$((skipped + 1)); continue
+        fi
+
+        # Hard errors from Pass 1 (no plan): never touch.
+        if [[ "$action" == "error" ]]; then
+            log_warn "[error-row] $rel — skipping (Pass 1 produced no plan)"
+            [[ $ASSUME_YES -eq 1 ]] && apply_ledger_add "$old_path" "error"
+            errs=$((errs + 1)); continue
+        fi
+
+        # ---- Review lane (D5): move to _Needs Review/ + tag + comment ----
+        local is_review=0
+        if [[ "$review_lane" == "yes" || "$action" == "review" ]] \
+            || conf_below "$confidence" "$CONFIDENCE_MIN"; then
+            is_review=1
+        fi
+
+        if [[ $is_review -eq 1 ]]; then
+            local rname="${prop_name:-${old_path:t}}"
+            local rdest="$PAPERWORK_ROOT/_Needs Review/$rname"
+            log_info "[review] $rel"
+            log_info "         -> _Needs Review/$rname  (+tag 'Needs Review')"
+            if [[ $ASSUME_YES -eq 1 ]]; then
+                local final=""; final="$(safe_move "$old_path" "$rdest")"
+                if [[ "$final" == "DUP" ]]; then
+                    final="$(quarantine_dup "$old_path")"
+                    apply_report_add "$old_path" "$final" "dup" "" ""
+                    apply_ledger_add "$old_path" "dup"
+                    dups=$((dups + 1)); continue
+                fi
+                undo_add "$old_path" "$final" ""
+                set_finder_comment "$final" "$summary"
+                add_finder_tags "$final" "Needs Review" "$category" "$sender"
+                apply_report_add "$old_path" "$final" "review" "no" ""
+                apply_ledger_add "$old_path" "review"
+            fi
+            reviewed=$((reviewed + 1)); continue
+        fi
+
+        # ---- Full apply ----
+        # OCR (unless skipped by D2).
+        local did_ocr="no" ocr_backup=""
+        if [[ "$needs_ocr" == "yes" ]]; then
+            if should_skip_ocr "$old_path" "$category" "$doc_type"; then
+                did_ocr="skip"
+                log_info "[ocr-skip] $rel (manual/large)"
+            elif [[ $ASSUME_YES -eq 1 ]]; then
+                if ocr_in_place "$old_path"; then
+                    did_ocr="yes"; ocr_backup="$LAST_OCR_BACKUP"; ocrd=$((ocrd + 1))
+                else
+                    did_ocr="failed"; log_warn "    OCR failed: $rel"
+                fi
+            else
+                did_ocr="plan"
+            fi
+        fi
+
+        # Duplicate detection (content identity).
+        if [[ $ASSUME_YES -eq 1 ]]; then
+            local h="" existing=""
+            h="$(text_sha "$old_path")"
+            if [[ -n "$h" && -f "$DUP_INDEX" ]]; then
+                # grep exits 1 on no-match; with pipefail that would trip
+                # errexit, so swallow it and treat "no match" as empty.
+                existing=$(grep -F "$h	" "$DUP_INDEX" 2>/dev/null | head -n1 | cut -f2-) \
+                    || existing=""
+            else
+                existing=""
+            fi
+            if [[ -n "$existing" ]]; then
+                local qdest=""; qdest="$(quarantine_dup "$old_path")"
+                log_info "[dup] $rel -> _Duplicates/ (of ${existing:t})"
+                undo_add "$old_path" "$qdest" "$ocr_backup"
+                apply_report_add "$old_path" "$qdest" "dup" "$did_ocr" "$existing"
+                apply_ledger_add "$old_path" "dup" "$existing"
+                dups=$((dups + 1)); continue
+            fi
+        fi
+
+        # Destination (with D3 sender auto-map).
+        local dest_rel="$prop_loc" dest_name="$prop_name" eff_sender="$sender"
+        if [[ -n "$category" && -n "$sender" ]]; then
+            local existing_sender=""
+            existing_sender="$(resolve_existing_sender "$PAPERWORK_ROOT/$category" "$sender")"
+            if [[ -n "$existing_sender" && "$existing_sender" != "$sender" ]]; then
+                local -a segs=("${(@s:/:)prop_loc}")
+                if [[ ${#segs} -ge 2 && "${segs[2]}" == "$sender" ]]; then
+                    segs[2]="$existing_sender"
+                    dest_rel="${(j:/:)segs}"
+                fi
+                dest_name="${prop_name/ - $sender - / - $existing_sender - }"
+                log_info "         sender remap: $sender -> $existing_sender (existing folder)"
+                eff_sender="$existing_sender"
+            fi
+        fi
+
+        local dest="$PAPERWORK_ROOT/$dest_rel/$dest_name"
+        local dest_show="${dest#$PAPERWORK_ROOT/}"
+        local op="rename"
+        [[ "$dest_rel" != "$(dirname "$rel")" ]] && op="move"
+
+        log_info "[$op] $rel"
+        log_info "         -> $dest_show${did_ocr:+  (ocr=$did_ocr)}"
+
+        if [[ $ASSUME_YES -eq 1 ]]; then
+            local final=""; final="$(safe_move "$old_path" "$dest")"
+            if [[ "$final" == "DUP" ]]; then
+                final="$(quarantine_dup "$old_path")"
+                undo_add "$old_path" "$final" "$ocr_backup"
+                apply_report_add "$old_path" "$final" "dup" "$did_ocr" "$dest"
+                apply_ledger_add "$old_path" "dup"
+                dups=$((dups + 1)); continue
+            fi
+            # Record content hash for later dup detection.
+            local kh=""; kh="$(text_sha "$final")"
+            [[ -n "$kh" ]] && printf '%s\t%s\n' "$kh" "$final" >>"$DUP_INDEX"
+            undo_add "$old_path" "$final" "$ocr_backup"
+
+            # Metadata.
+            set_finder_comment "$final" "$summary"
+            local -a tagset=("$category" "$eff_sender")
+            [[ -n "$doc_type" ]] && tagset+=("$doc_type")
+            if [[ "$category" == "Taxes" || "${doc_type:l}" == *tax* ]] && [[ -n "$date" ]]; then
+                tagset+=("Tax ${date:0:4}")
+            fi
+            add_finder_tags "$final" "${tagset[@]}"
+
+            apply_report_add "$old_path" "$final" "$op" "$did_ocr" ""
+            apply_ledger_add "$old_path" "$op"
+        fi
+
+        applied=$((applied + 1))
+        [[ "$op" == "move" ]] && moved=$((moved + 1)) || renamed=$((renamed + 1))
+        [[ "$BATCH_PAUSE" != "0" ]] && sleep "$BATCH_PAUSE"
+    done < <(jq -r '[.old_path,.proposed_location,.proposed_filename,.action,
+                     .category,.sender,.department,.date,.doc_type,.confidence,
+                     .needs_ocr,.review_lane,.summary]
+                    | map(gsub("[\n\r\u001f]";" ")) | join("\u001f")' "$REPORT_JSONL")
+
+    # applied-report.csv
+    if [[ -s "$APPLY_REPORT_JSONL" ]]; then
+        {
+            print -r -- "old_path,new_path,result,ocr,dup_of"
+            jq -r '[.old_path,.new_path,.result,.ocr,.dup_of] | @csv' "$APPLY_REPORT_JSONL"
+        } >"$APPLY_REPORT_CSV"
+    fi
+
+    log_header "Backfill Pass 2 $([[ $ASSUME_YES -eq 1 ]] && echo complete || echo '(dry-run) complete')"
+    log_info "Applied:   $applied (move=$moved rename=$renamed)"
+    log_info "OCR'd:     $ocrd"
+    log_info "Review:    $reviewed"
+    log_info "Dups:      $dups"
+    log_info "Skipped:   $skipped"
+    log_info "Errors:    $errs"
+    [[ $ASSUME_YES -eq 1 ]] && log_info "Undo log:  $UNDO_LOG"
+    [[ -f "$APPLY_REPORT_CSV" ]] && log_info "Report:    $APPLY_REPORT_CSV"
+    [[ $ASSUME_YES -eq 0 ]] && log_warn "No changes made. Re-run with --yes (and --backup-dest) to apply."
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# run_undo — reverse a prior apply run using undo.jsonl (LIFO).
+# ----------------------------------------------------------------------------
+run_undo() {
+    if [[ ! -s "$UNDO_LOG" ]]; then
+        log_error "No undo log (or empty) in run dir: $RUN_DIR"
+        return 1
+    fi
+    log_header "Reversing apply run: $RUN_DIR"
+    if [[ $ASSUME_YES -eq 0 ]]; then
+        log_info "DRY-RUN: would reverse $(grep -c '' "$UNDO_LOG") operations. Add --yes to run."
+    fi
+    local restored=0 failed=0
+    local -a lines
+    lines=("${(@f)$(cat "$UNDO_LOG")}")
+    local i entry old_path new_path ocr_backup
+    for (( i=${#lines}; i>=1; i-- )); do
+        entry="${lines[i]}"
+        [[ -n "$entry" ]] || continue
+        old_path=$(jq -r '.old_path' <<<"$entry")
+        new_path=$(jq -r '.new_path' <<<"$entry")
+        ocr_backup=$(jq -r '.ocr_backup // ""' <<<"$entry")
+        log_info "restore: ${new_path:t} -> ${old_path#$PAPERWORK_ROOT/}"
+        if [[ $ASSUME_YES -eq 1 ]]; then
+            if [[ -f "$new_path" ]]; then
+                mkdir -p "${old_path:h}"
+                if mv "$new_path" "$old_path" 2>>"$APPLY_LOG"; then
+                    restored=$((restored + 1))
+                else
+                    log_warn "    move-back failed"; failed=$((failed + 1)); continue
+                fi
+            elif [[ ! -f "$old_path" ]]; then
+                log_warn "    neither new nor old path present; skipping"; failed=$((failed + 1)); continue
+            fi
+            if [[ -n "$ocr_backup" && -f "$ocr_backup" ]]; then
+                cp "$ocr_backup" "$old_path" 2>>"$APPLY_LOG" \
+                    && log_info "    restored pre-OCR bytes"
+            fi
+        fi
+    done
+    log_header "Undo $([[ $ASSUME_YES -eq 1 ]] && echo complete || echo '(dry-run) complete')"
+    log_info "Restored:  $restored"
+    log_info "Failed:    $failed"
+    [[ $ASSUME_YES -eq 0 ]] && log_warn "No changes made. Re-run with --yes to reverse."
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# run_relocate_excluded — one-time move of excluded worship media out of
+# Paperwork into RELOCATE_DEST (D4).
+# ----------------------------------------------------------------------------
+run_relocate_excluded() {
+    log_header "Relocate excluded worship media out of Paperwork"
+    log_info "Destination: $RELOCATE_DEST"
+    if [[ $ASSUME_YES -eq 0 ]]; then
+        log_info "DRY-RUN: printing the plan only. Add --yes to move."
+    fi
+    local ex src count=0
+    for ex in "${EXCLUDE_REL_PATHS[@]}"; do
+        [[ "$ex" == _* ]] && continue
+        src="$PAPERWORK_ROOT/$ex"
+        [[ -d "$src" ]] || { log_info "skip (absent): $ex"; continue; }
+        local n=""; n=$(find "$src" -type f 2>/dev/null | grep -c '' || echo 0)
+        local dest="$RELOCATE_DEST/${ex:t}"
+        log_info "move: $ex ($n files) -> ${dest/#$HOME/~}"
+        if [[ $ASSUME_YES -eq 1 ]]; then
+            mkdir -p "${dest:h}"
+            if [[ -e "$dest" ]]; then
+                # merge contents to avoid clobbering
+                mkdir -p "$dest"
+                if command -v rsync &>/dev/null; then
+                    rsync -a "$src"/ "$dest"/ >>"$APPLY_LOG" 2>&1 && rm -rf "$src"
+                else
+                    cp -R "$src"/ "$dest"/ && rm -rf "$src"
+                fi
+            else
+                mv "$src" "$dest" 2>>"$APPLY_LOG" || { log_warn "    move failed"; continue; }
+            fi
+            count=$((count + n))
+        fi
+    done
+    log_header "Relocation $([[ $ASSUME_YES -eq 1 ]] && echo complete || echo '(dry-run) complete')"
+    log_info "Files moved: $count"
+    [[ $ASSUME_YES -eq 0 ]] && log_warn "No changes made. Re-run with --yes to relocate."
+    return 0
+}
+
+# ----------------------------------------------------------------------------
+# Dispatch: apply / undo / relocate short-circuit Pass 1.
+# ----------------------------------------------------------------------------
+if [[ $RELOCATE_MODE -eq 1 ]]; then run_relocate_excluded; exit $?; fi
+if [[ $UNDO_MODE -eq 1 ]]; then run_undo; exit $?; fi
+if [[ $APPLY -eq 1 ]]; then run_apply; exit $?; fi
 
 # ----------------------------------------------------------------------------
 # Main
