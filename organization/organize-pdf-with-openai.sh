@@ -61,12 +61,20 @@ unset _structure_cache_ttl
 readonly CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/organize-pdf-with-openai"
 readonly AGENTIC_TEXT_SAMPLE_LIMIT=8000
 
+# Documents below this confidence (0-1) are routed to the manual review lane
+# instead of being auto-filed into the taxonomy.
+readonly REVIEW_CONFIDENCE_THRESHOLD="${OPENAI_CONFIDENCE_THRESHOLD:-0.7}"
+# Review-lane folder name (underscore-prefixed so it is excluded from the
+# taxonomy snapshot and sorts to the top of the archive).
+readonly NEEDS_REVIEW_DIRNAME="${NEEDS_REVIEW_DIRNAME:-_Needs Review}"
+
 # Global variables for processed data
 declare -g PDF_FILE=""
 declare -g SCANNED_AT=""
 declare -g PDF_TEXT=""
 declare -g FOLDER_STRUCTURE=""
 declare -g AI_RESPONSE=""
+declare -g AI_CONFIDENCE=""
 declare -g MOVE_FILE=false
 declare -g ADDITIONAL_CONTEXT=""
 declare -g ORGANIZER_DESCRIPTION=""
@@ -1059,13 +1067,20 @@ validate_required_fields() {
     return 0
 }
 
+is_low_confidence() {
+    # Returns success (0) when the document should be routed to the review lane:
+    # confidence is missing/null, non-numeric, or below REVIEW_CONFIDENCE_THRESHOLD.
+    local confidence="${1:-}"
+    [[ -z "$confidence" || "$confidence" == "null" ]] && return 0
+    awk -v c="$confidence" -v t="$REVIEW_CONFIDENCE_THRESHOLD" \
+        'BEGIN { if (c + 0 < t + 0) exit 0; else exit 1 }'
+}
+
 check_confidence_level() {
     local confidence="$1"
 
-    if command -v bc >/dev/null 2>&1 && [[ "$confidence" != "null" ]]; then
-        if [[ $(echo "$confidence < 0.7" | bc) -eq 1 ]]; then
-            log_warn "AI confidence is low ($confidence). Manual review may be needed."
-        fi
+    if is_low_confidence "$confidence"; then
+        log_warn "AI confidence is low (${confidence:-unknown}, threshold $REVIEW_CONFIDENCE_THRESHOLD). Routing to review lane."
     fi
 }
 
@@ -1153,22 +1168,31 @@ process_pdf_with_ai() {
     compact_state=$(printf '%s' "$state_snapshot" | jq -c '.')
 
     local system_message
-    system_message="You are an expert paperwork operations agent inside a sequential workflow. The JSON you receive contains the current discovery state for a single PDF (metadata, file facts, and derived context). Use it to:
+    system_message="You are an expert paperwork filing agent. The JSON you receive is the discovery state for a single scanned PDF: document metadata, file facts, the extracted text sample (context.textSample), and the CANONICAL ARCHIVE TAXONOMY under context.folderStructure (an object of existing categories, each with the senders and departments already in use). Your job is to decide exactly where this document belongs and return final-form field values that the pipeline files verbatim.
 
-1. Analyze the document and list what it represents and who sent it.
-2. Recommend consistent folder/category placements using the discovered archive structure.
-3. Produce a short summary plus any identifying metadata (dates, account numbers, case numbers, etc.).
+TAXONOMY REUSE (most important):
+- context.folderStructure lists the folders that already exist. When the document matches an existing category or sender, reuse that EXACT name (same spelling, spacing, and casing). Do not invent a near-duplicate (e.g. do not create 'Fifth Third' when 'Fifth Third Bank' already exists).
+- Only propose a NEW category or sender when nothing in the taxonomy reasonably fits.
 
-Guidelines:
-- Always reuse existing folder/category/sender names when the archive snapshot already contains a close match.
-- Prefer translating names to a consistent English form.
-- Departments are only for government entities or when explicitly called out.
-- Consider context.filenameDates (normalized dates parsed from the filename) when proposing sentOn or describing the document timeline; treat these as hints that may need validation against the PDF text.
-- Include an organizerDescription inside categorization that is a plain-English label (<=100 characters) suitable for file naming.
-- Organizer descriptions must never repeat the sender name or explicit dates/timestamps; focus on the distinguishing document details only so filenames stay concise.
-- Short summaries are stored verbatim in macOS Finder comments; write a natural-sentence paragraph rich with relevant keywords to maximize Spotlight searchability (do not force title case).
-- Return JSON that follows the provided schema exactly; do not add new keys.
-- Provide reasoning that cites the contextual evidence you relied on."
+FIELD FORMAT (these become folder and file names — follow strictly):
+- category, sender, and department must each be a SINGLE plain folder name. Never include a slash (/ or \\), a '>' character, a colon, or any path fragment. Never return an absolute path or repeat parent folders inside a child field.
+- The hierarchy is at most Category / Sender / optional Department. Do not encode more than one level into a single field.
+- department is null unless the sender is a government entity (or the document clearly names an internal department).
+- Prefer a consistent English form for names.
+
+METADATA & NAMING:
+- Use context.filenameDates (dates parsed from the original filename) as hints for sentOn, but validate against the document text; the true document date wins.
+- organizerDescription is a plain-English label (<=100 characters) for the filename. It must NOT repeat the sender name or any date/timestamp; capture only the distinguishing document detail (e.g. 'Monthly Statement', 'Explanation of Benefits').
+- shortSummary is stored verbatim in the macOS Finder comment; write a natural-sentence paragraph rich with searchable keywords (names, account/case numbers, document type, amounts) to maximize Spotlight recall. Do not force title case.
+
+CONFIDENCE (drives an automated review lane):
+- Set analysis.confidence honestly on a 0-1 scale reflecting how sure you are of BOTH the category and the sender.
+- Use >= 0.85 only when the sender and category are unambiguous and (ideally) already in the taxonomy.
+- Use < 0.7 whenever the text is sparse/garbled, the sender is unclear, or you are guessing the category. Documents below 0.7 are routed to a human review folder, so do NOT inflate confidence to force a placement.
+
+OUTPUT:
+- Return JSON matching the provided schema exactly; add no keys.
+- categorization holds the final values to file under. folderSuggestions may restate the same category/sender/department and must include reasoning that cites the specific evidence (taxonomy entries, text, filename dates) you relied on."
 
     local user_message
     user_message="Current workflow state JSON:\n$compact_state\n\nUpdate the plan according to the schema."
@@ -1210,11 +1234,11 @@ Guidelines:
                             "categorization": {
                                 "type": "object",
                                 "properties": {
-                                    "sender": {"type": "string"},
-                                    "department": {"type": ["string", "null"]},
+                                    "sender": {"type": "string", "description": "Single folder name for the sender/organization. No slashes, no > character, no paths. Reuse an existing sender from context.folderStructure verbatim when it matches."},
+                                    "department": {"type": ["string", "null"], "description": "Optional single sub-folder name, government/internal departments only. No slashes or paths; null when not applicable."},
                                     "additionalContext": {"type": ["string", "null"]},
                                     "sentOn": {"type": "string"},
-                                    "category": {"type": "string"},
+                                    "category": {"type": "string", "description": "Single top-level category folder name. Reuse an existing category from context.folderStructure verbatim when appropriate. No slashes, no > character, no paths."},
                                     "shortSummary": {"type": "string"},
                                     "organizerDescription": {"type": "string", "description": "<=100 char label for file organization"}
                                 },
@@ -1321,6 +1345,7 @@ apply_ai_suggestions() {
     suggested_additional_context=$(echo "$response" | jq -r '.folderSuggestions.suggestedAdditionalContext')
     ai_reasoning=$(echo "$response" | jq -r '.folderSuggestions.reasoning')
     confidence=$(echo "$response" | jq -r '.analysis.confidence')
+    AI_CONFIDENCE="$confidence"
 
     # Extract simplified analysis data
     primary_sender=$(echo "$response" | jq -r '.analysis.primarySender')
@@ -1404,6 +1429,13 @@ normalize_existing_folder_match() {
         dept_part="${remainder#*/}"
     fi
 
+    # The model often formats the match with padded slashes ("Finance / Equifax"),
+    # leaving leading/trailing spaces on each segment. Trim them so downstream
+    # consumers never see " Equifax".
+    category_part=$(printf '%s' "$category_part" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    sender_part=$(printf '%s' "$sender_part" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    dept_part=$(printf '%s' "$dept_part" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+
     CATEGORY="$category_part"
     SENDER="$sender_part"
     if [[ -n "$dept_part" ]]; then
@@ -1414,10 +1446,41 @@ normalize_existing_folder_match() {
     return 0
 }
 
+sanitize_folder_name() {
+    # Reduce an AI-provided value to a single safe folder name. Guards against
+    # the model returning an absolute path, a "Category > Sender > Department"
+    # string, or filesystem-illegal characters, all of which previously created
+    # runaway nested folders and literal ">" directories in the archive.
+    local name="${1:-}"
+    [[ -z "$name" || "$name" == "null" ]] && {
+        printf ''
+        return
+    }
+
+    # If a path slipped through, keep only the final component.
+    name="${name##*/}"
+    # If a "A > B > C" hierarchy slipped through, keep only the last segment.
+    name="${name##* > }"
+
+    name=$(printf '%s' "$name" |
+        tr -d '\000-\037\177' |
+        sed -E 's#[/\\:*?"<>|]# #g' |
+        tr -s ' ' |
+        sed -E 's/^[[:space:]._]+//; s/[[:space:].]+$//')
+
+    printf '%s' "$name"
+}
+
 create_folder_structure() {
-    local category="$1"
-    local sender="$2"
-    local department="$3"
+    local category
+    local sender
+    local department
+    category=$(sanitize_folder_name "$1")
+    sender=$(sanitize_folder_name "$2")
+    department=$(sanitize_folder_name "$3")
+
+    [[ -z "$category" ]] && category="Uncategorized"
+    [[ -z "$sender" ]] && sender="Unknown Sender"
 
     local category_dir="$PAPERWORK_DIR/$category"
     local sender_dir="$category_dir/$sender"
@@ -1669,9 +1732,27 @@ organize_and_move_file() {
         record_phase_note "action" "$PRIMARY_DATE_REASON"
     fi
 
-    # Create folder structure and get destination directory
+    # Decide placement: low-confidence documents are routed to a manual review
+    # lane instead of being auto-filed into the taxonomy.
     local destination_dir
-    destination_dir=$(create_folder_structure "$CATEGORY" "$SENDER" "$DEPARTMENT")
+    local low_confidence=0
+    local finder_comment="$SHORT_SUMMARY"
+    if is_low_confidence "$AI_CONFIDENCE"; then
+        low_confidence=1
+        local review_category
+        review_category=$(sanitize_folder_name "$CATEGORY")
+        [[ -z "$review_category" ]] && review_category="Uncategorized"
+        destination_dir="$PAPERWORK_DIR/$NEEDS_REVIEW_DIRNAME/$review_category"
+        log_warn "Confidence ${AI_CONFIDENCE:-unknown} below threshold $REVIEW_CONFIDENCE_THRESHOLD; routing to review lane: $destination_dir"
+        record_decision_rationale "review-lane" "Confidence ${AI_CONFIDENCE:-unknown} < $REVIEW_CONFIDENCE_THRESHOLD; needs manual review"
+        record_phase_note "action" "Routed to review lane (confidence ${AI_CONFIDENCE:-unknown})"
+        if (( ! DRY_RUN )); then
+            mkdir -p "$destination_dir"
+        fi
+        finder_comment="[Needs Review — confidence ${AI_CONFIDENCE:-unknown}; best guess: ${CATEGORY:-?} / ${SENDER:-?}${DEPARTMENT:+ / $DEPARTMENT}] $SHORT_SUMMARY"
+    else
+        destination_dir=$(create_folder_structure "$CATEGORY" "$SENDER" "$DEPARTMENT")
+    fi
 
     # Create sanitized versions for file names
     local sender_sanitized department_sanitized descriptor_source file_descriptor_sanitized
@@ -1711,7 +1792,10 @@ organize_and_move_file() {
 
     if (( DRY_RUN )); then
         log_info "Dry-run enabled; no filesystem changes will be made"
-        record_action_snapshot "$new_file" "" "$SHORT_SUMMARY"
+        if (( low_confidence )); then
+            log_info "Dry-run: would route to review lane ($destination_dir)"
+        fi
+        record_action_snapshot "$new_file" "" "$finder_comment"
         record_phase_note "action" "Dry-run preview: would $action_verb to $new_file"
         record_phase_complete "action"
         return
@@ -1728,7 +1812,7 @@ organize_and_move_file() {
 
     # Set Finder comments with summary
     log_info "Setting Finder comments with summary"
-    set_finder_comments "$new_file" "$SHORT_SUMMARY"
+    set_finder_comments "$new_file" "$finder_comment"
 
     # Open destination folder in Finder
     log_info "Revealing organized PDF in Finder"
@@ -1737,7 +1821,7 @@ organize_and_move_file() {
         open "$destination_dir"
     fi
 
-    record_action_snapshot "$new_file" "$new_file" "$SHORT_SUMMARY"
+    record_action_snapshot "$new_file" "$new_file" "$finder_comment"
     record_phase_note "action" "Completed $action_verb to $new_file"
     record_phase_complete "action"
 

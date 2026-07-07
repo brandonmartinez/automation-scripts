@@ -61,7 +61,9 @@ if ! ensure_openai_key; then
 fi
 
 OPENAI_API_BASE_URL="${OPENAI_API_BASE_URL:-https://api.openai.com/v1}"
-OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.1}"
+OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.4}"
+# Reasoning effort for GPT-5.x models (minimal|low|medium|high). Set empty to omit.
+OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-low}"
 
 set +a
 
@@ -71,16 +73,25 @@ echo-json() {
 }
 
 escape-text() {
-    echo "$1" |
-        tr -s '[:space:]' ' ' |
-        tr -cd 'A-Za-z0-9 ' |
-        tr -d '\n' |
-        tr -d '\r' |
-        awk '{for (i=1; i<=NF && i<=1000; i++) printf "%s%s", $i, (i==NF || i==1000 ? "" : " ")}'
+    # Normalize whitespace and strip control characters while preserving
+    # punctuation, symbols, and UTF-8 so the model receives faithful document
+    # text (dates, amounts, account numbers, sender names, etc.). Downstream
+    # callers bound the length; jq --arg handles JSON escaping.
+    printf '%s' "$1" |
+        tr '\r\n\t' '   ' |
+        tr -d '\000-\010\013\014\016-\037\177' |
+        tr -s ' '
 }
 
 sanitize-text() {
-    echo "$1" | tr -cd 'A-Za-z0-9'
+    # Filesystem-safe filename component: keep letters, numbers, spaces,
+    # hyphens and ordinary punctuation; drop path separators and other
+    # illegal characters; collapse whitespace and trim edges.
+    printf '%s' "$1" |
+        tr -d '\000-\037\177' |
+        sed -E 's#[/\\:*?"<>|]# #g' |
+        tr -s ' ' |
+        sed -E 's/^[[:space:].]+//; s/[[:space:].]+$//'
 }
 
 get-pdf-text() {
@@ -112,6 +123,12 @@ get-openai-response() {
         # ensure model is set in the body if it was missing
         request_body=$(printf '%s' "$request_body" | jq --arg model "$request_model" '.model = $model')
     fi
+
+    # Inject reasoning effort for GPT-5.x models unless already set or disabled.
+    if [[ -n "${OPENAI_REASONING_EFFORT:-}" ]]; then
+        request_body=$(printf '%s' "$request_body" | jq --arg effort "$OPENAI_REASONING_EFFORT" '.reasoning_effort = (if .reasoning_effort then .reasoning_effort else $effort end)')
+    fi
+
     log_debug "Sending request to $endpoint with model '$request_model'"
 
     local req_file
