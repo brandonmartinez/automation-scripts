@@ -58,7 +58,8 @@ readonly -a EXCLUDE_REL_PATHS=(
 LIMIT=0                    # 0 = no limit
 CATEGORY_FILTER=""         # restrict to a single top-level category
 FORCE=0                    # reprocess files already in the ledger
-APPLY=0                    # Pass 2 (guarded, not yet implemented)
+APPLY=0                    # Pass 2 apply mode (requires --resume <run_dir>)
+DRY_RUN=0                  # with --apply: preview moves without touching files
 RESUME_DIR=""              # reuse an existing run directory (append + resume)
 BATCH_PAUSE="${BACKFILL_BATCH_PAUSE:-0}"  # seconds to sleep between files
 
@@ -72,11 +73,15 @@ writes a proposal report. It makes ZERO changes to the archive.
 Options:
   --limit <N>          Process at most N files (0 = all). Default: 0
   --category <name>    Only process files under this top-level category
-  --resume <dir>       Reuse an existing run dir; skip files already in ledger
+  --resume <dir>       Reuse an existing run dir; skip files already in ledger.
+                       REQUIRED with --apply (identifies the report to apply).
   --force              Reprocess files even if present in the ledger
   --paperwork-dir <p>  Override archive root (default: ~/Documents/Paperwork)
   --pause <seconds>    Sleep between files (gentle throttling). Default: 0
-  --apply              Pass 2 apply mode (NOT YET IMPLEMENTED - guarded)
+  --apply              Pass 2: apply the reviewed report.jsonl from --resume dir
+                       (moves each action=move file into place, sets the Finder
+                       comment, logs to apply-ledger.jsonl; idempotent/resumable)
+  --dry-run            With --apply: preview every move without touching files
   --help, -h           Show this help
 EOF
 }
@@ -103,6 +108,7 @@ while [[ $# -gt 0 ]]; do
             BATCH_PAUSE="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --apply) APPLY=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
         --help | -h) usage; exit 0 ;;
         *) echo "Error: unknown argument '$1'" >&2; usage; exit 1 ;;
     esac
@@ -110,10 +116,10 @@ done
 
 [[ "$LIMIT" == <-> ]] || { echo "Error: --limit must be an integer" >&2; exit 1; }
 
-if [[ $APPLY -eq 1 ]]; then
-    log_error "Pass 2 (--apply) is not yet implemented."
-    log_error "This tool currently runs report-only Pass 1. Review the report first."
-    exit 2
+if [[ $APPLY -eq 1 && -z "$RESUME_DIR" ]]; then
+    log_error "--apply requires --resume <run_dir> so it knows which report.jsonl to apply."
+    log_error "Example: $0 --apply --resume ~/Documents/Paperwork/_Backfill/<timestamp>"
+    exit 1
 fi
 
 # --paperwork-dir override (PAPERWORK_DIR is readonly above; use a resolved var)
@@ -146,6 +152,7 @@ readonly RUN_DIR
 readonly REPORT_JSONL="$RUN_DIR/report.jsonl"
 readonly REPORT_CSV="$RUN_DIR/report.csv"
 readonly LEDGER="$RUN_DIR/ledger.jsonl"
+readonly APPLY_LEDGER="$RUN_DIR/apply-ledger.jsonl"
 readonly ENGINE_LOG="$RUN_DIR/engine.log"
 readonly TMP_ROOT="$RUN_DIR/tmp"
 mkdir -p "$TMP_ROOT"
@@ -236,7 +243,17 @@ emit_row() {
     rel_old="${orig#$PAPERWORK_ROOT/}"
     cur_loc="$(dirname "$rel_old")"
 
-    if [[ -n "$state" && -s "$state" ]]; then
+    # Only trust the engine state file if it is present AND parses as valid
+    # JSON. A run that is signal-killed mid-write can leave a non-empty but
+    # truncated state file; jq on that exits non-zero and, under errexit +
+    # pipefail, would abort the ENTIRE backfill instead of just failing this
+    # one item. Gating on `jq -e` keeps a bad item to a single "error" row.
+    local state_ok=0
+    if [[ -n "$state" && -s "$state" ]] && jq -e . "$state" >/dev/null 2>&1; then
+        state_ok=1
+    fi
+
+    if [[ $state_ok -eq 1 ]]; then
         proposed=$(jq -r '.action.proposedPath // ""' "$state")
     else
         proposed=""
@@ -269,7 +286,7 @@ emit_row() {
     fi
 
     local category sender department doc_type descriptor confidence summary
-    if [[ -n "$state" && -s "$state" ]]; then
+    if [[ $state_ok -eq 1 ]]; then
         category=$(jq -r '.plan.final.category // ""' "$state")
         sender=$(jq -r '.plan.final.sender // ""' "$state")
         department=$(jq -r '.plan.final.department // ""' "$state")
@@ -322,8 +339,161 @@ write_csv() {
 }
 
 # ----------------------------------------------------------------------------
+# Pass 2 (apply) helpers
+# ----------------------------------------------------------------------------
+
+# Set the macOS Finder (Spotlight) comment on a file. Matches the go-forward
+# engine's set_finder_comments so backfilled files carry the same searchable
+# summary. Non-fatal: a failure here must never abort the apply run.
+set_finder_comment() {
+    local file_path="$1" comment="$2"
+    [[ -n "$comment" ]] || return 0
+    osascript \
+        -e 'on run {f, c}' \
+        -e 'tell app "Finder" to set comment of (POSIX file f as alias) to c' \
+        -e 'end' \
+        "$file_path" "$comment" >/dev/null 2>&1 || return 1
+}
+
+apply_ledger_has() {
+    local p="$1"
+    grep -qF "\"old_path\":\"$p\"" "$APPLY_LEDGER" 2>/dev/null
+}
+
+apply_ledger_add() {
+    local old_path="$1" new_path="$2" st="$3"
+    jq -cn \
+        --arg old_path "$old_path" \
+        --arg new_path "$new_path" \
+        --arg status "$st" \
+        --arg at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{old_path:$old_path, new_path:$new_path, status:$status, at:$at}' \
+        >>"$APPLY_LEDGER"
+}
+
+# Given a desired destination path, return a collision-free path. If the target
+# exists (proposed filenames were computed at propose time against then-empty
+# dirs, so two source files can map to the same name), insert " (N)" before the
+# extension. Echoes the final path on stdout.
+collision_free_path() {
+    local dest="$1"
+    [[ -e "$dest" ]] || { print -r -- "$dest"; return 0; }
+    local dir base ext stem n candidate
+    dir="$(dirname "$dest")"
+    base="$(basename "$dest")"
+    if [[ "$base" == *.* ]]; then
+        stem="${base%.*}"; ext=".${base##*.}"
+    else
+        stem="$base"; ext=""
+    fi
+    n=2
+    candidate="$dir/$stem ($n)$ext"
+    while [[ -e "$candidate" ]]; do
+        n=$((n + 1))
+        candidate="$dir/$stem ($n)$ext"
+    done
+    print -r -- "$candidate"
+}
+
+# Pass 2: read the reviewed report.jsonl and physically apply every action=move
+# row. Idempotent (apply-ledger dedupe), resumable, collision-safe. Rows with
+# action != move (review/error/rename/keep) are skipped and tallied.
+apply_pass() {
+    [[ -s "$REPORT_JSONL" ]] || { log_error "No report.jsonl in $RUN_DIR — nothing to apply."; exit 1; }
+    : >>"$APPLY_LEDGER"
+
+    local mode="APPLY"
+    (( DRY_RUN )) && mode="DRY-RUN preview"
+    log_header "Paperwork standardization backfill - Pass 2 ($mode)"
+    log_info "Archive:  $PAPERWORK_ROOT"
+    log_info "Run dir:  $RUN_DIR"
+    log_info "Report:   $REPORT_JSONL"
+
+    local applied=0 already=0 skipped=0 missing=0 conflicts=0 failed=0
+    local action old_path prop_loc prop_name summary conf review
+    local dest_dir dest
+
+    while IFS=$'\x1f' read -r action old_path prop_loc prop_name summary conf review; do
+        [[ -n "$action" ]] || continue
+
+        if [[ "$action" != "move" ]]; then
+            skipped=$((skipped + 1))
+            log_debug "skip ($action): ${old_path:t}"
+            continue
+        fi
+
+        if apply_ledger_has "$old_path"; then
+            already=$((already + 1))
+            log_debug "already applied: ${old_path:t}"
+            continue
+        fi
+
+        if [[ ! -e "$old_path" ]]; then
+            missing=$((missing + 1))
+            log_warn "source missing (skipping): $old_path"
+            (( DRY_RUN )) || apply_ledger_add "$old_path" "" "missing-source"
+            continue
+        fi
+
+        if [[ -z "$prop_loc" || -z "$prop_name" ]]; then
+            skipped=$((skipped + 1))
+            log_warn "no proposed destination (skipping): ${old_path:t}"
+            continue
+        fi
+
+        dest_dir="$prop_loc"
+        dest="$dest_dir/$prop_name"
+        dest="$(collision_free_path "$dest")"
+        [[ "$dest" != "$dest_dir/$prop_name" ]] && conflicts=$((conflicts + 1))
+
+        if (( DRY_RUN )); then
+            log_info "would move: ${old_path:t}"
+            log_info "        -> ${dest#$PAPERWORK_ROOT/}"
+            applied=$((applied + 1))
+            continue
+        fi
+
+        mkdir -p "$dest_dir"
+        if ! mv "$old_path" "$dest" 2>>"$ENGINE_LOG"; then
+            failed=$((failed + 1))
+            log_error "move failed: $old_path -> $dest (see engine.log)"
+            apply_ledger_add "$old_path" "$dest" "failed"
+            continue
+        fi
+
+        if ! set_finder_comment "$dest" "$summary"; then
+            log_warn "Finder comment failed for ${dest:t} (file moved OK)"
+        fi
+
+        applied=$((applied + 1))
+        apply_ledger_add "$old_path" "$dest" "applied"
+        log_info "moved: ${old_path:t}"
+        log_info "    -> ${dest#$PAPERWORK_ROOT/}"
+    done < <(jq -rc '[.action, .old_path, (.proposed_location // ""),
+                      (.proposed_filename // ""), (.summary // ""),
+                      (.confidence // ""), (.review_lane // "")] | join("\u001f")' \
+                 "$REPORT_JSONL")
+
+    log_header "Backfill Pass 2 ($mode) complete"
+    log_info "Applied:        $applied$([[ $DRY_RUN -eq 1 ]] && echo ' (preview)')"
+    log_info "Already applied: $already (ledger dedupe)"
+    log_info "Skipped:        $skipped (action != move)"
+    log_info "Missing source: $missing"
+    log_info "Renamed (collision): $conflicts"
+    log_info "Failed moves:   $failed"
+    (( DRY_RUN )) || log_info "Apply ledger:   $APPLY_LEDGER"
+    [[ $failed -gt 0 ]] && return 1
+    return 0
+}
+
+# ----------------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------------
+if [[ $APPLY -eq 1 ]]; then
+    apply_pass
+    exit $?
+fi
+
 log_header "Paperwork standardization backfill - Pass 1 (report only)"
 log_info "Archive:    $PAPERWORK_ROOT"
 log_info "Run dir:    $RUN_DIR"
@@ -370,8 +540,8 @@ while IFS= read -r orig; do
         ledger_add "$orig" "error"
         log_warn "    -> engine produced no plan (see engine.log)"
     else
-        last_action=$(tail -n1 "$REPORT_JSONL" | jq -r '.action')
-        last_conf=$(tail -n1 "$REPORT_JSONL" | jq -r '.confidence')
+        last_action=$(tail -n1 "$REPORT_JSONL" | jq -r '.action' 2>/dev/null) || last_action=""
+        last_conf=$(tail -n1 "$REPORT_JSONL" | jq -r '.confidence' 2>/dev/null) || last_conf=""
         log_info "    -> action=$last_action confidence=$last_conf ocr=$NEEDS_OCR"
         ledger_add "$orig" "analyzed"
     fi
