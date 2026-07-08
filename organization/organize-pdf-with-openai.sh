@@ -1497,8 +1497,17 @@ apply_ai_suggestions() {
     # Canonicalize the sender one final time: apply_ai_suggestions may have
     # overwritten SENDER from existingFolderMatch or suggestedSender (raw model
     # values), so re-run the alias map here as the single choke point before the
-    # plan is recorded.
+    # plan is recorded. Those raw values can themselves be a "Category > Sender >
+    # Department" breadcrumb (normalize_existing_folder_match only understands
+    # '/'-delimited paths and passes ' > '-delimited ones through untouched), so
+    # strip breadcrumbs here too — otherwise they flatten into the filename and
+    # duplicate the department folder.
+    CATEGORY=$(sanitize_path_field "$CATEGORY" "" single)
+    SENDER=$(sanitize_path_field "$SENDER" "$CATEGORY" sender)
     SENDER=$(normalize_sender "$SENDER")
+    if [[ -n "$DEPARTMENT" && "$DEPARTMENT" != "null" ]]; then
+        DEPARTMENT=$(sanitize_path_field "$DEPARTMENT" "$CATEGORY" dept)
+    fi
 
     log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, ADDITIONAL_CONTEXT: $ADDITIONAL_CONTEXT, ORGANIZER_DESCRIPTION: $ORGANIZER_DESCRIPTION, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
 }
