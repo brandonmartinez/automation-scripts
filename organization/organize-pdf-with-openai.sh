@@ -88,6 +88,10 @@ declare -g FOLDER_STRUCTURE=""
 declare -g AI_RESPONSE=""
 declare -g AI_CONFIDENCE=""
 declare -g MOVE_FILE=false
+# Reveal the organized file in Finder after filing. Enabled by default for the
+# interactive single-file workflow; set REVEAL_IN_FINDER=false for batch/backfill
+# runs so hundreds of files don't each spawn a Finder window.
+declare -g REVEAL_IN_FINDER="${REVEAL_IN_FINDER:-true}"
 declare -g ADDITIONAL_CONTEXT=""
 declare -g ORGANIZER_DESCRIPTION=""
 declare -g FILE_NAME_DESCRIPTION=""
@@ -1946,11 +1950,15 @@ organize_and_move_file() {
     log_info "Setting Finder comments with summary"
     set_finder_comments "$new_file" "$finder_comment"
 
-    # Open destination folder in Finder
-    log_info "Revealing organized PDF in Finder"
-    if ! open -R "$new_file"; then
-        log_warn "Failed to reveal file in Finder; opening destination directory instead"
-        open "$destination_dir"
+    # Open destination folder in Finder (skipped in batch/backfill mode)
+    if [[ "$REVEAL_IN_FINDER" == true ]]; then
+        log_info "Revealing organized PDF in Finder"
+        if ! open -R "$new_file"; then
+            log_warn "Failed to reveal file in Finder; opening destination directory instead"
+            open "$destination_dir"
+        fi
+    else
+        log_debug "REVEAL_IN_FINDER=false; skipping Finder reveal"
     fi
 
     record_action_snapshot "$new_file" "$new_file" "$finder_comment"
