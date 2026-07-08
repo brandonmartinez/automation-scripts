@@ -1188,13 +1188,18 @@ TAXONOMY REUSE (most important):
 
 SENDER IDENTITY:
 - The sender is the ORGANIZATION OR ENTITY THAT ISSUED the document (the company, agency, institution, or person named on the document itself). It is NOT a folder name, a category, a document type, or a mailing/postal address.
-- Never return a grouping label (e.g. 'Student Loan', 'Cars', 'Checks', 'Manuals') or a street address (e.g. '1101 Monona Dr') as the sender. If the nearest label is a folder or an address, identify the actual issuer from the document text instead.
+- Never return a grouping label (e.g. 'Student Loan', 'Cars', 'Checks', 'Manuals'), a lawsuit or matter name (e.g. 'Replacement Device Lawsuit'), an administrative role (e.g. 'Settlement Administrator', 'Claims Administrator'), a court name, or a street address (e.g. '1101 Monona Dr') as the sender. If the nearest label is a folder, a matter, a role, a court, or an address, identify the actual issuing organization from the document text instead.
 - Prefer the widely recognized brand name over a parent or legal entity when they denote the same organization (e.g. use the consumer brand a manufacturer sells under, not its holding-company legal name). Always reuse an existing taxonomy sender verbatim when one matches.
+
+LEGAL & CLASS-ACTION SETTLEMENTS:
+- Class-action notices, settlement award/refund checks, claim forms, exclusion/objection letters, and other litigation correspondence belong in category 'Legal' (reuse an existing 'Legal' folder when one is present). A court being named on the document does NOT make the category 'Government'.
+- The sender is the recognizable DEFENDANT brand from the case caption (e.g. 'Apple', 'LinkedIn', or the consumer brand a defendant LLC does business as) — never the lawsuit/matter name, a 'Settlement Administrator'/'Claims Administrator' role, or a court.
+- department must be null for these documents. Capture the case/matter name and case number in shortSummary and organizerDescription, never in a folder field.
 
 FIELD FORMAT (these become folder and file names — follow strictly):
 - category, sender, and department must each be a SINGLE plain folder name. Never include a slash (/ or \\), a '>' character, a colon, or any path fragment. Never return an absolute path or repeat parent folders inside a child field.
 - The hierarchy is at most Category / Sender / optional Department. Do not encode more than one level into a single field.
-- department is null unless the sender is a government entity (or the document clearly names an internal department).
+- department is null unless the sender is a government entity (or the document clearly names an internal department). A court, case caption, or legal-matter name is NEVER a department.
 - Prefer a consistent English form for names.
 
 METADATA & NAMING:

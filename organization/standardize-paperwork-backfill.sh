@@ -299,6 +299,16 @@ emit_row() {
     local review_lane="no"
     [[ "$proposed_dir" == _* || "$proposed_dir" == *"/_"* ]] && review_lane="yes"
 
+    # Depth guard (defense-in-depth): a valid destination is at most
+    # Category/Sender/Department (3 segments). Anything deeper means the model
+    # encoded a path fragment into a field (e.g. a court name as department);
+    # route it to review rather than creating a malformed deep folder.
+    if [[ -n "$proposed_dir" && "$review_lane" == "no" ]]; then
+        local _depth
+        _depth=$(print -r -- "$proposed_dir" | awk -F/ '{print NF}')
+        [[ $_depth -gt 3 ]] && review_lane="yes"
+    fi
+
     if [[ -z "$proposed" ]]; then
         action="error"
     elif [[ "$review_lane" == "yes" ]]; then
