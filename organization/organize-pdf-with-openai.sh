@@ -515,9 +515,19 @@ build_folder_structure_snapshot() {
     rm -f "$structure_file"
 
     if [[ -n "$structure_json" ]]; then
-        local tmp_cache="$cache_file.tmp"
-        printf '%s' "$structure_json" >"$tmp_cache"
-        mv "$tmp_cache" "$cache_file"
+        # Write the cache atomically via a UNIQUE temp file so concurrent engine
+        # invocations (parallel backfill workers) never clobber a shared
+        # "<cache>.tmp" and fail the rename. mktemp guarantees a unique name;
+        # the rename is atomic so readers always see a complete file and the
+        # last concurrent writer simply wins. Never let this trip errexit.
+        local tmp_cache
+        tmp_cache=$(mktemp "$CACHE_DIR/folder-structure-$cache_key-XXXXXX" 2>/dev/null) \
+            || tmp_cache="$cache_file.$$.$RANDOM.tmp"
+        if printf '%s' "$structure_json" >"$tmp_cache" 2>/dev/null; then
+            mv -f "$tmp_cache" "$cache_file" 2>/dev/null || rm -f "$tmp_cache" 2>/dev/null || true
+        else
+            rm -f "$tmp_cache" 2>/dev/null || true
+        fi
     fi
 
     printf '%s' "$structure_json"

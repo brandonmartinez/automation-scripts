@@ -62,6 +62,7 @@ APPLY=0                    # Pass 2 apply mode
 RESUME_DIR=""              # reuse an existing run directory (append + resume)
 BATCH_PAUSE="${BACKFILL_BATCH_PAUSE:-0}"  # seconds to sleep between files
 AI_PROVIDER_CHOICE="${AI_PROVIDER:-openai}"  # openai (default) or copilot backend
+JOBS="${BACKFILL_JOBS:-1}"  # Pass 1 parallel worker count (1 = serial)
 
 # ---- Pass 2 (apply) configuration ----
 BACKUP_DEST=""             # tarball backup destination (D1); required to mutate
@@ -90,6 +91,10 @@ Options:
   --provider <name>    AI backend: 'openai' (default, metered API) or 'copilot'
                        (GitHub Copilot CLI, gpt-5.4, 0 premium requests). Use
                        'copilot' for large batches to avoid OpenAI token cost.
+  --jobs <N>           Pass 1 parallel workers (default 1 = serial). N>1 analyzes
+                       N documents concurrently; each writes to its own part file
+                       which are merged in order afterwards. Recommend 4-6 for
+                       large batches. Pass 1 is report-only, so parallelism is safe.
 
 Pass 2 (apply) options:
   --apply              Apply an approved report. REQUIRES --resume <run_dir>.
@@ -129,6 +134,9 @@ while [[ $# -gt 0 ]]; do
         --provider)
             [[ $# -ge 2 ]] || { echo "Error: --provider requires a value" >&2; exit 1; }
             AI_PROVIDER_CHOICE="$2"; shift 2 ;;
+        --jobs)
+            [[ $# -ge 2 ]] || { echo "Error: --jobs requires a value" >&2; exit 1; }
+            JOBS="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --apply) APPLY=1; shift ;;
         --yes) ASSUME_YES=1; shift ;;
@@ -151,6 +159,7 @@ done
 
 [[ "$LIMIT" == <-> ]] || { echo "Error: --limit must be an integer" >&2; exit 1; }
 [[ "$OCR_MAX_MB" == <-> ]] || { echo "Error: --ocr-max-mb must be an integer" >&2; exit 1; }
+[[ "$JOBS" == <-> && "$JOBS" -ge 1 ]] || { echo "Error: --jobs must be a positive integer" >&2; exit 1; }
 
 case "$AI_PROVIDER_CHOICE" in
     openai | copilot) ;;
@@ -250,10 +259,14 @@ ledger_add() {
 # Sets globals: NEEDS_OCR (yes/no), OCR_STATUS (ok/failed/skipped)
 analyze_one() {
     local orig="$1"
-    local base work state
+    local base work state uniq
     base="$(basename "$orig")"
-    work="$TMP_ROOT/${$}-${RANDOM}-$base"
-    state="$TMP_ROOT/${$}-${RANDOM}-state.json"
+    # Unique token per invocation. Under parallel execution WORKER_UNIQ is set to
+    # a globally-unique index so concurrent workers never collide on temp names
+    # ($$ is the shared parent PID and $RANDOM can repeat across subshells).
+    uniq="${WORKER_UNIQ:-${$}-${RANDOM}}"
+    work="$TMP_ROOT/${uniq}-$base"
+    state="$TMP_ROOT/${uniq}-state.json"
 
     cp "$orig" "$work"
     touch -r "$orig" "$work" 2>/dev/null || true
@@ -286,8 +299,11 @@ analyze_one() {
 }
 
 # Build one report row (JSON) from a state file + original path facts.
+# Arg 5 (optional) is the destination file; defaults to $REPORT_JSONL. Parallel
+# workers pass a unique per-file part path so concurrent appends never interleave.
 emit_row() {
     local orig="$1" state="$2" needs_ocr="$3" ocr_status="$4"
+    local out_file="${5:-$REPORT_JSONL}"
     local rel_old cur_loc proposed proposed_rel proposed_dir proposed_name resolved_date action
 
     rel_old="${orig#$PAPERWORK_ROOT/}"
@@ -370,7 +386,7 @@ emit_row() {
           action:$action, category:$category, sender:$sender, department:$department,
           date:$date, doc_type:$doc_type, descriptor:$descriptor,
           confidence:$confidence, needs_ocr:$needs_ocr, ocr_status:$ocr_status,
-          review_lane:$review_lane, summary:$summary}' >>"$REPORT_JSONL"
+          review_lane:$review_lane, summary:$summary}' >>"$out_file"
 }
 
 # Derive report.csv from report.jsonl (correct escaping via @csv).
@@ -386,6 +402,44 @@ write_csv() {
                 .confidence,.needs_ocr,.ocr_status,.review_lane,.summary] | @csv' \
             "$REPORT_JSONL"
     } >"$REPORT_CSV"
+}
+
+# Process one file for a parallel Pass 1 worker. Runs in a backgrounded subshell,
+# writing its report row, ledger entry, and a status token to unique per-file
+# part files under $PARTS_DIR. The main process merges the parts (in stable,
+# zero-padded order) after the pool drains, so concurrent workers never append to
+# the shared report.jsonl/ledger.jsonl. Sets WORKER_UNIQ so analyze_one and the
+# Copilot backend use collision-proof temp/working directories.
+process_one_worker() {
+    local orig="$1" idx="$2"
+    local part_json="$PARTS_DIR/${idx}.jsonl"
+    local part_ledger="$PARTS_DIR/${idx}.ledger"
+    local part_status="$PARTS_DIR/${idx}.status"
+    local rel="${orig#$PAPERWORK_ROOT/}"
+
+    export WORKER_UNIQ="$idx"
+
+    NEEDS_OCR="no"; OCR_STATUS="skipped"; STATE_PATH=""
+    analyze_one "$orig"
+    local state="$STATE_PATH"
+    emit_row "$orig" "$state" "$NEEDS_OCR" "$OCR_STATUS" "$part_json"
+    [[ -n "$state" ]] && rm -f "$state" 2>/dev/null || true
+
+    local at; at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [[ -z "$state" ]]; then
+        jq -cn --arg path "$orig" --arg status "error" --arg at "$at" \
+            '{path:$path, status:$status, at:$at}' >"$part_ledger"
+        print -r -- "error" >"$part_status"
+        log_warn "[$idx] $rel -> engine produced no plan (see engine.log)"
+    else
+        jq -cn --arg path "$orig" --arg status "analyzed" --arg at "$at" \
+            '{path:$path, status:$status, at:$at}' >"$part_ledger"
+        print -r -- "analyzed" >"$part_status"
+        local a c
+        a=$(jq -r '.action' "$part_json" 2>/dev/null || echo '?')
+        c=$(jq -r '.confidence' "$part_json" 2>/dev/null || echo '?')
+        log_info "[$idx] $rel -> action=$a confidence=$c ocr=$NEEDS_OCR"
+    fi
 }
 
 # ============================================================================
@@ -911,6 +965,7 @@ log_info "Run dir:    $RUN_DIR"
 log_info "Limit:      $([[ $LIMIT -eq 0 ]] && echo 'all' || echo "$LIMIT")"
 [[ -n "$CATEGORY_FILTER" ]] && log_info "Category:   $CATEGORY_FILTER"
 log_info "AI backend: $AI_PROVIDER_CHOICE$([[ "$AI_PROVIDER_CHOICE" == copilot ]] && echo ' (Copilot CLI, gpt-5.4, 0 premium)' || echo ' (OpenAI API)')"
+log_info "Jobs:       $JOBS$([[ $JOBS -gt 1 ]] && echo ' (parallel)' || echo ' (serial)')"
 [[ $FORCE -eq 1 ]] && log_info "Force:      reprocessing ledger entries"
 
 scan_root="$PAPERWORK_ROOT"
@@ -924,6 +979,10 @@ processed=0
 skipped=0
 errors=0
 
+if [[ $JOBS -le 1 ]]; then
+# ---------------------------------------------------------------------------
+# Serial Pass 1 (default): one file at a time, inline progress logging.
+# ---------------------------------------------------------------------------
 while IFS= read -r orig; do
     [[ -n "$orig" ]] || continue
     rel="${orig#$PAPERWORK_ROOT/}"
@@ -960,6 +1019,63 @@ while IFS= read -r orig; do
 
     [[ "$BATCH_PAUSE" != "0" ]] && sleep "$BATCH_PAUSE"
 done < <(find "$scan_root" -type f -iname '*.pdf' 2>/dev/null | sort)
+
+else
+# ---------------------------------------------------------------------------
+# Parallel Pass 1: enumerate eligible files, then run a bounded pool of $JOBS
+# workers. Each worker writes to its own part files; results are merged in
+# order afterwards. Pass 1 is report-only, so a bad parallel run is discardable.
+# ---------------------------------------------------------------------------
+PARTS_DIR="$RUN_DIR/parts"
+mkdir -p "$PARTS_DIR"
+
+typeset -a queue
+queue=()
+while IFS= read -r orig; do
+    [[ -n "$orig" ]] || continue
+    rel="${orig#$PAPERWORK_ROOT/}"
+    if is_excluded "$rel"; then
+        continue
+    fi
+    if [[ $FORCE -eq 0 ]] && ledger_has "$orig"; then
+        skipped=$((skipped + 1))
+        continue
+    fi
+    queue+=("$orig")
+    if [[ $LIMIT -gt 0 && ${#queue} -ge $LIMIT ]]; then
+        break
+    fi
+done < <(find "$scan_root" -type f -iname '*.pdf' 2>/dev/null | sort)
+
+total=${#queue}
+log_info "Dispatching $total file(s) across $JOBS parallel workers..."
+
+typeset -a pids
+pids=()
+i=0
+for orig in "${queue[@]}"; do
+    i=$((i + 1))
+    idx=$(printf '%06d' "$i")
+    process_one_worker "$orig" "$idx" &
+    pids+=($!)
+    if [[ ${#pids} -ge $JOBS ]]; then
+        wait "${pids[1]}" || true
+        shift pids
+    fi
+done
+wait || true
+
+# Merge part files (zero-padded names sort into stable submission order) into the
+# shared report + ledger, then tally. /dev/null guards against an empty glob
+# under null_glob (which would otherwise make cat read stdin and hang).
+processed=$total
+if [[ $total -gt 0 ]]; then
+    cat /dev/null "$PARTS_DIR"/*.jsonl >>"$REPORT_JSONL"
+    cat /dev/null "$PARTS_DIR"/*.ledger >>"$LEDGER"
+    errors=$(cat /dev/null "$PARTS_DIR"/*.status | grep -c '^error$' || true)
+fi
+rm -rf "$PARTS_DIR" 2>/dev/null || true
+fi
 
 write_csv
 

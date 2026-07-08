@@ -123,19 +123,30 @@ ${user_msg}"
     local base_flags
     base_flags=$(_copilot_base_flags)
 
-    # Run the Copilot CLI in a neutral working directory so it never indexes the
-    # caller's repository. Retry once on empty/invalid output (covers transient
-    # errors and the occasional non-JSON reply).
-    local work_dir="${TMPDIR:-/tmp}"
-    local attempt=0 max_attempts=2
-    local raw content
+    # Run the Copilot CLI in a private, empty working directory so it never
+    # indexes the caller's repository AND so concurrent invocations (parallel
+    # Pass 1 workers) never share a cwd. WORKER_UNIQ, when exported by a parallel
+    # worker, keys the dir; otherwise the PID does. Retry once on empty/invalid
+    # output (covers transient errors and the occasional non-JSON reply).
+    local work_base="${TMPDIR:-/tmp}"
+    local work_dir="$work_base/copilot-work-${WORKER_UNIQ:-$$}-$$"
+    mkdir -p "$work_dir" 2>/dev/null || work_dir="$work_base"
 
+    local attempt=0 max_attempts=2
+    local raw content content_json rc=1 result=""
+
+    # NOTE: callers (the categorization engine) run under `set -o errexit` and
+    # `pipefail`, so every command here must be errexit-safe. copilot and the
+    # parse pipelines can legitimately exit non-zero; we guard them with `|| true`
+    # and track success via `rc` rather than letting a non-zero status abort the
+    # function. Output is buffered in `result` and printed once at the very end so
+    # no post-success command can trip errexit before we return.
     while (( attempt < max_attempts )); do
         attempt=$((attempt + 1))
 
-        raw=$(copilot -p "$prompt" -C "$work_dir" ${=base_flags} 2>/dev/null)
-        content=$(printf '%s\n' "$raw" | _copilot_extract_content)
-        content=$(_strip_code_fence "$content")
+        raw=$(copilot -p "$prompt" -C "$work_dir" ${=base_flags} 2>/dev/null) || true
+        content=$(printf '%s\n' "$raw" | _copilot_extract_content) || true
+        content=$(_strip_code_fence "$content") || true
 
         if [[ -z "$content" ]]; then
             log_warn "Copilot backend: empty content (attempt $attempt/$max_attempts)"
@@ -144,22 +155,26 @@ ${user_msg}"
 
         # For json_schema requests, require valid JSON; normalize to compact.
         if [[ -n "$schema" ]]; then
-            local content_json
             if content_json=$(printf '%s' "$content" | jq -ec . 2>/dev/null); then
-                print -r -- "$content_json"
-                return 0
+                result="$content_json"; rc=0; break
             fi
             log_warn "Copilot backend: response was not valid JSON (attempt $attempt/$max_attempts)"
             continue
         fi
 
         # Plain-text request: return content as-is.
-        print -r -- "$content"
-        return 0
+        result="$content"; rc=0; break
     done
 
-    log_error "Copilot backend: failed to obtain a valid response after $max_attempts attempts"
-    return 1
+    # Clean up the private working directory (best-effort, never fatal).
+    [[ "$work_dir" == "$work_base/copilot-work-"* ]] && rm -rf "$work_dir" 2>/dev/null || true
+
+    if (( rc == 0 )); then
+        print -r -- "$result"
+    else
+        log_error "Copilot backend: failed to obtain a valid response after $max_attempts attempts"
+    fi
+    return $rc
 }
 
 # ----------------------------------------------------------------------------
@@ -169,6 +184,7 @@ ${user_msg}"
 # ----------------------------------------------------------------------------
 get-ai-response() {
     local provider="${AI_PROVIDER:-openai}"
+    [[ -n "${AI_DEBUG_DUMP:-}" ]] && printf '%s' "$1" >"$AI_DEBUG_DUMP" 2>/dev/null || true
     case "$provider" in
         openai)
             get-openai-response "$1"
