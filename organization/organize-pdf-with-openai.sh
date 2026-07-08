@@ -191,12 +191,14 @@ setup_environment() {
     setup_script_logging
     set_log_level "$LOG_LEVEL_NAME"
 
-    log_info "Sourcing Open AI Helpers from $SCRIPT_DIR"
-    if [[ ! -f "$SCRIPT_DIR/../ai/open-ai-functions.sh" ]]; then
-        log_error "OpenAI functions not found at $SCRIPT_DIR/../ai/open-ai-functions.sh"
+    log_info "Sourcing AI provider adapter from $SCRIPT_DIR"
+    if [[ ! -f "$SCRIPT_DIR/../ai/ai-provider.sh" ]]; then
+        log_error "AI provider adapter not found at $SCRIPT_DIR/../ai/ai-provider.sh"
         exit 1
     fi
-    source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
+    # ai-provider.sh transitively sources open-ai-functions.sh and adds the
+    # provider-dispatching facade (get-ai-response) plus the Copilot backend.
+    source "$SCRIPT_DIR/../ai/ai-provider.sh"
 
     # Log header to mark new session start
     log_header "organize-pdf-with-openai.sh"
@@ -1287,7 +1289,7 @@ OUTPUT:
             }
         }')
 
-    get-openai-response "$json_payload"
+    get-ai-response "$json_payload"
 }
 
 validate_ai_response() {

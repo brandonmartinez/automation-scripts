@@ -61,6 +61,7 @@ FORCE=0                    # reprocess files already in the ledger
 APPLY=0                    # Pass 2 apply mode
 RESUME_DIR=""              # reuse an existing run directory (append + resume)
 BATCH_PAUSE="${BACKFILL_BATCH_PAUSE:-0}"  # seconds to sleep between files
+AI_PROVIDER_CHOICE="${AI_PROVIDER:-openai}"  # openai (default) or copilot backend
 
 # ---- Pass 2 (apply) configuration ----
 BACKUP_DEST=""             # tarball backup destination (D1); required to mutate
@@ -86,6 +87,9 @@ Options:
   --force              Reprocess files even if present in the ledger
   --paperwork-dir <p>  Override archive root (default: ~/Documents/Paperwork)
   --pause <seconds>    Sleep between files (gentle throttling). Default: 0
+  --provider <name>    AI backend: 'openai' (default, metered API) or 'copilot'
+                       (GitHub Copilot CLI, gpt-5.4, 0 premium requests). Use
+                       'copilot' for large batches to avoid OpenAI token cost.
 
 Pass 2 (apply) options:
   --apply              Apply an approved report. REQUIRES --resume <run_dir>.
@@ -122,6 +126,9 @@ while [[ $# -gt 0 ]]; do
         --pause)
             [[ $# -ge 2 ]] || { echo "Error: --pause requires a value" >&2; exit 1; }
             BATCH_PAUSE="$2"; shift 2 ;;
+        --provider)
+            [[ $# -ge 2 ]] || { echo "Error: --provider requires a value" >&2; exit 1; }
+            AI_PROVIDER_CHOICE="$2"; shift 2 ;;
         --force) FORCE=1; shift ;;
         --apply) APPLY=1; shift ;;
         --yes) ASSUME_YES=1; shift ;;
@@ -144,6 +151,13 @@ done
 
 [[ "$LIMIT" == <-> ]] || { echo "Error: --limit must be an integer" >&2; exit 1; }
 [[ "$OCR_MAX_MB" == <-> ]] || { echo "Error: --ocr-max-mb must be an integer" >&2; exit 1; }
+
+case "$AI_PROVIDER_CHOICE" in
+    openai | copilot) ;;
+    *) echo "Error: --provider must be 'openai' or 'copilot' (got '$AI_PROVIDER_CHOICE')" >&2; exit 1 ;;
+esac
+# Propagate the provider choice to the categorization engine subprocesses.
+export AI_PROVIDER="$AI_PROVIDER_CHOICE"
 
 if [[ ( $APPLY -eq 1 || $UNDO_MODE -eq 1 ) && -z "$RESUME_DIR" ]]; then
     echo "Error: --apply and --undo require --resume <run_dir> containing report.jsonl" >&2
@@ -896,6 +910,7 @@ log_info "Archive:    $PAPERWORK_ROOT"
 log_info "Run dir:    $RUN_DIR"
 log_info "Limit:      $([[ $LIMIT -eq 0 ]] && echo 'all' || echo "$LIMIT")"
 [[ -n "$CATEGORY_FILTER" ]] && log_info "Category:   $CATEGORY_FILTER"
+log_info "AI backend: $AI_PROVIDER_CHOICE$([[ "$AI_PROVIDER_CHOICE" == copilot ]] && echo ' (Copilot CLI, gpt-5.4, 0 premium)' || echo ' (OpenAI API)')"
 [[ $FORCE -eq 1 ]] && log_info "Force:      reprocessing ledger entries"
 
 scan_root="$PAPERWORK_ROOT"
