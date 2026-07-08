@@ -1665,6 +1665,11 @@ generate_unique_filename() {
     local department_sanitized="$3"
     local descriptor_sanitized="$4"
     local primary_date="$5"
+    # Optional: the real on-disk path of the source document. When a file is
+    # already sitting at its ideal name/location, the destination we compute
+    # below will be that same file. Without this hint the collision loop treats
+    # the file as colliding with itself and appends a spurious "-001" suffix.
+    local orig_source="${6:-}"
 
     local max_filename_length=255
     local date_component="$primary_date"
@@ -1707,6 +1712,12 @@ generate_unique_filename() {
     fi
 
     local new_file="$destination_dir/$base_filename"
+    # A file already sitting at its ideal name/location is not colliding with
+    # itself; return it unchanged rather than appending a spurious "-001".
+    if [[ -n "$orig_source" && -e "$new_file" && "$new_file" -ef "$orig_source" ]]; then
+        echo "$new_file"
+        return
+    fi
     local counter=1
     while [[ -e "$new_file" ]]; do
         local counter_suffix="-$(printf "%03d" $counter)"
@@ -1897,7 +1908,7 @@ organize_and_move_file() {
 
     # Generate unique filename
     local new_file
-    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$file_descriptor_sanitized" "$primary_document_date")
+    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$file_descriptor_sanitized" "$primary_document_date" "${ORIGINAL_FILE_PATH:-$PDF_FILE}")
 
     log_info "Final file destination: $(basename "$new_file")"
     log_debug "Full path: $new_file"

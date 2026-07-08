@@ -288,7 +288,7 @@ analyze_one() {
 
     {
         echo "===== $(date -u +%Y-%m-%dT%H:%M:%SZ) $orig ====="
-        "$ENGINE" --dry-run --state-file "$state" "$work"
+        ORIGINAL_FILE_PATH="$orig" "$ENGINE" --dry-run --state-file "$state" "$work"
     } >>"$ENGINE_LOG" 2>&1 || true
 
     rm -f "$work" 2>/dev/null || true
