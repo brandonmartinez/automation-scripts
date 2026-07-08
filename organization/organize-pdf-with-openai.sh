@@ -88,6 +88,10 @@ declare -g FOLDER_STRUCTURE=""
 declare -g AI_RESPONSE=""
 declare -g AI_CONFIDENCE=""
 declare -g MOVE_FILE=false
+# Reveal the organized file in Finder after filing. Enabled by default for the
+# interactive single-file workflow; set REVEAL_IN_FINDER=false for batch/backfill
+# runs so hundreds of files don't each spawn a Finder window.
+declare -g REVEAL_IN_FINDER="${REVEAL_IN_FINDER:-true}"
 declare -g ADDITIONAL_CONTEXT=""
 declare -g ORGANIZER_DESCRIPTION=""
 declare -g FILE_NAME_DESCRIPTION=""
@@ -191,12 +195,14 @@ setup_environment() {
     setup_script_logging
     set_log_level "$LOG_LEVEL_NAME"
 
-    log_info "Sourcing Open AI Helpers from $SCRIPT_DIR"
-    if [[ ! -f "$SCRIPT_DIR/../ai/open-ai-functions.sh" ]]; then
-        log_error "OpenAI functions not found at $SCRIPT_DIR/../ai/open-ai-functions.sh"
+    log_info "Sourcing AI provider adapter from $SCRIPT_DIR"
+    if [[ ! -f "$SCRIPT_DIR/../ai/ai-provider.sh" ]]; then
+        log_error "AI provider adapter not found at $SCRIPT_DIR/../ai/ai-provider.sh"
         exit 1
     fi
-    source "$SCRIPT_DIR/../ai/open-ai-functions.sh"
+    # ai-provider.sh transitively sources open-ai-functions.sh and adds the
+    # provider-dispatching facade (get-ai-response) plus the Copilot backend.
+    source "$SCRIPT_DIR/../ai/ai-provider.sh"
 
     # Log header to mark new session start
     log_header "organize-pdf-with-openai.sh"
@@ -513,9 +519,19 @@ build_folder_structure_snapshot() {
     rm -f "$structure_file"
 
     if [[ -n "$structure_json" ]]; then
-        local tmp_cache="$cache_file.tmp"
-        printf '%s' "$structure_json" >"$tmp_cache"
-        mv "$tmp_cache" "$cache_file"
+        # Write the cache atomically via a UNIQUE temp file so concurrent engine
+        # invocations (parallel backfill workers) never clobber a shared
+        # "<cache>.tmp" and fail the rename. mktemp guarantees a unique name;
+        # the rename is atomic so readers always see a complete file and the
+        # last concurrent writer simply wins. Never let this trip errexit.
+        local tmp_cache
+        tmp_cache=$(mktemp "$CACHE_DIR/folder-structure-$cache_key-XXXXXX" 2>/dev/null) \
+            || tmp_cache="$cache_file.$$.$RANDOM.tmp"
+        if printf '%s' "$structure_json" >"$tmp_cache" 2>/dev/null; then
+            mv -f "$tmp_cache" "$cache_file" 2>/dev/null || rm -f "$tmp_cache" 2>/dev/null || true
+        else
+            rm -f "$tmp_cache" 2>/dev/null || true
+        fi
     fi
 
     printf '%s' "$structure_json"
@@ -1287,7 +1303,7 @@ OUTPUT:
             }
         }')
 
-    get-openai-response "$json_payload"
+    get-ai-response "$json_payload"
 }
 
 validate_ai_response() {
@@ -1305,6 +1321,41 @@ validate_ai_response() {
         log_error "AI API returned error: $ai_error"
         exit 1
     fi
+}
+
+# Reduce a model-returned field to a single clean folder name. Despite the
+# prompt forbidding it, the model occasionally encodes a breadcrumb path such as
+# "Finance > American Express" or "Finance/Associated Bank/HSA Dept" into a
+# single field; left unsanitized this flattens into the filename (e.g.
+# "2024-05-06 - Finance American Express - ...") and duplicates the department.
+# $1 = raw value; $2 = category (a leading segment equal to it is dropped);
+# $3 = which segment to keep: 'sender'/'single' -> first meaningful segment,
+# 'dept' -> last segment. Slashes, backslashes and '>' are all treated as
+# separators. A value with no separators passes through unchanged.
+sanitize_path_field() {
+    emulate -L zsh
+    setopt extendedglob
+    local raw="$1" cat="$2" want="${3:-single}"
+    [[ -z "$raw" || "$raw" == "null" ]] && { print -r -- "$raw"; return 0; }
+    # Treat backslash, forward slash and '>' all as path separators.
+    local norm
+    norm=$(print -r -- "$raw" | tr '\\>' '//')
+    local -a segs=()
+    local part
+    for part in "${(@s:/:)norm}"; do
+        part="${part##[[:space:]]##}"
+        part="${part%%[[:space:]]##}"
+        [[ -n "$part" ]] && segs+=("$part")
+    done
+    (( ${#segs} == 0 )) && { print -r -- ""; return 0; }
+    # Drop a leading segment that merely repeats the category folder.
+    if [[ -n "$cat" && "${(L)segs[1]}" == "${(L)cat}" && ${#segs} -gt 1 ]]; then
+        shift segs
+    fi
+    case "$want" in
+        dept) print -r -- "${segs[-1]}" ;;
+        *)    print -r -- "${segs[1]}" ;;
+    esac
 }
 
 # Map a model-returned sender to its canonical brand name via SENDER_ALIASES.
@@ -1344,6 +1395,17 @@ extract_categorization_data() {
     category=$(echo "$response" | jq -r '.categorization.category')
     short_summary=$(echo "$response" | jq -r '.categorization.shortSummary' | tr '"' "'")
     organizer_description=$(echo "$response" | jq -r '.categorization.organizerDescription')
+
+    # Defensive breadcrumb stripping: reduce any "Category > Sender > Dept" path
+    # the model may have encoded into a single field down to one clean folder
+    # name, so it never leaks into the folder tree or the filename. category is
+    # sanitized first so it can be stripped from the front of sender/department.
+    category=$(sanitize_path_field "$category" "" single)
+    sender=$(sanitize_path_field "$sender" "$category" sender)
+    sender=$(normalize_sender "$sender")
+    if [[ "$department" != "null" && -n "$department" ]]; then
+        department=$(sanitize_path_field "$department" "$category" dept)
+    fi
 
     # Handle null values
     if [[ "$department" == "null" ]]; then
@@ -1439,8 +1501,17 @@ apply_ai_suggestions() {
     # Canonicalize the sender one final time: apply_ai_suggestions may have
     # overwritten SENDER from existingFolderMatch or suggestedSender (raw model
     # values), so re-run the alias map here as the single choke point before the
-    # plan is recorded.
+    # plan is recorded. Those raw values can themselves be a "Category > Sender >
+    # Department" breadcrumb (normalize_existing_folder_match only understands
+    # '/'-delimited paths and passes ' > '-delimited ones through untouched), so
+    # strip breadcrumbs here too — otherwise they flatten into the filename and
+    # duplicate the department folder.
+    CATEGORY=$(sanitize_path_field "$CATEGORY" "" single)
+    SENDER=$(sanitize_path_field "$SENDER" "$CATEGORY" sender)
     SENDER=$(normalize_sender "$SENDER")
+    if [[ -n "$DEPARTMENT" && "$DEPARTMENT" != "null" ]]; then
+        DEPARTMENT=$(sanitize_path_field "$DEPARTMENT" "$CATEGORY" dept)
+    fi
 
     log_debug "Final parsed values - SENDER: $SENDER, DEPARTMENT: $DEPARTMENT, ADDITIONAL_CONTEXT: $ADDITIONAL_CONTEXT, ORGANIZER_DESCRIPTION: $ORGANIZER_DESCRIPTION, SENT_ON: $SENT_ON, CATEGORY: $CATEGORY"
 }
@@ -1607,6 +1678,11 @@ generate_unique_filename() {
     local department_sanitized="$3"
     local descriptor_sanitized="$4"
     local primary_date="$5"
+    # Optional: the real on-disk path of the source document. When a file is
+    # already sitting at its ideal name/location, the destination we compute
+    # below will be that same file. Without this hint the collision loop treats
+    # the file as colliding with itself and appends a spurious "-001" suffix.
+    local orig_source="${6:-}"
 
     local max_filename_length=255
     local date_component="$primary_date"
@@ -1649,6 +1725,12 @@ generate_unique_filename() {
     fi
 
     local new_file="$destination_dir/$base_filename"
+    # A file already sitting at its ideal name/location is not colliding with
+    # itself; return it unchanged rather than appending a spurious "-001".
+    if [[ -n "$orig_source" && -e "$new_file" && "$new_file" -ef "$orig_source" ]]; then
+        echo "$new_file"
+        return
+    fi
     local counter=1
     while [[ -e "$new_file" ]]; do
         local counter_suffix="-$(printf "%03d" $counter)"
@@ -1839,7 +1921,7 @@ organize_and_move_file() {
 
     # Generate unique filename
     local new_file
-    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$file_descriptor_sanitized" "$primary_document_date")
+    new_file=$(generate_unique_filename "$destination_dir" "$sender_sanitized" "$department_sanitized" "$file_descriptor_sanitized" "$primary_document_date" "${ORIGINAL_FILE_PATH:-$PDF_FILE}")
 
     log_info "Final file destination: $(basename "$new_file")"
     log_debug "Full path: $new_file"
@@ -1868,11 +1950,15 @@ organize_and_move_file() {
     log_info "Setting Finder comments with summary"
     set_finder_comments "$new_file" "$finder_comment"
 
-    # Open destination folder in Finder
-    log_info "Revealing organized PDF in Finder"
-    if ! open -R "$new_file"; then
-        log_warn "Failed to reveal file in Finder; opening destination directory instead"
-        open "$destination_dir"
+    # Open destination folder in Finder (skipped in batch/backfill mode)
+    if [[ "$REVEAL_IN_FINDER" == true ]]; then
+        log_info "Revealing organized PDF in Finder"
+        if ! open -R "$new_file"; then
+            log_warn "Failed to reveal file in Finder; opening destination directory instead"
+            open "$destination_dir"
+        fi
+    else
+        log_debug "REVEAL_IN_FINDER=false; skipping Finder reveal"
     fi
 
     record_action_snapshot "$new_file" "$new_file" "$finder_comment"
