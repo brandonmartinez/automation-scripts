@@ -1319,6 +1319,41 @@ validate_ai_response() {
     fi
 }
 
+# Reduce a model-returned field to a single clean folder name. Despite the
+# prompt forbidding it, the model occasionally encodes a breadcrumb path such as
+# "Finance > American Express" or "Finance/Associated Bank/HSA Dept" into a
+# single field; left unsanitized this flattens into the filename (e.g.
+# "2024-05-06 - Finance American Express - ...") and duplicates the department.
+# $1 = raw value; $2 = category (a leading segment equal to it is dropped);
+# $3 = which segment to keep: 'sender'/'single' -> first meaningful segment,
+# 'dept' -> last segment. Slashes, backslashes and '>' are all treated as
+# separators. A value with no separators passes through unchanged.
+sanitize_path_field() {
+    emulate -L zsh
+    setopt extendedglob
+    local raw="$1" cat="$2" want="${3:-single}"
+    [[ -z "$raw" || "$raw" == "null" ]] && { print -r -- "$raw"; return 0; }
+    # Treat backslash, forward slash and '>' all as path separators.
+    local norm
+    norm=$(print -r -- "$raw" | tr '\\>' '//')
+    local -a segs=()
+    local part
+    for part in "${(@s:/:)norm}"; do
+        part="${part##[[:space:]]##}"
+        part="${part%%[[:space:]]##}"
+        [[ -n "$part" ]] && segs+=("$part")
+    done
+    (( ${#segs} == 0 )) && { print -r -- ""; return 0; }
+    # Drop a leading segment that merely repeats the category folder.
+    if [[ -n "$cat" && "${(L)segs[1]}" == "${(L)cat}" && ${#segs} -gt 1 ]]; then
+        shift segs
+    fi
+    case "$want" in
+        dept) print -r -- "${segs[-1]}" ;;
+        *)    print -r -- "${segs[1]}" ;;
+    esac
+}
+
 # Map a model-returned sender to its canonical brand name via SENDER_ALIASES.
 # Matching is case-insensitive and ignores surrounding whitespace and trailing
 # punctuation. Unknown senders pass through unchanged.
@@ -1356,6 +1391,17 @@ extract_categorization_data() {
     category=$(echo "$response" | jq -r '.categorization.category')
     short_summary=$(echo "$response" | jq -r '.categorization.shortSummary' | tr '"' "'")
     organizer_description=$(echo "$response" | jq -r '.categorization.organizerDescription')
+
+    # Defensive breadcrumb stripping: reduce any "Category > Sender > Dept" path
+    # the model may have encoded into a single field down to one clean folder
+    # name, so it never leaks into the folder tree or the filename. category is
+    # sanitized first so it can be stripped from the front of sender/department.
+    category=$(sanitize_path_field "$category" "" single)
+    sender=$(sanitize_path_field "$sender" "$category" sender)
+    sender=$(normalize_sender "$sender")
+    if [[ "$department" != "null" && -n "$department" ]]; then
+        department=$(sanitize_path_field "$department" "$category" dept)
+    fi
 
     # Handle null values
     if [[ "$department" == "null" ]]; then
