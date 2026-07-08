@@ -55,15 +55,27 @@ ensure_openai_key() {
     return 1
 }
 
-if ! ensure_openai_key; then
-    log_error "OPENAI_API_KEY is not set"
-    exit 1
+# Provider selection: "openai" (default, OpenAI-compatible HTTP API) or
+# "copilot" (headless Copilot CLI, which bills zero premium requests on gpt-5.x).
+AI_PROVIDER="${AI_PROVIDER:-openai}"
+
+# OpenAI credentials are only required when the OpenAI provider is active, so a
+# copilot-only run does not depend on OpenAI keys being present.
+if [[ "$AI_PROVIDER" != "copilot" ]]; then
+    if ! ensure_openai_key; then
+        log_error "OPENAI_API_KEY is not set"
+        exit 1
+    fi
 fi
 
 OPENAI_API_BASE_URL="${OPENAI_API_BASE_URL:-https://api.openai.com/v1}"
 OPENAI_MODEL="${OPENAI_MODEL:-gpt-5.4}"
 # Reasoning effort for GPT-5.x models (minimal|low|medium|high). Set empty to omit.
 OPENAI_REASONING_EFFORT="${OPENAI_REASONING_EFFORT:-low}"
+
+# Copilot headless provider configuration.
+COPILOT_MODEL="${COPILOT_MODEL:-gpt-5.4}"
+COPILOT_CONFIG_HOME="${COPILOT_HOME:-$HOME/.copilot}"
 
 set +a
 
@@ -228,6 +240,125 @@ get-openai-response() {
     fi
 
     echo "$content_json"
+}
+
+# Query the Copilot headless CLI as an alternative provider. Accepts the same
+# OpenAI chat/completions-style payload as get-openai-response (a messages array
+# plus an optional response_format.json_schema) and returns the model's content
+# as a compact JSON string, matching get-openai-response's output contract.
+#
+# Copilot's headless mode has no structured-output parameter, so the JSON schema
+# (when present) is injected into the prompt text. All MCP servers and built-in
+# tools are disabled for speed and determinism. gpt-5.x models bill zero premium
+# requests here.
+get-copilot-response() {
+    log_debug "Preparing request for Copilot headless CLI"
+
+    if ! command -v copilot >/dev/null 2>&1; then
+        log_error "copilot CLI not found on PATH"
+        return 1
+    fi
+
+    local payload="$1"
+
+    local system_msg user_msg schema
+    system_msg=$(printf '%s' "$payload" | jq -r '[.messages[] | select(.role=="system") | .content] | join("\n\n")' 2>/dev/null)
+    user_msg=$(printf '%s' "$payload" | jq -r '[.messages[] | select(.role=="user") | .content] | join("\n\n")' 2>/dev/null)
+    schema=$(printf '%s' "$payload" | jq -c '.response_format.json_schema.schema // empty' 2>/dev/null)
+
+    local prompt="$system_msg"$'\n\n'"$user_msg"
+    if [[ -n "$schema" && "$schema" != "null" ]]; then
+        prompt+=$'\n\n'"Return ONLY a single minified JSON object that validates against the JSON Schema below. Emit no prose, no explanation, and no code fences."$'\n'"JSON Schema:"$'\n'"$schema"
+    fi
+
+    # Lean invocation: disable the built-in and every configured MCP server, and
+    # expose no tools, so no servers connect. Keeps latency low (~4s) and output
+    # deterministic.
+    local -a cop_flags
+    cop_flags=(
+        -p "$prompt"
+        --model "${COPILOT_MODEL:-gpt-5.4}"
+        --output-format json
+        --no-color
+        --disable-builtin-mcps
+        --available-tools ""
+    )
+    local mcp_config="${COPILOT_CONFIG_HOME:-$HOME/.copilot}/mcp-config.json"
+    if [[ -f "$mcp_config" ]]; then
+        local server
+        for server in $(jq -r '.mcpServers // {} | keys[]' "$mcp_config" 2>/dev/null); do
+            cop_flags+=(--disable-mcp-server "$server")
+        done
+    fi
+
+    local out_file
+    out_file=$(mktemp)
+
+    local attempt=0 max_attempts=3 sleep_base=2 cop_status=0
+    while ((attempt < max_attempts)); do
+        attempt=$((attempt + 1))
+        copilot "${cop_flags[@]}" >"$out_file" 2>/dev/null
+        cop_status=$?
+        [[ $cop_status -eq 0 ]] && break
+        log_warn "Copilot request failed (attempt $attempt/$max_attempts); retrying after backoff"
+        command sleep $((sleep_base ** attempt))
+    done
+
+    if [[ $cop_status -ne 0 ]]; then
+        command rm -f "$out_file"
+        log_error "Copilot CLI failed after $max_attempts attempts"
+        return 1
+    fi
+
+    local premium
+    premium=$(jq -r 'select(.type=="result") | .usage.premiumRequests // empty' "$out_file" 2>/dev/null | tail -1) || premium=""
+    [[ -n "$premium" ]] && log_debug "Copilot premiumRequests=$premium"
+
+    local content_raw
+    content_raw=$(jq -r 'select(.type=="assistant.message") | .data.content' "$out_file" 2>/dev/null | tail -1) || content_raw=""
+    command rm -f "$out_file"
+
+    if [[ -z "$content_raw" || "$content_raw" == "null" ]]; then
+        log_error "No assistant content found in Copilot response"
+        return 1
+    fi
+
+    # Defensive: strip code fences the model may have added despite instructions.
+    content_raw=${content_raw//'```json'/}
+    content_raw=${content_raw//'```'/}
+
+    local content_json
+    if print -r -- "$content_raw" | jq -e . >/dev/null 2>&1; then
+        content_json=$(print -r -- "$content_raw" | jq -c .)
+    else
+        # Fallback: reduce to the outermost { ... } span, then re-parse.
+        local body="${content_raw#*\{}"
+        body="{${body}"
+        body="${body%\}*}}"
+        if print -r -- "$body" | jq -e . >/dev/null 2>&1; then
+            content_json=$(print -r -- "$body" | jq -c .)
+        else
+            content_json=$(print -r -- "$content_raw" | jq -Rs '.')
+        fi
+    fi
+
+    if [[ -z "$content_json" || "$content_json" == "null" ]]; then
+        log_error "No usable content parsed from Copilot response"
+        return 1
+    fi
+
+    echo "$content_json"
+}
+
+# Provider dispatcher. Routes to the Copilot headless CLI when AI_PROVIDER is
+# "copilot"; otherwise uses the OpenAI HTTP provider. Callers that want provider
+# selection should invoke this instead of get-openai-response directly.
+get-ai-response() {
+    if [[ "${AI_PROVIDER:-openai}" == "copilot" ]]; then
+        get-copilot-response "$1"
+    else
+        get-openai-response "$1"
+    fi
 }
 
 test-openai-connectivity() {

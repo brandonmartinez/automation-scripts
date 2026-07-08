@@ -1282,7 +1282,7 @@ OUTPUT:
             }
         }')
 
-    get-openai-response "$json_payload"
+    get-ai-response "$json_payload"
 }
 
 validate_ai_response() {
