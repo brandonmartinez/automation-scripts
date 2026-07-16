@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for check-ups-state.sh — polls power state once a minute and,
+  on a utility-power loss, gracefully powers off the NAS before the UPS drains.
+
+  This file is the canonical source in the repo. Install it by symlinking it
+  into ~/Library/LaunchAgents/ and bootstrapping it (see the script header or
+  the install snippet below):
+
+    ln -sf "$HOME/src/automation-scripts/power-management/com.brandonmartinez.check-ups-state.plist" \
+           "$HOME/Library/LaunchAgents/com.brandonmartinez.check-ups-state.plist"
+    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.brandonmartinez.check-ups-state.plist"
+
+  Reload after edits:
+    launchctl bootout  gui/$(id -u)/com.brandonmartinez.check-ups-state 2>/dev/null || true
+    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.brandonmartinez.check-ups-state.plist"
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brandonmartinez.check-ups-state</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brandonmartinez/src/automation-scripts/power-management/check-ups-state.sh</string>
+    </array>
+
+    <!-- Run once at load (immediate check on login/reload) and then every 60s. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <!-- The script self-logs to a rotating file via utilities/logging.sh and is
+         silent on stdout/stderr during routine runs. Discard both streams so
+         nothing accumulates; launchd (unlike cron) never generates mail. -->
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+
+    <!-- Minimal, explicit PATH: pmset, ssh, tmutil, logger all live in the
+         system paths below; homebrew added last for any nix-managed utility. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Keep the agent lightweight; do not relaunch on nonzero exit (the next
+         StartInterval tick will run it again in ~60s anyway). -->
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
