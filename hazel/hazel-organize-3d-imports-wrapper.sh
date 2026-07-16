@@ -3,21 +3,24 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-src="$1"
-inbox="$HOME/Documents/3D Prints/_temp"
-queue="$HOME/.hazel-organize-3d-imports-queue"
 script_dir="$(cd "$(dirname "$0")" && pwd)"
+source "$script_dir/3d-import-job-functions.sh"
 
-mkdir -p "$inbox"
+if [[ $# -ne 1 || ! -d "$1" ]]; then
+    print -u2 -r -- "Usage: $0 <directory>"
+    exit 1
+fi
 
-# Work on a copy so Hazel is free to move the original to Done
-dest="$inbox/$(basename "$src")"
-cp -R "$src" "$dest"
+src="$1"
+worker="${ORGANIZE_3D_WORKER:-$script_dir/hazel-organize-3d-imports-worker.sh}"
+worker_log="${ORGANIZE_3D_WORKER_LOG:-$HOME/Library/Logs/automation-scripts/hazel/hazel-organize-3d-imports-worker.log}"
 
-# Enqueue the copied file for processing
-print -- "$dest" >> "$queue"
+job_id=$(enqueue_3d_import "$src")
+print -r -- "Accepted 3D import job $job_id for $(basename "$src")"
 
-# Kick the worker in the background using local script
-"$script_dir/hazel-organize-3d-imports-worker.sh" & disown
+if [[ "${ORGANIZE_3D_NO_WORKER:-0}" != "1" ]]; then
+    command mkdir -p "$(dirname "$worker_log")"
+    nohup "$worker" </dev/null >>"$worker_log" 2>&1 &!
+fi
 
 exit 0

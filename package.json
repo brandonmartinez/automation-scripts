@@ -5,7 +5,8 @@
   "main": "README.md",
   "scripts": {
     "lint": "shellcheck -s zsh **/*.sh",
-    "format": "shfmt -i 4 -ln zsh -w **/*.sh"
+    "format": "shfmt -i 4 -ln zsh -w **/*.sh",
+    "test:3d": "zsh tests/test-organize-3d-imports.sh && zsh tests/test-3d-import-jobs.sh"
   },
   "keywords": [
     "shell",
