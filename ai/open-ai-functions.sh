@@ -118,6 +118,14 @@ get-folder-list() {
     find "$1" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | tr '\n' ',' | sed 's/,$//'
 }
 
+model-supports-json-schema() {
+    local model="$1"
+    case "$model" in
+        gpt-4o*|gpt-4.1*|gpt-5*|o1*|o3*|o4*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 get-openai-response() {
     log_debug "Preparing request for OpenAI API chat completions"
 
@@ -134,6 +142,25 @@ get-openai-response() {
         request_model="$OPENAI_MODEL"
         # ensure model is set in the body if it was missing
         request_body=$(printf '%s' "$request_body" | jq --arg model "$request_model" '.model = $model')
+    fi
+
+    # GPT-5 chat-completions models only accept the default temperature.
+    if [[ "$request_model" == gpt-5* ]] && [[ "$(printf '%s' "$request_body" | jq -r 'has("temperature")')" == "true" ]]; then
+        log_debug "Removing unsupported temperature for model '$request_model'"
+        request_body=$(printf '%s' "$request_body" | jq 'del(.temperature)')
+    fi
+
+    if [[ "$(printf '%s' "$request_body" | jq -r '.response_format.type // empty')" == "json_schema" ]] &&
+        ! model-supports-json-schema "$request_model"; then
+        local response_schema
+        response_schema=$(printf '%s' "$request_body" | jq -c '.response_format.json_schema.schema')
+        log_debug "Downgrading structured output to json_object for model '$request_model'"
+        request_body=$(printf '%s' "$request_body" | jq --arg schema "$response_schema" '
+            .response_format = {type: "json_object"} |
+            .messages[-1].content += (
+                "\n\nReturn only JSON matching this schema:\n" + $schema
+            )
+        ')
     fi
 
     # Inject reasoning effort for GPT-5.x models unless already set or disabled.

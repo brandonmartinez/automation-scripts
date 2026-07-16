@@ -15,8 +15,11 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
 DEFAULT_STATE_FILENAME="agentic-plan.json"
 SUMMARY_FILENAME="SUMMARY.md"
 readonly BASE_PATH="${ORGANIZE_3D_BASE_PATH:-$HOME/Documents/3D Prints}"
+readonly RECOVERY_ROOT="${ORGANIZE_3D_RECOVERY_DIR:-$BASE_PATH/_recovery}"
+readonly AI_PROMPT_VERSION="3d-import-v2"
 DRY_RUN=0
 SKIP_AI=0
+SKIP_BACKUP=0
 STATE_FILE=""
 STATE_FILE_PROVIDED=0
 STATE_FILE_EPHEMERAL=0
@@ -28,6 +31,7 @@ FILE_INDEX=0
 AI_HELPERS_LOADED=0
 DOCUMENTATION_CONTEXT=""
 FILE_ENTRIES_BUFFER=""
+IMPORT_ID=""
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/organize-3d-imports"
 ARCHIVE_CACHE_TTL=${ARCHIVE_CACHE_TTL:-900}
 typeset -A WEBLOC_URL_REGISTRY=()
@@ -39,6 +43,9 @@ typeset -a IGNORE_PATTERNS=(
     'Thumbs.db'
     'desktop.ini'
     "$DEFAULT_STATE_FILENAME"
+    "$SUMMARY_FILENAME"
+    '*_backup_*.zip'
+    '.3d-print-catalog*'
 )
 
 usage() {
@@ -49,6 +56,7 @@ Options:
   --state-file <path>   Write the JSON state file to this path (default: <folder>/agentic-plan.json)
   --dry-run             Perform analysis and persist state without renaming files
   --skip-ai             Skip the AI planning cycle (state will contain only discovery data)
+  --skip-backup         Skip the recovery archive (intended for read-only backfills/tests)
   -h, --help            Show this help text
 
 The script creates a backup archive, builds a JSON map of every file, runs an
@@ -120,7 +128,7 @@ require_command() {
 }
 
 parse_args() {
-    local args=()
+    local -a args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --state-file)
@@ -135,6 +143,10 @@ parse_args() {
                 ;;
             --skip-ai)
                 SKIP_AI=1
+                shift
+                ;;
+            --skip-backup)
+                SKIP_BACKUP=1
                 shift
                 ;;
             -h|--help)
@@ -191,6 +203,7 @@ validate_environment() {
     [[ -d "$INPUT_PATH" ]] || { echo "Input path must be an existing directory" >&2; exit 1; }
     INPUT_PATH="$(cd "$INPUT_PATH" &>/dev/null && pwd)"
     ORIGINAL_INPUT_PATH="$INPUT_PATH"
+    IMPORT_ID="${ORGANIZE_3D_JOB_ID:-$(date +"%Y%m%dT%H%M%S")-$$}"
 
     require_command jq
     require_command zip
@@ -206,6 +219,9 @@ validate_environment() {
 
     mkdir -p "$BASE_PATH"
     mkdir -p "$CACHE_DIR"
+    if (( ! DRY_RUN )) && (( ! SKIP_BACKUP )); then
+        mkdir -p "$RECOVERY_ROOT/$IMPORT_ID"
+    fi
     WORK_STATE_FILE=$(mktemp -t agentic-state.XXXXXX.json)
     FILE_ENTRIES_BUFFER=$(mktemp -t agentic-files.XXXXXX.json)
 
@@ -218,48 +234,70 @@ validate_environment() {
 
 create_backup_archive() {
     log_divider "BACKUP"
-    if (( DRY_RUN )); then
-        log_info "Dry-run requested; skipping backup archive"
+    if (( DRY_RUN )) || (( SKIP_BACKUP )); then
+        log_info "Recovery archive skipped"
         BACKUP_ARCHIVE=""
         return
     fi
 
-    log_info "Creating backup archive before analysis"
+    log_info "Creating external recovery archive before analysis"
 
-    local timestamp=$(date +"%Y%m%d_%H%M%S")
-    local folder_name="$(basename "$INPUT_PATH")"
-    local parent_dir="$(dirname "$INPUT_PATH")"
-    local backup_name="${folder_name}_backup_${timestamp}.zip"
-    BACKUP_ARCHIVE="$INPUT_PATH/$backup_name"
+    local folder_name parent_dir
+    folder_name="$(basename "$INPUT_PATH")"
+    parent_dir="$(dirname "$INPUT_PATH")"
+    BACKUP_ARCHIVE="$RECOVERY_ROOT/$IMPORT_ID/source.zip"
 
-    (cd "$parent_dir" && zip -qr "$folder_name/$backup_name" "$folder_name" -x "$folder_name/$backup_name") && {
+    if (cd "$parent_dir" && command zip -qr "$BACKUP_ARCHIVE" "$folder_name" \
+        -x "*/$DEFAULT_STATE_FILENAME" "*/$SUMMARY_FILENAME" "*/*_backup_*.zip" \
+        "*/.3d-print-catalog*" "*/.DS_Store" "*/._*"); then
         log_info "Backup created at $BACKUP_ARCHIVE"
-    } || {
-        log_warn "Failed to create backup archive"
-        BACKUP_ARCHIVE=""
-    }
+        return
+    fi
+
+    log_error "Failed to create recovery archive"
+    return 1
 }
 
 initialize_state_document() {
     log_divider "STATE INIT"
-    local generated_at=$(date -Iseconds)
-    local folder_name="$(basename "$INPUT_PATH")"
+    local generated_at folder_name provider model recovery_json
+    generated_at=$(date -Iseconds)
+    folder_name="$(basename "$INPUT_PATH")"
+    provider="${AI_PROVIDER:-openai}"
+    if [[ "$provider" == "copilot" ]]; then
+        model="${COPILOT_MODEL:-gpt-5.4}"
+    else
+        model="${OPENAI_MODEL:-gpt-5.4}"
+    fi
+    recovery_json="null"
+    if [[ -n "$BACKUP_ARCHIVE" ]]; then
+        recovery_json=$(jq -n --arg id "$IMPORT_ID" --arg archive "source.zip" \
+            '{id: $id, archiveName: $archive}')
+    fi
 
     jq -n \
-        --arg schema "1.0" \
+        --arg schema "2.0" \
+        --arg import_id "$IMPORT_ID" \
         --arg generated "$generated_at" \
-        --arg input "$INPUT_PATH" \
         --arg folder "$folder_name" \
-        --arg backup "$BACKUP_ARCHIVE" \
         --arg dry "$DRY_RUN" \
+        --arg provider "$provider" \
+        --arg model "$model" \
+        --arg prompt_version "$AI_PROMPT_VERSION" \
+        --argjson recovery "$recovery_json" \
         '{
             metadata: {
                 schemaVersion: $schema,
+                importId: $import_id,
                 generatedAt: $generated,
-                inputPath: $input,
                 folderName: $folder,
-                backupZip: $backup,
+                recovery: $recovery,
                 dryRun: ($dry == "1"),
+                ai: {
+                    provider: $provider,
+                    model: $model,
+                    promptVersion: $prompt_version
+                },
                 totalFiles: 0,
                 agentCycles: [],
                 duplicates: []
@@ -283,14 +321,16 @@ classify_extension() {
 append_file_entry() {
     local file_path="$1"
     local rel_path="${file_path#$INPUT_PATH/}"
-    local filename="$(basename "$file_path")"
+    local filename
+    filename="$(basename "$file_path")"
     local extension=""
     if [[ "$filename" == *.* ]]; then
         extension="${filename##*.}"
     fi
     local size_bytes
     size_bytes=$(stat -f%z "$file_path" 2>/dev/null || stat -c%s "$file_path" 2>/dev/null || echo 0)
-    local category=$(classify_extension "$extension")
+    local category
+    category=$(classify_extension "$extension")
     local file_id=$FILE_INDEX
     FILE_INDEX=$((FILE_INDEX + 1))
 
@@ -304,7 +344,7 @@ append_file_entry() {
             if [[ -n "${WEBLOC_URL_REGISTRY[$source_url]-}" ]]; then
                 url_duplicate_of="${WEBLOC_URL_REGISTRY[$source_url]}"
             else
-                WEBLOC_URL_REGISTRY[$source_url]="$file_path"
+                WEBLOC_URL_REGISTRY[$source_url]="$rel_path"
             fi
         fi
     fi
@@ -312,7 +352,6 @@ append_file_entry() {
     local file_json
     file_json=$(jq -n \
         --arg id "$file_id" \
-        --arg original "$file_path" \
         --arg relative "$rel_path" \
         --arg name "$filename" \
         --arg ext "${extension:l}" \
@@ -323,7 +362,6 @@ append_file_entry() {
         --arg duplicate "$url_duplicate_of" \
         '{
             id: ($id|tonumber),
-            originalPath: $original,
             relativePath: $relative,
             filename: $name,
             extension: $ext,
@@ -336,7 +374,6 @@ append_file_entry() {
                 folder: null,
                 filename: null,
                 path: null,
-                absolutePath: null,
                 rationale: null
             },
             agentNotes: []
@@ -368,7 +405,7 @@ record_url_duplicates() {
               | select(.urlDuplicateOf != null)
               | {
                     fileId: .id,
-                    originalPath: .originalPath,
+                    relativePath: .relativePath,
                     duplicateOf: .urlDuplicateOf,
                     url: .sourceUrl,
                     type: "url"
@@ -385,9 +422,10 @@ build_file_inventory() {
 
     : >"$FILE_ENTRIES_BUFFER"
     local found_any=0
+    local file base skip pattern
     while IFS= read -r -d '' file; do
-        local base="$(basename "$file")"
-        local skip=0
+        base="$(basename "$file")"
+        skip=0
         for pattern in "${IGNORE_PATTERNS[@]}"; do
             if [[ "$base" == $~pattern ]]; then
                 skip=1
@@ -445,7 +483,8 @@ collect_documentation_context() {
     while IFS= read -r -d '' doc_file; do
         doc_files+=("$doc_file")
     done < <(find "$INPUT_PATH" -maxdepth 1 -type f \
-        \( -iname 'readme' -o -iname 'readme.*' -o -iname '*.md' -o -iname '*.rtf' -o -iname '*.txt' -o -iname '*.pdf' \) -print0)
+        \( -iname 'readme' -o -iname 'readme.*' -o -iname '*.md' -o -iname '*.rtf' -o -iname '*.txt' -o -iname '*.pdf' \) \
+        ! -name "$SUMMARY_FILENAME" ! -name "$DEFAULT_STATE_FILENAME" -print0)
 
     local combined=""
     local max_chars=6000
@@ -662,7 +701,7 @@ get_folder_structure() {
         [[ "$category_name" == _* ]] && continue
 
         local category_json
-        category_json=$(jq -n --arg name "$category_name" --arg path "$category" '{name: $name, path: $path, subcategories: []}')
+        category_json=$(jq -n --arg name "$category_name" '{name: $name, subcategories: []}')
 
         for subfolder in "$category"/*; do
             [[ -d "$subfolder" ]] || continue
@@ -670,7 +709,7 @@ get_folder_structure() {
             [[ "$sub_name" == _* ]] && continue
             local sub_count=$(find "$subfolder" -type f 2>/dev/null | wc -l | tr -d ' ')
             local sub_json
-            sub_json=$(jq -n --arg name "$sub_name" --arg path "$subfolder" --arg count "$sub_count" '{name: $name, path: $path, itemCount: ($count|tonumber)}')
+            sub_json=$(jq -n --arg name "$sub_name" --arg count "$sub_count" '{name: $name, itemCount: ($count|tonumber)}')
             category_json=$(jq --argjson sub "$sub_json" '.subcategories += [$sub]' <<<"$category_json")
         done
 
@@ -703,42 +742,37 @@ enforce_filetype_structure() {
     log_divider "STRUCTURE ENFORCEMENT"
     log_info "Normalizing proposed folders based on file types"
 
+    local entry id extension filename proposed_filename target_folder chosen_name
+    local normalized_name relative_path tmp
     while IFS= read -r entry; do
-        local id extension filename proposed_filename
         id=$(echo "$entry" | jq -r '.id')
         extension=$(echo "$entry" | jq -r '.extension // ""')
         filename=$(echo "$entry" | jq -r '.filename')
         proposed_filename=$(echo "$entry" | jq -r '.proposed.filename // empty')
 
-        local target_folder="$(canonical_folder_for_extension "$extension")"
-        local chosen_name="$filename"
+        target_folder="$(canonical_folder_for_extension "$extension")"
+        chosen_name="$filename"
         if [[ -n "$proposed_filename" ]]; then
             chosen_name="$proposed_filename"
         fi
 
-        local normalized_name
         normalized_name=$(normalize_filename "$chosen_name")
 
-        local relative_path
         if [[ -z "$target_folder" ]]; then
             relative_path="$normalized_name"
         else
             relative_path="$target_folder/$normalized_name"
         fi
 
-        local absolute_path="$INPUT_PATH/$relative_path"
-
-        local tmp=$(mktemp)
+        tmp=$(mktemp)
         jq --arg id "$id" \
             --arg folder "$target_folder" \
             --arg filename "$normalized_name" \
             --arg rel "$relative_path" \
-            --arg abs "$absolute_path" \
             '(.files[] | select(.id == ($id|tonumber))) |= (
                 .proposed.folder = (if $folder == "" then null else $folder end) |
                 .proposed.filename = $filename |
-                .proposed.path = $rel |
-                .proposed.absolutePath = $abs
+                .proposed.path = $rel
             )' "$WORK_STATE_FILE" >"$tmp"
         mv "$tmp" "$WORK_STATE_FILE"
     done < <(jq -c '.files[]' "$WORK_STATE_FILE")
@@ -786,20 +820,58 @@ validate_agent_plan() {
     jq -e \
         --argjson expectedIds "$expected_ids" \
         --argjson expectedCount "$expected_count" \
-        '(.files | type == "array") and
+        '((keys | sort) == ["files"]) and
+         (.files | type == "array") and
          (.files | length == $expectedCount) and
          (([.files[].id] | sort) == $expectedIds) and
          (reduce .files[] as $file (
-             true;
-             . and
-             ($file.id | type == "number") and
-             ($file.proposed | type == "object") and
-             ( ($file.proposed.folder == null) or ($file.proposed.folder | type == "string") ) and
-             ( ($file.proposed.filename == null) or ($file.proposed.filename | type == "string") ) and
-             ( ($file.proposed.path == null) or ($file.proposed.path | type == "string") ) and
-             ( ($file.proposed.absolutePath == null) or ($file.proposed.absolutePath | type == "string") ) and
-             ( ($file.proposed.rationale == null) or ($file.proposed.rationale | type == "string") )
+            true;
+            . and
+            (($file | keys | sort) == ["id", "proposed"]) and
+            ($file.id | type == "number") and
+            ($file.proposed | type == "object") and
+            (($file.proposed | keys | sort) == ["filename", "folder", "path", "rationale"]) and
+            ( ($file.proposed.folder == null) or ($file.proposed.folder | type == "string") ) and
+            ( ($file.proposed.filename == null) or ($file.proposed.filename | type == "string") ) and
+            ( ($file.proposed.path == null) or ($file.proposed.path | type == "string") ) and
+            ( ($file.proposed.rationale == null) or ($file.proposed.rationale | type == "string") ) and
+            (
+                ($file.proposed.path == null) or
+                (
+                    ($file.proposed.path | startswith("/") | not) and
+                    ([$file.proposed.path | split("/")[] | select(. == "" or . == "." or . == "..")] | length == 0)
+                )
+            ) and
+            (
+                ($file.proposed.folder == null) or
+                (
+                    ($file.proposed.folder | startswith("/") | not) and
+                    ([$file.proposed.folder | split("/")[] | select(. == "" or . == "." or . == "..")] | length == 0)
+                )
+            ) and
+            (
+                ($file.proposed.filename == null) or
+                (
+                    ($file.proposed.filename | contains("/") | not) and
+                    ($file.proposed.filename != ".") and
+                    ($file.proposed.filename != "..")
+                )
+            )
          ))' <<<"$plan_json" >/dev/null 2>&1
+}
+
+merge_agent_plan() {
+    local plan_json="$1"
+    local tmp
+    tmp=$(mktemp)
+    jq --argjson plan "$plan_json" '
+        .files |= map(
+           . as $local
+           | ($plan.files[] | select(.id == $local.id)) as $suggestion
+           | .proposed = $suggestion.proposed
+        )
+    ' "$WORK_STATE_FILE" >"$tmp"
+    mv "$tmp" "$WORK_STATE_FILE"
 }
 
 run_agentic_cycle() {
@@ -811,9 +883,23 @@ run_agentic_cycle() {
     log_divider "AI CYCLE"
     ensure_ai_helpers_loaded
 
-    local system_message="You are an expert 3D printing archivist. Given JSON data describing a folder, propose polished folder structures and rename/move plans. Translate all names to clear English when they appear in other languages, normalize punctuation, and return JSON matching the schema you received, updating only metadata.agentCycles and files[].proposed.* fields."
-    local state_blob=$(cat "$WORK_STATE_FILE")
-    local user_message="Analyze the following JSON catalog of files. For each entry, fill the proposed fields with the desired destination folder (relative to the input root), the desired filename, and the combined path. If no change is needed, leave the proposed fields null. Respond with valid JSON only.\n\n$state_blob"
+    local system_message="You are an expert 3D printing archivist. Return only rename and relative-folder suggestions keyed by the supplied immutable file IDs. Never emit absolute paths or parent-directory traversal. Translate non-English names to clear English and normalize punctuation."
+    local state_blob
+    state_blob=$(jq '{
+        folderName: .metadata.folderName,
+        documentationContext: (.metadata.documentationContext // ""),
+        files: [.files[] | {
+            id,
+            relativePath,
+            filename,
+            extension,
+            sizeBytes,
+            category,
+            sourceUrl,
+            linkPreview
+        }]
+    }' "$WORK_STATE_FILE")
+    local user_message="Analyze this immutable file catalog. For every file ID, return proposed folder, filename, combined relative path, and rationale. Use null for unchanged fields. Respond with valid JSON only.\n\n$state_blob"
 
     local escaped_system escaped_user
     escaped_system=$(printf '%s' "$system_message" | jq -R -s .)
@@ -828,11 +914,47 @@ run_agentic_cycle() {
                 {role: "system", content: $sys},
                 {role: "user", content: $usr}
             ],
-            temperature: 0.15
+            temperature: 0.15,
+            response_format: {
+                type: "json_schema",
+                json_schema: {
+                    name: "three_d_file_plan",
+                    strict: true,
+                    schema: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["files"],
+                        properties: {
+                            files: {
+                                type: "array",
+                                items: {
+                                    type: "object",
+                                    additionalProperties: false,
+                                    required: ["id", "proposed"],
+                                    properties: {
+                                        id: {type: "integer"},
+                                        proposed: {
+                                            type: "object",
+                                            additionalProperties: false,
+                                            required: ["folder", "filename", "path", "rationale"],
+                                            properties: {
+                                                folder: {type: ["string", "null"]},
+                                                filename: {type: ["string", "null"]},
+                                                path: {type: ["string", "null"]},
+                                                rationale: {type: ["string", "null"]}
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }')
 
     debug_log_api "AGENTIC_REQUEST" "$payload"
-    local response=$(get-openai-response "$payload")
+    local response=$(get-ai-response "$payload")
     debug_log_api "AGENTIC_RESPONSE" "$response"
 
     if [[ -z "$response" ]]; then
@@ -850,13 +972,7 @@ run_agentic_cycle() {
         exit 1
     fi
 
-    printf '%s' "$response" >"$WORK_STATE_FILE"
-
-    local tmp=$(mktemp)
-    jq 'if (.metadata.duplicates? | type == "array") then . else (.metadata.duplicates = []) end' \
-        "$WORK_STATE_FILE" >"$tmp"
-    mv "$tmp" "$WORK_STATE_FILE"
-    ensure_agent_cycle_timestamps "$WORK_STATE_FILE"
+    merge_agent_plan "$response"
     record_agent_cycle "Primary planning cycle"
 }
 
@@ -873,25 +989,34 @@ persist_state_file() {
     log_info "State written to $STATE_FILE"
 }
 
+is_safe_relative_path() {
+    local relative_path="$1"
+    [[ -n "$relative_path" && "$relative_path" != /* ]] || return 1
+
+    local -a components
+    components=("${(@s:/:)relative_path}")
+    local component
+    for component in "${components[@]}"; do
+        [[ -n "$component" && "$component" != "." && "$component" != ".." ]] || return 1
+    done
+
+    local root candidate
+    root="${INPUT_PATH:A}"
+    candidate="${INPUT_PATH}/${relative_path}"
+    candidate="${candidate:A}"
+    [[ "$candidate" == "$root"/* ]]
+}
+
 resolve_destination_path() {
     local proposed_path="$1"
     local proposed_folder="$2"
     local proposed_filename="$3"
-    local proposed_absolute="$4"
-    local current_relative="$5"
-    local fallback_name="$6"
-
-    if [[ -n "$proposed_absolute" && "$proposed_absolute" != "null" ]]; then
-        echo "$proposed_absolute"
-        return
-    fi
+    local current_relative="$4"
+    local fallback_name="$5"
 
     if [[ -n "$proposed_path" && "$proposed_path" != "null" ]]; then
-        if [[ "$proposed_path" == /* ]]; then
-            echo "$proposed_path"
-        else
-            echo "$INPUT_PATH/$proposed_path"
-        fi
+        is_safe_relative_path "$proposed_path" || return 1
+        echo "$proposed_path"
         return
     fi
 
@@ -909,9 +1034,12 @@ resolve_destination_path() {
     fi
 
     if [[ -z "$folder_component" ]]; then
-        echo "$INPUT_PATH/$filename_component"
+        is_safe_relative_path "$filename_component" || return 1
+        echo "$filename_component"
     else
-        echo "$INPUT_PATH/$folder_component/$filename_component"
+        local destination_relative="$folder_component/$filename_component"
+        is_safe_relative_path "$destination_relative" || return 1
+        echo "$destination_relative"
     fi
 }
 
@@ -930,12 +1058,13 @@ files_identical() {
 
 record_duplicate_detection() {
     local file_id="$1"
-    local original="$2"
-    local existing="$3"
+    local relative_path="$2"
+    local existing_relative="$3"
 
-    local tmp=$(mktemp)
-    jq --arg id "$file_id" --arg orig "$original" --arg dup "$existing" \
-        '.metadata.duplicates += [{ fileId: ($id|tonumber), originalPath: $orig, duplicateOf: $dup }]' \
+    local tmp
+    tmp=$(mktemp)
+    jq --arg id "$file_id" --arg relative "$relative_path" --arg dup "$existing_relative" \
+        '.metadata.duplicates += [{ fileId: ($id|tonumber), relativePath: $relative, duplicateOf: $dup, type: "content" }]' \
         "$STATE_FILE" >"$tmp"
     mv "$tmp" "$STATE_FILE"
 }
@@ -949,20 +1078,35 @@ apply_rename_plan() {
 
     log_info "Applying rename/move plan"
     local applied=0
-    while IFS=$'\t' read -r file_id original_path proposed_path proposed_folder proposed_filename proposed_absolute; do
-        [[ -z "$original_path" || "$original_path" == "null" ]] && continue
+    local file_id relative_path proposed_path proposed_folder proposed_filename
+    local original_path fallback_name destination_relative destination destination_dir
+    local final_destination attempt base ext final_relative tmp
+    while IFS=$'\x1f' read -r file_id relative_path proposed_path proposed_folder proposed_filename; do
+        [[ -z "$relative_path" || "$relative_path" == "null" ]] && continue
+        if ! is_safe_relative_path "$relative_path"; then
+            log_error "Unsafe inventory path rejected: $relative_path"
+            return 1
+        fi
+
+        original_path="${INPUT_PATH}/${relative_path}"
+        if [[ -L "$original_path" ]]; then
+            log_error "Symlinked inventory source rejected: $relative_path"
+            return 1
+        fi
         if [[ ! -e "$original_path" ]]; then
-            log_warn "Original file missing, skipping: $original_path"
+            log_warn "Original file missing, skipping: $relative_path"
             continue
         fi
 
-        local relative_path="${original_path#$INPUT_PATH/}"
-        local fallback_name="$(basename "$original_path")"
-        local destination
-        destination=$(resolve_destination_path "$proposed_path" "$proposed_folder" "$proposed_filename" "$proposed_absolute" "$relative_path" "$fallback_name")
+        fallback_name="$(basename "$original_path")"
+        if ! destination_relative=$(resolve_destination_path "$proposed_path" "$proposed_folder" "$proposed_filename" "$relative_path" "$fallback_name"); then
+            log_error "Unsafe proposed destination rejected for $relative_path"
+            return 1
+        fi
+        destination="${INPUT_PATH}/${destination_relative}"
 
         if [[ -z "$destination" ]]; then
-            log_warn "No destination resolved for $original_path; skipping"
+            log_warn "No destination resolved for $relative_path; skipping"
             continue
         fi
         if [[ "$original_path" == "$destination" ]]; then
@@ -971,18 +1115,18 @@ apply_rename_plan() {
 
         if [[ -e "$destination" ]] && files_identical "$original_path" "$destination"; then
             log_info "Duplicate detected; skipping move for $original_path (matches $destination)"
-            record_duplicate_detection "$file_id" "$original_path" "$destination"
+            record_duplicate_detection "$file_id" "$relative_path" "$destination_relative"
             continue
         fi
 
-        local destination_dir="$(dirname "$destination")"
+        destination_dir="$(dirname "$destination")"
         mkdir -p "$destination_dir"
 
-        local final_destination="$destination"
-        local attempt=1
+        final_destination="$destination"
+        attempt=1
         while [[ -e "$final_destination" ]]; do
-            local base="$(basename "$destination")"
-            local ext=""
+            base="$(basename "$destination")"
+            ext=""
             if [[ "$base" == *.* ]]; then
                 ext=".${base##*.}"
                 base="${base%.*}"
@@ -993,14 +1137,15 @@ apply_rename_plan() {
 
         mv "$original_path" "$final_destination"
         applied=$((applied + 1))
+        final_relative="${final_destination#$INPUT_PATH/}"
 
-        local tmp=$(mktemp)
-        jq --arg id "$file_id" --arg path "$final_destination" \
+        tmp=$(mktemp)
+        jq --arg id "$file_id" --arg path "$final_relative" \
             '(.files[] | select((.id|tostring) == $id)) |= (.appliedPath = $path)' \
             "$STATE_FILE" >"$tmp"
         mv "$tmp" "$STATE_FILE"
-        log_info "Moved $(basename "$original_path") -> $final_destination"
-    done < <(jq -r '.files[] | [(.id|tostring), .originalPath, (.proposed.path // ""), (.proposed.folder // ""), (.proposed.filename // ""), (.proposed.absolutePath // "")] | @tsv' "$STATE_FILE")
+        log_info "Moved $(basename "$original_path") -> $final_relative"
+    done < <(jq -r '.files[] | [(.id|tostring), .relativePath, (.proposed.path // ""), (.proposed.folder // ""), (.proposed.filename // "")] | join("\u001f")' "$STATE_FILE")
 
     log_info "Applied $applied rename operations"
 }
@@ -1050,7 +1195,7 @@ plan_archive_destination() {
             }')
 
         debug_log_api "ARCHIVE_PLAN_REQUEST" "$payload"
-        response=$(get-openai-response "$payload")
+        response=$(get-ai-response "$payload")
         debug_log_api "ARCHIVE_PLAN_RESPONSE" "$response"
 
         if [[ -n "$response" ]] && echo "$response" | jq . >/dev/null 2>&1; then
@@ -1079,14 +1224,12 @@ plan_archive_destination() {
     jq --arg category "$archive_category" \
        --arg sub "$archive_subcategory" \
        --arg folder "$archive_folder" \
-       --arg base "$BASE_PATH" \
        --arg rationale "$rationale" \
-        '.metadata.archivePlan = {
-            category: $category,
-            subcategory: $sub,
-            folderName: $folder,
-            basePath: $base,
-            rationale: (if $rationale == "" then null else $rationale end)
+       '.metadata.archivePlan = {
+           category: $category,
+           subcategory: $sub,
+           folderName: $folder,
+           rationale: (if $rationale == "" then null else $rationale end)
         }' "$STATE_FILE" >"$tmp"
     mv "$tmp" "$STATE_FILE"
 }
@@ -1105,39 +1248,34 @@ apply_archive_destination() {
 
     local category_dir="$BASE_PATH/$archive_category"
     local target_dir="$category_dir/$archive_subcategory"
-    local resolved_destination
+    local resolved_destination relative_destination
 
     if (( DRY_RUN )); then
         resolved_destination=$(resolve_unique_archive_destination "$target_dir" "$archive_folder")
+        relative_destination="${resolved_destination#$BASE_PATH/}"
         log_info "Dry-run: folder would be moved to $resolved_destination"
         local tmp=$(mktemp)
-        jq --arg path "$resolved_destination" '.metadata.archivePlan.destinationPath = $path' "$STATE_FILE" >"$tmp"
+        jq --arg path "$relative_destination" '.metadata.archivePlan.destinationPath = $path' "$STATE_FILE" >"$tmp"
         mv "$tmp" "$STATE_FILE"
         return
     fi
 
     mkdir -p "$target_dir"
     resolved_destination=$(resolve_unique_archive_destination "$target_dir" "$archive_folder")
+    relative_destination="${resolved_destination#$BASE_PATH/}"
 
     log_info "Moving organized folder to archive: $resolved_destination"
     mv "$INPUT_PATH" "$resolved_destination"
     invalidate_archive_cache "$BASE_PATH"
 
-    local updated_backup_path=""
-    if [[ -n "$BACKUP_ARCHIVE" ]]; then
-        updated_backup_path="$resolved_destination/$(basename "$BACKUP_ARCHIVE")"
-        BACKUP_ARCHIVE="$updated_backup_path"
-    fi
-
     INPUT_PATH="$resolved_destination"
     STATE_FILE="$resolved_destination/$DEFAULT_STATE_FILENAME"
 
-    local tmp=$(mktemp)
-    jq --arg dest "$resolved_destination" --arg backup "$updated_backup_path" '
-        .metadata.inputPath = $dest |
-        .metadata.archivePlan.destinationPath = $dest |
-        (if $backup == "" then . else (.metadata.backupZip = $backup) end)
-    ' "$STATE_FILE" >"$tmp"
+    local tmp
+    tmp=$(mktemp)
+    jq --arg dest "$relative_destination" \
+        '.metadata.archivePlan.destinationPath = $dest' \
+        "$STATE_FILE" >"$tmp"
     mv "$tmp" "$STATE_FILE"
 }
 
@@ -1155,9 +1293,9 @@ generate_summary_report() {
         folderName: .metadata.folderName,
         generatedAt: .metadata.generatedAt,
         dryRun: (.metadata.dryRun // false),
-        backupZip: (.metadata.backupZip // ""),
+        recovery: (.metadata.recovery // null),
         totalFiles: (.metadata.totalFiles // 0),
-        plannedMoves: ([.files[] | select(.proposed.path != null or .proposed.absolutePath != null or .proposed.folder != null or .proposed.filename != null)] | length),
+        plannedMoves: ([.files[] | select(.proposed.path != null or .proposed.folder != null or .proposed.filename != null)] | length),
         appliedMoves: ([.files[] | select((.appliedPath? // null) != null)] | length),
         duplicates: (.metadata.duplicates // []),
         archivePlan: (.metadata.archivePlan // {}),
@@ -1165,12 +1303,11 @@ generate_summary_report() {
         documentationContext: (.metadata.documentationContext // ""),
         plannedPreview: ([
             .files[]
-            | select(.proposed.path != null or .proposed.absolutePath != null or .proposed.folder != null or .proposed.filename != null)
+            | select(.proposed.path != null or .proposed.folder != null or .proposed.filename != null)
             | {
-                source: (.relativePath // .originalPath // "(unknown)"),
+                source: (.relativePath // "(unknown)"),
                 destination: (
                     .proposed.path //
-                    .proposed.absolutePath //
                     (if .proposed.folder != null and .proposed.filename != null then .proposed.folder + "/" + .proposed.filename
                      elif .proposed.filename != null then .proposed.filename
                      else .relativePath end) // "(unchanged)"
@@ -1184,8 +1321,7 @@ generate_summary_report() {
     generated_at=$(jq -r '.generatedAt' <<<"$summary_data")
     dry_run_flag=$(jq -r '.dryRun' <<<"$summary_data")
     dry_run_text=$([[ "$dry_run_flag" == "true" ]] && echo "Yes" || echo "No")
-    backup_zip=$(jq -r '.backupZip' <<<"$summary_data")
-    [[ -z "$backup_zip" || "$backup_zip" == "null" ]] && backup_zip="None"
+    backup_zip=$(jq -r 'if .recovery == null then "None" else .recovery.id + "/" + .recovery.archiveName end' <<<"$summary_data")
     total_files=$(jq -r '.totalFiles' <<<"$summary_data")
     planned_moves=$(jq -r '.plannedMoves' <<<"$summary_data")
     applied_moves=$(jq -r '.appliedMoves' <<<"$summary_data")
@@ -1231,7 +1367,7 @@ generate_summary_report() {
         if (.duplicates | length) == 0 then ""
         else
             (["## Duplicates", ""] +
-             (.duplicates | map("- " + (.type // "file") + ": `" + esc(.originalPath // .url) + "` duplicate of `" + esc(.duplicateOf // .url) + "`")))
+             (.duplicates | map("- " + (.type // "file") + ": `" + esc(.relativePath // .url) + "` duplicate of `" + esc(.duplicateOf // .url) + "`")))
             | join("\n")
         end
     ' <<<"$summary_data")
@@ -1297,6 +1433,11 @@ generate_summary_report() {
 }
 
 reveal_result_folder() {
+    if [[ "${ORGANIZE_3D_NO_REVEAL:-0}" == "1" ]]; then
+        log_info "Finder reveal disabled"
+        return
+    fi
+
     local target_path context
     if (( DRY_RUN )); then
         target_path="$ORIGINAL_INPUT_PATH"
@@ -1364,4 +1505,6 @@ main() {
     reveal_result_folder
 }
 
-main "$@"
+if [[ "${ORGANIZE_3D_LIBRARY_ONLY:-0}" != "1" ]]; then
+    main "$@"
+fi
