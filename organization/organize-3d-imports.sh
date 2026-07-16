@@ -12,6 +12,7 @@ if [[ "${TRACE-0}" == "1" ]]; then
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" &>/dev/null && pwd)"
+source "$SCRIPT_DIR/3d-print-catalog-functions.sh"
 DEFAULT_STATE_FILENAME="agentic-plan.json"
 SUMMARY_FILENAME="SUMMARY.md"
 readonly BASE_PATH="${ORGANIZE_3D_BASE_PATH:-$HOME/Documents/3D Prints}"
@@ -208,11 +209,14 @@ validate_environment() {
 
     require_command jq
     require_command zip
+    require_command unzip
     require_command find
     require_command stat
     require_command cmp
     require_command shasum
     require_command sort
+    require_command sqlite3
+    require_command base64
     require_command curl
     require_command xmllint
 
@@ -450,6 +454,22 @@ record_content_duplicates() {
         )
     ' "$WORK_STATE_FILE" >"$tmp"
     mv "$tmp" "$WORK_STATE_FILE"
+}
+
+annotate_archive_catalog_matches() {
+    log_divider "CATALOG COMPARISON"
+    if annotate_3d_catalog_matches "$WORK_STATE_FILE"; then
+        local matched_files duplicates versions exact_project
+        matched_files=$(command jq -r '.metadata.catalog.matchedFiles // 0' "$WORK_STATE_FILE")
+        duplicates=$(command jq -r '.metadata.catalog.duplicateMatches // 0' "$WORK_STATE_FILE")
+        versions=$(command jq -r '.metadata.catalog.versionMatches // 0' "$WORK_STATE_FILE")
+        exact_project=$(command jq -r '.metadata.catalog.exactDuplicateProject.relativePath // empty' "$WORK_STATE_FILE")
+        log_info "Catalog matches: $matched_files files ($duplicates duplicate, $versions version)"
+        [[ -n "$exact_project" ]] && log_warn "Exact archived project match: $exact_project"
+        return 0
+    fi
+    log_warn "Catalog comparison failed; import will continue and backfill can repair the catalog"
+    return 0
 }
 
 build_file_inventory() {
@@ -874,6 +894,49 @@ is_safe_archive_destination() {
     [[ "$resolved" == "$root"/* ]]
 }
 
+directory_hash_inventory_matches_state() {
+    local directory="$1"
+    local state_file="$2"
+    local expected_hashes actual_hashes unsorted_hashes
+    expected_hashes=$(command mktemp -t 3d-expected-hashes.XXXXXX)
+    actual_hashes=$(command mktemp -t 3d-actual-hashes.XXXXXX)
+    unsorted_hashes=$(command mktemp -t 3d-unsorted-hashes.XXXXXX)
+
+    if ! command jq -r '.files[].sha256' "$state_file" | LC_ALL=C command sort >"$expected_hashes"; then
+        command rm -f "$expected_hashes" "$actual_hashes" "$unsorted_hashes"
+        return 1
+    fi
+
+    local file base skip pattern sha256
+    while IFS= read -r -d '' file; do
+        base="${file:t}"
+        skip=0
+        for pattern in "${IGNORE_PATTERNS[@]}"; do
+            if [[ "$base" == $~pattern ]]; then
+                skip=1
+                break
+            fi
+        done
+        (( skip )) && continue
+        if ! sha256=$(command shasum -a 256 "$file" | command awk '{print $1}'); then
+            command rm -f "$expected_hashes" "$actual_hashes" "$unsorted_hashes"
+            return 1
+        fi
+        print -r -- "$sha256" >>"$unsorted_hashes"
+    done < <(command find "$directory" -type f -print0 | LC_ALL=C command sort -z)
+
+    if ! LC_ALL=C command sort "$unsorted_hashes" >"$actual_hashes"; then
+        command rm -f "$expected_hashes" "$actual_hashes" "$unsorted_hashes"
+        return 1
+    fi
+    if command cmp -s "$expected_hashes" "$actual_hashes"; then
+        command rm -f "$expected_hashes" "$actual_hashes" "$unsorted_hashes"
+        return 0
+    fi
+    command rm -f "$expected_hashes" "$actual_hashes" "$unsorted_hashes"
+    return 1
+}
+
 get_folder_structure() {
     local base_path="$1"
     [[ -d "$base_path" ]] || return 1
@@ -1097,7 +1160,8 @@ run_agentic_cycle() {
             category,
             sourceUrl,
             linkPreview,
-            contentDuplicateOf
+            contentDuplicateOf,
+            catalogMatches
         }]
     }' "$WORK_STATE_FILE")
     local user_message="Analyze this immutable file catalog. For every file ID, return proposed folder, filename, combined relative path, and rationale. Use null for unchanged fields. Respond with valid JSON only.\n\n$state_blob"
@@ -1447,9 +1511,125 @@ apply_archive_destination() {
     archive_subcategory=$(sanitize_existing_folder_component "$archive_subcategory")
     archive_folder=$(sanitize_existing_folder_component "$archive_folder")
 
+    local exact_duplicate_relative exact_duplicate_path
+    exact_duplicate_relative=$(command jq -r '.metadata.catalog.exactDuplicateProject.relativePath // empty' "$STATE_FILE")
+    exact_duplicate_path="$BASE_PATH/$exact_duplicate_relative"
+    if [[ -n "$exact_duplicate_relative" && ! -d "$exact_duplicate_path" ]]; then
+        log_warn "Catalog exact-duplicate target is missing; proceeding with a normal archive move"
+        exact_duplicate_relative=""
+    fi
+    if [[ -n "$exact_duplicate_relative" ]] && ! is_safe_archive_destination "$exact_duplicate_path"; then
+        log_error "Unsafe catalog duplicate destination rejected: $exact_duplicate_relative"
+        return 1
+    fi
+    if [[ -n "$exact_duplicate_relative" ]]; then
+        local exact_category exact_subcategory exact_folder
+        local source_resolved target_resolved
+        exact_category=$(command jq -r '.metadata.catalog.exactDuplicateProject.category' "$STATE_FILE")
+        exact_subcategory=$(command jq -r '.metadata.catalog.exactDuplicateProject.subcategory' "$STATE_FILE")
+        exact_folder=$(command jq -r '.metadata.catalog.exactDuplicateProject.folderName' "$STATE_FILE")
+        source_resolved="${INPUT_PATH:A}"
+        target_resolved="${exact_duplicate_path:A}"
+        if [[ "$source_resolved" == "$target_resolved" ]]; then
+            local already_archived_tmp
+            already_archived_tmp=$(command mktemp)
+            command jq \
+                --arg path "$exact_duplicate_relative" \
+                --arg category "$exact_category" \
+                --arg subcategory "$exact_subcategory" \
+                --arg folder "$exact_folder" \
+                '.metadata.archivePlan |= (
+                    .category = $category |
+                    .subcategory = $subcategory |
+                    .folderName = $folder |
+                    .destinationPath = $path |
+                    .disposition = "already-archived"
+                )' "$STATE_FILE" >"$already_archived_tmp"
+            command mv "$already_archived_tmp" "$STATE_FILE"
+            log_info "Input is already the canonical archived project; leaving it in place"
+            return 0
+        fi
+        if [[ "$source_resolved" == "$target_resolved"/* || "$target_resolved" == "$source_resolved"/* ]]; then
+            log_error "Overlapping source and canonical project paths cannot be duplicate-suppressed"
+            return 1
+        fi
+        if (( DRY_RUN )); then
+            local duplicate_tmp
+            duplicate_tmp=$(command mktemp)
+            command jq \
+                --arg path "$exact_duplicate_relative" \
+                --arg category "$exact_category" \
+                --arg subcategory "$exact_subcategory" \
+                --arg folder "$exact_folder" \
+                '.metadata.archivePlan |= (
+                    .category = $category |
+                    .subcategory = $subcategory |
+                    .folderName = $folder |
+                    .destinationPath = $path |
+                    .disposition = "exact-duplicate"
+                )' "$STATE_FILE" >"$duplicate_tmp"
+            command mv "$duplicate_tmp" "$STATE_FILE"
+            log_info "Dry-run: exact duplicate would reuse $BASE_PATH/$exact_duplicate_relative"
+            return 0
+        fi
+
+        if (( SKIP_BACKUP )) || [[ -z "$BACKUP_ARCHIVE" || ! -s "$BACKUP_ARCHIVE" ]] ||
+            ! command unzip -tq "$BACKUP_ARCHIVE" >/dev/null 2>&1; then
+            log_warn "Exact duplicate suppression requires a recovery archive; proceeding with a normal archive move"
+        elif ! directory_hash_inventory_matches_state "$exact_duplicate_path" "$STATE_FILE"; then
+            log_warn "Catalog exact-duplicate target no longer matches on disk; proceeding with a normal archive move"
+        elif ! directory_hash_inventory_matches_state "$INPUT_PATH" "$STATE_FILE"; then
+            log_warn "Duplicate input changed after inventory; preserving it with a normal archive move"
+        else
+            local receipt_path receipt_tmp
+            receipt_path="$RECOVERY_ROOT/$IMPORT_ID/duplicate-import.json"
+            receipt_tmp="$receipt_path.tmp.$$"
+            command mkdir -p "$(dirname "$receipt_path")"
+            command jq \
+                --arg path "$exact_duplicate_relative" \
+                --arg category "$exact_category" \
+                --arg subcategory "$exact_subcategory" \
+                --arg folder "$exact_folder" \
+                '.metadata.archivePlan |= (
+                    .category = $category |
+                    .subcategory = $subcategory |
+                    .folderName = $folder |
+                    .destinationPath = $path |
+                    .disposition = "exact-duplicate"
+                )' "$STATE_FILE" >"$receipt_tmp"
+            command mv "$receipt_tmp" "$receipt_path"
+            if ! command rm -rf "$INPUT_PATH" || [[ -e "$INPUT_PATH" ]]; then
+                log_error "Could not remove the recovered duplicate input at $INPUT_PATH"
+                return 1
+            fi
+            INPUT_PATH="$BASE_PATH/$exact_duplicate_relative"
+            STATE_FILE="$receipt_path"
+            log_info "Exact duplicate suppressed; recovery receipt written to $receipt_path"
+            return 0
+        fi
+    fi
+
     local category_dir="$BASE_PATH/$archive_category"
     local target_dir="$category_dir/$archive_subcategory"
+    local intended_destination="$target_dir/$archive_folder"
     local resolved_destination relative_destination
+
+    if ! is_safe_archive_destination "$intended_destination"; then
+        log_error "Unsafe archive destination rejected: $intended_destination"
+        return 1
+    fi
+    if [[ "${INPUT_PATH:A}" == "${intended_destination:A}" ]]; then
+        relative_destination="${intended_destination#$BASE_PATH/}"
+        local existing_tmp
+        existing_tmp=$(command mktemp)
+        command jq --arg path "$relative_destination" \
+            '.metadata.archivePlan.destinationPath = $path |
+             .metadata.archivePlan.disposition = "already-archived"' \
+            "$STATE_FILE" >"$existing_tmp"
+        command mv "$existing_tmp" "$STATE_FILE"
+        log_info "Input already occupies its planned archive destination; leaving it in place"
+        return 0
+    fi
 
     if (( DRY_RUN )); then
         resolved_destination=$(resolve_unique_archive_destination "$target_dir" "$archive_folder")
@@ -1641,6 +1821,33 @@ generate_summary_report() {
     fi
 }
 
+finalize_3d_catalog() {
+    log_divider "CATALOG UPDATE"
+    local disposition destination category subcategory
+    disposition=$(command jq -r '.metadata.archivePlan.disposition // "archived"' "$STATE_FILE")
+    destination=$(command jq -r '.metadata.archivePlan.destinationPath // empty' "$STATE_FILE")
+    category=$(command jq -r '.metadata.archivePlan.category // "Unsorted"' "$STATE_FILE")
+    subcategory=$(command jq -r '.metadata.archivePlan.subcategory // "Needs Review"' "$STATE_FILE")
+
+    if [[ "$disposition" == "exact-duplicate" ]]; then
+        record_3d_catalog_event "$IMPORT_ID" "$disposition" "" "$destination" ||
+            log_warn "Could not record exact-duplicate catalog event"
+    else
+        if index_3d_project_from_state "$STATE_FILE" "$INPUT_PATH" "valid"; then
+            record_3d_catalog_event "$IMPORT_ID" "$disposition" "$destination" "" ||
+                log_warn "Could not record archive catalog event"
+            apply_3d_project_finder_tags "$INPUT_PATH" "$category" "$subcategory" ||
+                log_warn "Could not apply optional Finder tags to $INPUT_PATH"
+        else
+            log_warn "Catalog indexing failed; the archived project will be repaired by backfill"
+        fi
+    fi
+
+    render_3d_catalog_html || log_warn "Catalog HTML regeneration failed"
+    write_3d_catalog_health_report || log_warn "Catalog health report regeneration failed"
+    return 0
+}
+
 reveal_result_folder() {
     if [[ "${ORGANIZE_3D_NO_REVEAL:-0}" == "1" ]]; then
         log_info "Finder reveal disabled"
@@ -1695,6 +1902,7 @@ main() {
     create_backup_archive
     initialize_state_document
     build_file_inventory
+    annotate_archive_catalog_matches
     collect_documentation_context
     run_agentic_cycle
     if (( SKIP_AI )); then
@@ -1711,6 +1919,7 @@ main() {
     plan_archive_destination
     apply_archive_destination
     generate_summary_report
+    finalize_3d_catalog
     reveal_result_folder
 }
 

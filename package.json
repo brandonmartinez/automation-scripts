@@ -6,7 +6,7 @@
   "scripts": {
     "lint": "shellcheck -s zsh **/*.sh",
     "format": "shfmt -i 4 -ln zsh -w **/*.sh",
-    "test:3d": "zsh tests/test-organize-3d-imports.sh && zsh tests/test-3d-import-jobs.sh"
+    "test:3d": "zsh tests/test-organize-3d-imports.sh && zsh tests/test-3d-import-jobs.sh && zsh tests/test-3d-print-catalog.sh"
   },
   "keywords": [
     "shell",
