@@ -11,7 +11,9 @@ THREE_D_STAGING_ROOT="${ORGANIZE_3D_STAGING_ROOT:-$THREE_D_BASE_PATH/_temp}"
 THREE_D_PENDING_DIR="$THREE_D_SPOOL_ROOT/pending"
 THREE_D_RUNNING_DIR="$THREE_D_SPOOL_ROOT/running"
 THREE_D_FAILED_DIR="$THREE_D_SPOOL_ROOT/failed"
+THREE_D_QUARANTINE_DIR="$THREE_D_SPOOL_ROOT/quarantine"
 THREE_D_DONE_DIR="$THREE_D_SPOOL_ROOT/done"
+THREE_D_STATUS_FILE="$THREE_D_SPOOL_ROOT/status.json"
 
 initialize_3d_job_directories() {
     command mkdir -p \
@@ -19,6 +21,7 @@ initialize_3d_job_directories() {
         "$THREE_D_PENDING_DIR" \
         "$THREE_D_RUNNING_DIR" \
         "$THREE_D_FAILED_DIR" \
+        "$THREE_D_QUARANTINE_DIR" \
         "$THREE_D_DONE_DIR"
 }
 
@@ -30,6 +33,7 @@ generate_3d_job_id() {
         if [[ ! -e "$THREE_D_PENDING_DIR/$candidate" &&
             ! -e "$THREE_D_RUNNING_DIR/$candidate" &&
             ! -e "$THREE_D_FAILED_DIR/$candidate" &&
+            ! -e "$THREE_D_QUARANTINE_DIR/$candidate" &&
             ! -e "$THREE_D_DONE_DIR/$candidate" &&
             ! -e "$THREE_D_STAGING_ROOT/$candidate" ]]; then
             print -r -- "$candidate"
@@ -44,8 +48,9 @@ write_3d_job_manifest() {
     local source_name="$3"
     local staging_path="$4"
     local legacy="${5:-0}"
-    local timestamp
+    local timestamp max_attempts
     timestamp=$(date -Iseconds)
+    max_attempts="${ORGANIZE_3D_MAX_ATTEMPTS:-3}"
 
     command jq -n \
         --arg id "$job_id" \
@@ -53,6 +58,7 @@ write_3d_job_manifest() {
         --arg staging "$staging_path" \
         --arg timestamp "$timestamp" \
         --arg legacy "$legacy" \
+        --arg max_attempts "$max_attempts" \
         '{
             schemaVersion: "1.0",
             id: $id,
@@ -62,6 +68,12 @@ write_3d_job_manifest() {
             createdAt: $timestamp,
             updatedAt: $timestamp,
             attempts: 0,
+            maxAttempts: ($max_attempts | tonumber),
+            nextAttemptAt: null,
+            nextAttemptEpoch: 0,
+            activeWorkerPid: null,
+            lastExitCode: null,
+            lastError: null,
             importedFromLegacyQueue: ($legacy == "1"),
             history: [{
                 state: "pending",
@@ -84,7 +96,14 @@ publish_3d_job() {
         command rm -rf "$job_tmp"
         return 1
     fi
-    command mv "$job_tmp" "$job_final"
+    if ! command mv "$job_tmp" "$job_final"; then
+        command rm -rf "$job_tmp"
+        return 1
+    fi
+    if ! write_3d_spool_status "Job $job_id accepted"; then
+        print -u2 -r -- "WARNING: Job $job_id was accepted, but spool status could not be refreshed"
+    fi
+    return 0
 }
 
 enqueue_3d_import() {
@@ -167,6 +186,201 @@ update_3d_job_state() {
          }]' \
         "$manifest" >"$tmp"
     command mv "$tmp" "$manifest"
+}
+
+claim_3d_job() {
+    local job_dir="$1"
+    local manifest="$job_dir/job.json"
+    local tmp="$manifest.tmp.$$"
+    local timestamp epoch
+    timestamp=$(date -Iseconds)
+    epoch=$(date +%s)
+
+    command jq \
+        --arg timestamp "$timestamp" \
+        --arg epoch "$epoch" \
+        --arg pid "$$" \
+        '.state = "running" |
+         .updatedAt = $timestamp |
+         .attempts = ((.attempts // 0) + 1) |
+         .activeWorkerPid = ($pid | tonumber) |
+         .claimedAt = $timestamp |
+         .claimedAtEpoch = ($epoch | tonumber) |
+         .nextAttemptAt = null |
+         .nextAttemptEpoch = 0 |
+         .history += [{
+             state: "running",
+             at: $timestamp,
+             message: "Worker claimed job"
+         }]' \
+        "$manifest" >"$tmp"
+    command mv "$tmp" "$manifest"
+}
+
+mark_3d_job_failed() {
+    local job_dir="$1"
+    local exit_code="$2"
+    local message="$3"
+    local manifest="$job_dir/job.json"
+    local tmp="$manifest.tmp.$$"
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    command jq \
+        --arg timestamp "$timestamp" \
+        --arg exit_code "$exit_code" \
+        --arg message "$message" \
+        '.state = "failed" |
+         .updatedAt = $timestamp |
+         .activeWorkerPid = null |
+         .lastExitCode = ($exit_code | tonumber) |
+         .lastError = $message |
+         .history += [{
+             state: "failed",
+             at: $timestamp,
+             message: $message
+         }]' \
+        "$manifest" >"$tmp"
+    command mv "$tmp" "$manifest"
+}
+
+schedule_3d_job_retry() {
+    local job_dir="$1"
+    local delay_seconds="$2"
+    local message="$3"
+    local manifest="$job_dir/job.json"
+    local tmp="$manifest.tmp.$$"
+    local timestamp next_epoch next_timestamp
+    timestamp=$(date -Iseconds)
+    next_epoch=$(($(date +%s) + delay_seconds))
+    next_timestamp=$(/bin/date -r "$next_epoch" +"%Y-%m-%dT%H:%M:%S%z")
+
+    command jq \
+        --arg timestamp "$timestamp" \
+        --arg next_timestamp "$next_timestamp" \
+        --arg next_epoch "$next_epoch" \
+        --arg message "$message" \
+        '.state = "pending" |
+         .updatedAt = $timestamp |
+         .nextAttemptAt = $next_timestamp |
+         .nextAttemptEpoch = ($next_epoch | tonumber) |
+         .history += [{
+             state: "pending",
+             at: $timestamp,
+             message: $message
+         }]' \
+        "$manifest" >"$tmp"
+    command mv "$tmp" "$manifest"
+}
+
+quarantine_3d_job() {
+    local job_dir="$1"
+    local message="$2"
+    local manifest="$job_dir/job.json"
+    local tmp="$manifest.tmp.$$"
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    command jq \
+        --arg timestamp "$timestamp" \
+        --arg message "$message" \
+        '.state = "quarantined" |
+         .updatedAt = $timestamp |
+         .activeWorkerPid = null |
+         .nextAttemptAt = null |
+         .nextAttemptEpoch = 0 |
+         .history += [{
+             state: "quarantined",
+             at: $timestamp,
+             message: $message
+         }]' \
+        "$manifest" >"$tmp"
+    command mv "$tmp" "$manifest"
+}
+
+complete_3d_job() {
+    local job_dir="$1"
+    local message="$2"
+    local manifest="$job_dir/job.json"
+    local tmp="$manifest.tmp.$$"
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    command jq \
+        --arg timestamp "$timestamp" \
+        --arg message "$message" \
+        '.state = "done" |
+         .updatedAt = $timestamp |
+         .activeWorkerPid = null |
+         .nextAttemptAt = null |
+         .nextAttemptEpoch = 0 |
+         .lastExitCode = 0 |
+         .lastError = null |
+         .history += [{
+             state: "done",
+             at: $timestamp,
+             message: $message
+         }]' \
+        "$manifest" >"$tmp"
+    command mv "$tmp" "$manifest"
+}
+
+ensure_3d_job_attempt_count() {
+    local job_dir="$1"
+    local minimum_attempts="${2:-1}"
+    local manifest="$job_dir/job.json"
+    local tmp="$manifest.tmp.$$"
+
+    if ! command jq \
+        --arg minimum_attempts "$minimum_attempts" \
+        '.attempts = ([.attempts // 0, ($minimum_attempts | tonumber)] | max)' \
+        "$manifest" >"$tmp"; then
+        command rm -f "$tmp"
+        return 1
+    fi
+    command mv "$tmp" "$manifest"
+}
+
+write_3d_spool_status() {
+    local message="${1:-Status refreshed}"
+    local tmp="$THREE_D_STATUS_FILE.tmp.$$"
+    local timestamp
+    timestamp=$(date -Iseconds)
+
+    local -a pending running failed quarantine done
+    pending=("$THREE_D_PENDING_DIR"/*(N/))
+    running=("$THREE_D_RUNNING_DIR"/*(N/))
+    failed=("$THREE_D_FAILED_DIR"/*(N/))
+    quarantine=("$THREE_D_QUARANTINE_DIR"/*(N/))
+    done=("$THREE_D_DONE_DIR"/*(N/))
+
+    if ! command jq -n \
+        --arg timestamp "$timestamp" \
+        --arg message "$message" \
+        --arg pending "${#pending[@]}" \
+        --arg running "${#running[@]}" \
+        --arg failed "${#failed[@]}" \
+        --arg quarantine "${#quarantine[@]}" \
+        --arg done "${#done[@]}" \
+        '{
+            schemaVersion: "1.0",
+            updatedAt: $timestamp,
+            message: $message,
+            counts: {
+                pending: ($pending | tonumber),
+                running: ($running | tonumber),
+                failed: ($failed | tonumber),
+                quarantined: ($quarantine | tonumber),
+                done: ($done | tonumber)
+            }
+        }' >"$tmp"; then
+        command rm -f "$tmp"
+        return 1
+    fi
+    if ! command mv "$tmp" "$THREE_D_STATUS_FILE"; then
+        command rm -f "$tmp"
+        return 1
+    fi
 }
 
 move_3d_job() {
