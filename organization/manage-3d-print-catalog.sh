@@ -310,6 +310,7 @@ replace_catalog_from_archive() {
         command rm -f "$staged_db" "$staged_db-wal" "$staged_db-shm"
         return 1
     fi
+    command rm -f "$staged_db-wal" "$staged_db-shm"
 
     THREE_D_CATALOG_DB="$final_db"
     if [[ -f "$final_db" ]] &&

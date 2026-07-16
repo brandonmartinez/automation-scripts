@@ -711,6 +711,10 @@ normalize_readable_token() {
     value="${value//+/ }"
     value="${value//_/ }"
     value=$(printf '%s' "$value" | sed -E 's/[^[:alnum:].-]+/ /g')
+    value=$(printf '%s' "$value" | sed -E '
+        s/([mM][0-9]+([.][0-9]+)?) +[xX] +([0-9]+([.][0-9]+)?) +([mM][mM])/\1x\3\5/g
+        s/([0-9]+([.][0-9]+)?) +([mM][mM]|[cC][mM]|[fF][tT]|[gG]|[kK][gG]|[oO][zZ]|[lL][bB]|[mM][lL]|[mM][aA][hH]|[mM][aA]|[aA][hH]|[VWA])/\1\3/g
+    ')
     value=$(printf '%s' "$value" | tr -s ' ')
     value=$(printf '%s' "$value" | sed -E 's/^ +//;s/ +$//')
     [[ -z "$value" ]] && value="Untitled"
@@ -745,7 +749,7 @@ normalize_word_piece() {
         gopro) printf '%s' "GoPro"; return ;;
         youtube) printf '%s' "YouTube"; return ;;
         cyberbrick) printf '%s' "CyberBrick"; return ;;
-        nfc|qr|rfid|usb|hdmi|led|rgb|tpu|pla|petg|abs|asa|cad|cnc|rc|vr|ar|gps|stl|obj|step|iges|3mf)
+        nfc|qr|rfid|usb|hdmi|led|rgb|tpu|pla|petg|abs|asa|cad|cnc|rc|vr|ar|gps|stl|obj|step|iges|3d|3mf)
             printf '%s' "${lower_piece:u}"
             return
             ;;
@@ -769,6 +773,13 @@ normalize_word_piece() {
     fi
     if [[ "$lower_piece" == <->(|.<->)(mm|cm|in|ft|g|kg|oz|lb|ml) ]]; then
         printf '%s' "$lower_piece"
+        return
+    fi
+    if [[ "$lower_piece" == <->(|.<->)[[:alpha:]]* ]]; then
+        local numeric_prefix word_suffix
+        numeric_prefix=$(printf '%s' "$lower_piece" | sed -E 's/^([0-9]+([.][0-9]+)?).*/\1/')
+        word_suffix="${lower_piece#$numeric_prefix}"
+        printf '%s %s' "$numeric_prefix" "$(normalize_word_piece "$word_suffix")"
         return
     fi
     if [[ "$piece" == "${piece:u}" && "$piece" != "${piece:l}" ]]; then
@@ -947,35 +958,53 @@ get_folder_structure() {
     now=$(date +%s)
 
     if [[ -f "$cache_file" ]]; then
-        modified=$(stat -f %m "$cache_file" 2>/dev/null || stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        if ! modified=$(/usr/bin/stat -f %m "$cache_file" 2>/dev/null); then
+            modified=$(command stat -c %Y "$cache_file" 2>/dev/null || echo 0)
+        fi
         if (( now - modified < ARCHIVE_CACHE_TTL )); then
-            cat "$cache_file"
-            return 0
+            if command jq -e '
+                ((.categories | type) == "array") and
+                all(.categories[];
+                    (type == "object") and
+                    ((.name | type) == "string") and
+                    ((.name | length) > 0) and
+                    ((.subcategories | type) == "array") and
+                    all(.subcategories[];
+                        (type == "object") and
+                        ((.name | type) == "string") and
+                        ((.name | length) > 0)
+                    )
+                )
+            ' "$cache_file" >/dev/null 2>&1; then
+                command cat "$cache_file"
+                return 0
+            fi
+            command rm -f "$cache_file"
         fi
     fi
 
-    local structure_file=$(mktemp)
+    local structure_file
+    structure_file=$(command mktemp)
     jq -n '{categories: []}' >"$structure_file"
 
+    local category category_name category_json subfolder sub_name sub_count sub_json updated
     for category in "$base_path"/*; do
         [[ -d "$category" ]] || continue
-        local category_name=$(basename "$category")
+        category_name=$(basename "$category")
         [[ "$category_name" == _* ]] && continue
 
-        local category_json
         category_json=$(jq -n --arg name "$category_name" '{name: $name, subcategories: []}')
 
         for subfolder in "$category"/*; do
             [[ -d "$subfolder" ]] || continue
-            local sub_name=$(basename "$subfolder")
+            sub_name=$(basename "$subfolder")
             [[ "$sub_name" == _* ]] && continue
-            local sub_count=$(find "$subfolder" -type f 2>/dev/null | wc -l | tr -d ' ')
-            local sub_json
+            sub_count=$(find "$subfolder" -type f 2>/dev/null | wc -l | tr -d ' ')
             sub_json=$(jq -n --arg name "$sub_name" --arg count "$sub_count" '{name: $name, itemCount: ($count|tonumber)}')
             category_json=$(jq --argjson sub "$sub_json" '.subcategories += [$sub]' <<<"$category_json")
         done
 
-        local updated=$(mktemp)
+        updated=$(command mktemp)
         jq --argjson category "$category_json" '.categories += [$category]' "$structure_file" >"$updated"
         mv "$updated" "$structure_file"
     done
@@ -1321,6 +1350,62 @@ files_identical() {
     cmp -s "$first" "$second"
 }
 
+files_same_identity() {
+    local first="$1"
+    local second="$2"
+    [[ -f "$first" && -f "$second" ]] || return 1
+
+    local identity_a identity_b
+    if ! identity_a=$(/usr/bin/stat -f '%d:%i' "$first" 2>/dev/null); then
+        identity_a=$(command stat -c '%d:%i' "$first" 2>/dev/null) || return 1
+    fi
+    if ! identity_b=$(/usr/bin/stat -f '%d:%i' "$second" 2>/dev/null); then
+        identity_b=$(command stat -c '%d:%i' "$second" 2>/dev/null) || return 1
+    fi
+    [[ "$identity_a" == "$identity_b" ]]
+}
+
+apply_directory_case() {
+    local destination_dir="$1"
+    [[ "$destination_dir" == "$INPUT_PATH" || "$destination_dir" == "$INPUT_PATH"/* ]] || return 1
+
+    local relative_dir="${destination_dir#$INPUT_PATH/}"
+    [[ "$relative_dir" != "$destination_dir" ]] || return 0
+
+    local -a components
+    components=("${(@s:/:)relative_dir}")
+    local current="$INPUT_PATH"
+    local component entry entry_name actual temporary
+    for component in "${components[@]}"; do
+        actual=""
+        for entry in "$current"/*(DN); do
+            [[ -d "$entry" && ! -L "$entry" ]] || continue
+            entry_name="$(basename "$entry")"
+            if [[ "${entry_name:l}" == "${component:l}" ]]; then
+                actual="$entry"
+                break
+            fi
+        done
+
+        if [[ -z "$actual" ]]; then
+            command mkdir "$current/$component" || return 1
+        elif [[ "$(basename "$actual")" != "$component" ]]; then
+            temporary="$current/.case-rename-dir-$$-$RANDOM"
+            while [[ -e "$temporary" ]]; do
+                temporary="$current/.case-rename-dir-$$-$RANDOM"
+            done
+            if ! command mv "$actual" "$temporary"; then
+                return 1
+            fi
+            if ! command mv "$temporary" "$current/$component"; then
+                command mv "$temporary" "$actual" 2>/dev/null || true
+                return 1
+            fi
+        fi
+        current="$current/$component"
+    done
+}
+
 record_duplicate_detection() {
     local file_id="$1"
     local relative_path="$2"
@@ -1345,7 +1430,7 @@ apply_rename_plan() {
     local applied=0
     local file_id relative_path proposed_path proposed_folder proposed_filename
     local original_path fallback_name destination_relative destination destination_dir
-    local final_destination attempt base ext final_relative tmp
+    local final_destination attempt base ext final_relative tmp case_rename_tmp
     while IFS=$'\x1f' read -r file_id relative_path proposed_path proposed_folder proposed_filename; do
         [[ -z "$relative_path" || "$relative_path" == "null" ]] && continue
         if ! is_safe_relative_path "$relative_path"; then
@@ -1378,29 +1463,43 @@ apply_rename_plan() {
             continue
         fi
 
-        if [[ -e "$destination" ]] && files_identical "$original_path" "$destination"; then
+        destination_dir="$(dirname "$destination")"
+        if [[ -e "$destination" && "${original_path:l}" == "${destination:l}" ]] &&
+            files_same_identity "$original_path" "$destination"; then
+            if ! apply_directory_case "$destination_dir"; then
+                log_error "Case-only directory rename failed for $relative_path"
+                return 1
+            fi
+            case_rename_tmp="$destination_dir/.case-rename-$$-$RANDOM"
+            if ! mv "$original_path" "$case_rename_tmp" || ! mv "$case_rename_tmp" "$destination"; then
+                [[ -e "$case_rename_tmp" && ! -e "$original_path" ]] &&
+                    mv "$case_rename_tmp" "$original_path" 2>/dev/null || true
+                log_error "Case-only rename failed for $relative_path"
+                return 1
+            fi
+            final_destination="$destination"
+        elif [[ -e "$destination" ]] && files_identical "$original_path" "$destination"; then
             log_info "Duplicate detected; skipping move for $original_path (matches $destination)"
             record_duplicate_detection "$file_id" "$relative_path" "$destination_relative"
             continue
+        else
+            mkdir -p "$destination_dir"
+
+            final_destination="$destination"
+            attempt=1
+            while [[ -e "$final_destination" ]]; do
+                base="$(basename "$destination")"
+                ext=""
+                if [[ "$base" == *.* ]]; then
+                    ext=".${base##*.}"
+                    base="${base%.*}"
+                fi
+                final_destination="$destination_dir/${base}_agentic${attempt}${ext}"
+                attempt=$((attempt + 1))
+            done
+
+            mv "$original_path" "$final_destination"
         fi
-
-        destination_dir="$(dirname "$destination")"
-        mkdir -p "$destination_dir"
-
-        final_destination="$destination"
-        attempt=1
-        while [[ -e "$final_destination" ]]; do
-            base="$(basename "$destination")"
-            ext=""
-            if [[ "$base" == *.* ]]; then
-                ext=".${base##*.}"
-                base="${base%.*}"
-            fi
-            final_destination="$destination_dir/${base}_agentic${attempt}${ext}"
-            attempt=$((attempt + 1))
-        done
-
-        mv "$original_path" "$final_destination"
         applied=$((applied + 1))
         final_relative="${final_destination#$INPUT_PATH/}"
 

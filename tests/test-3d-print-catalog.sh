@@ -172,6 +172,32 @@ export ORGANIZE_3D_CATALOG_HTML="$catalog_html"
 export ORGANIZE_3D_CATALOG_HEALTH="$catalog_health"
 source "$CATALOG_FUNCTIONS"
 
+quoted_project="$archive/Quoted/Names/Maker's Part"
+quoted_state="$quoted_project/agentic-plan.json"
+command mkdir -p "$quoted_project"
+print -r -- "quoted model" >"$quoted_project/owner's-model.stl"
+quoted_hash=$(command shasum -a 256 "$quoted_project/owner's-model.stl" | command awk '{print $1}')
+quoted_size=$(command stat -f%z "$quoted_project/owner's-model.stl" 2>/dev/null ||
+    command stat -c%s "$quoted_project/owner's-model.stl")
+command jq -n --arg hash "$quoted_hash" --arg size "$quoted_size" '{
+    metadata: {importId: "quoted", generatedAt: "2026-01-01T00:00:00Z"},
+    files: [{
+        relativePath: "owner\u0027s-model.stl",
+        filename: "owner\u0027s-model.stl",
+        extension: "stl",
+        category: "3d-model",
+        sizeBytes: ($size | tonumber),
+        sha256: $hash
+    }]
+}' >"$quoted_state"
+index_3d_project_from_state "$quoted_state" "$quoted_project" "valid"
+assert_sql "catalog SQL safely indexes apostrophes in project and file names" "Maker's Part|owner's-model.stl" \
+    "$catalog_db" "
+        SELECT p.name || '|' || f.filename
+        FROM projects p JOIN files f ON p.id = f.project_id
+        WHERE p.relative_path = 'Quoted/Names/Maker''s Part';
+    "
+
 overlap_project="$archive/Overlap/Only/Canonical"
 overlap_state="$overlap_project/agentic-plan.json"
 command mkdir -p "$overlap_project"
@@ -191,10 +217,19 @@ command jq -n --arg hash "$overlap_hash" --arg size "$overlap_size" '{
     }]
 }' >"$overlap_state"
 index_3d_project_from_state "$overlap_state" "$overlap_project" "valid"
-if run_organizer "$archive/Overlap/Only"; then
+if overlap_output=$(ORGANIZE_3D_BASE_PATH="$archive" \
+    ORGANIZE_3D_RECOVERY_DIR="$recovery" \
+    ORGANIZE_3D_CATALOG_DB="$catalog_db" \
+    ORGANIZE_3D_CATALOG_HTML="$catalog_html" \
+    ORGANIZE_3D_CATALOG_HEALTH="$catalog_health" \
+    ORGANIZE_3D_NO_REVEAL=1 \
+    command zsh "$ORGANIZER" --skip-ai "$archive/Overlap/Only" 2>&1); then
     fail "overlapping source and canonical paths are rejected"
-else
+elif command grep -Fq "Overlapping source and canonical project paths cannot be duplicate-suppressed" \
+    <<<"$overlap_output"; then
     pass "overlapping source and canonical paths are rejected"
+else
+    fail "overlapping source and canonical paths are rejected for the intended reason"
 fi
 assert_true "overlap rejection preserves canonical archive data" \
     test -f "$overlap_project/model.stl"
@@ -298,6 +333,12 @@ ORGANIZE_3D_BASE_PATH="$archive" \
     ORGANIZE_3D_CATALOG_HTML="$catalog_html" \
     ORGANIZE_3D_CATALOG_HEALTH="$catalog_health" \
     command zsh "$CATALOG_MANAGER" rebuild --archive "$archive" >/dev/null 2>&1
+staged_catalog_artifacts=("$archive"/.3d-print-catalog.sqlite3.staged.*(N))
+if (( ${#staged_catalog_artifacts[@]} == 0 )); then
+    pass "successful rebuild removes SQLite staging sidecars"
+else
+    fail "successful rebuild removes SQLite staging sidecars"
+fi
 
 legacy_after=$(command shasum -a 256 "$legacy_project/widget.FCStd" | command awk '{print $1}')
 if [[ "$legacy_before" == "$legacy_after" && ! -e "$legacy_project/agentic-plan.json" ]]; then

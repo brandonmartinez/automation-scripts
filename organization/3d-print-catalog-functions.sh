@@ -12,7 +12,8 @@ THREE_D_CATALOG_HEALTH="${ORGANIZE_3D_CATALOG_HEALTH:-$THREE_D_CATALOG_BASE/.3d-
 
 catalog_sql_quote() {
     local value="$1"
-    value="${value//\'/\'\'}"
+    local quote="'"
+    value="${value//$quote/$quote$quote}"
     printf "'%s'" "$value"
 }
 
@@ -126,46 +127,23 @@ index_3d_project_from_state() {
         printf "DELETE FROM files WHERE project_id = (SELECT id FROM projects WHERE relative_path = %s);\n" \
             "$(catalog_sql_quote "$project_relative")"
 
-        local file_json file_relative filename extension file_category size_bytes sha256 source_url
-        while IFS= read -r file_json; do
-            file_relative=$(command jq -r '.appliedPath // .relativePath' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            filename=$(command jq -r '(.appliedPath // .relativePath // .filename) | split("/")[-1]' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            extension=$(command jq -r '.extension // ""' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            file_category=$(command jq -r '.category // "other"' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            size_bytes=$(command jq -r '.sizeBytes' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            sha256=$(command jq -r '.sha256' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            source_url=$(command jq -r '.sourceUrl // ""' <<<"$file_json") || {
-                command rm -f "$sql_file"
-                return 1
-            }
-            printf "INSERT INTO files(project_id, relative_path, filename, extension, file_category, size_bytes, sha256, source_url) SELECT id, %s, %s, %s, %s, %s, %s, %s FROM projects WHERE relative_path = %s;\n" \
-                "$(catalog_sql_quote "$file_relative")" \
-                "$(catalog_sql_quote "$filename")" \
-                "$(catalog_sql_quote "$extension")" \
-                "$(catalog_sql_quote "$file_category")" \
-                "$size_bytes" \
-                "$(catalog_sql_quote "$sha256")" \
-                "$(catalog_sql_nullable "$source_url")" \
-                "$(catalog_sql_quote "$project_relative")"
-        done < <(command jq -c '.files[]' "$state_file")
+        if ! command jq -r --arg project "$project_relative" --arg quote "'" '
+            def sqlq:
+                $quote + gsub($quote; $quote + $quote) + $quote;
+            .files[] |
+            (.appliedPath // .relativePath) as $path |
+            (($path // .filename) | split("/")[-1]) as $filename |
+            (
+                if (.sourceUrl // "") == ""
+                then "NULL"
+                else (.sourceUrl | sqlq)
+                end
+            ) as $source_url |
+            "INSERT INTO files(project_id, relative_path, filename, extension, file_category, size_bytes, sha256, source_url) SELECT id, \(($path | sqlq)), \(($filename | sqlq)), \(((.extension // "") | sqlq)), \(((.category // "other") | sqlq)), \(.sizeBytes), \((.sha256 | sqlq)), \($source_url) FROM projects WHERE relative_path = \(($project | sqlq));"
+        ' "$state_file"; then
+            command rm -f "$sql_file"
+            return 1
+        fi
         printf '%s\n' "COMMIT;"
     } >"$sql_file"
 

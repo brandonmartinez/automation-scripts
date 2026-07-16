@@ -200,6 +200,21 @@ test_deterministic_normalization_and_taxonomy() {
     assert_equal "decimal dimensions retain their numeric meaning" \
         "Spacer 2.5mm M3x0.5mm.stl" \
         "$(normalize_filename "spacer_2.5mm_M3x0.5mm.STL")"
+    assert_equal "spaced metric thread tokens are rejoined before title casing" \
+        "Desk Cable Clip M3x0.5mm.stl" \
+        "$(normalize_filename "desk cable clip M3 x 0.5 mm.STL")"
+    assert_equal "spaced gram units are rejoined before title casing" \
+        "Filament 500g Spool.stl" \
+        "$(normalize_filename "filament 500 g spool.STL")"
+    assert_equal "ordinary in phrases are not treated as measurements" \
+        "Model 3 In One.stl" \
+        "$(normalize_filename "model 3 in one.STL")"
+    assert_equal "numeric-to-word boundaries are restored" \
+        "Phase 6 Adjustable Monitor Riser.stl" \
+        "$(normalize_filename "phase 6adjustable monitor riser.STL")"
+    assert_equal "recognized numeric technical tokens remain joined" \
+        "3D Printer 32V 2.5mm.stl" \
+        "$(normalize_filename "3d printer 32V 2.5mm.STL")"
     assert_equal "unlisted uppercase technical acronyms are preserved" \
         "24V PSU PCB Mount.stl" \
         "$(normalize_filename "24V_PSU_PCB_mount.STL")"
@@ -246,6 +261,91 @@ test_deterministic_normalization_and_taxonomy() {
         is_safe_archive_destination "$BASE_PATH/../escaped-project"
 }
 
+test_case_only_rename() {
+    log_divider() { :; }
+    log_info() { :; }
+    log_warn() { :; }
+    log_error() { :; }
+
+    local tmp_dir
+    tmp_dir=$(command mktemp -d)
+    INPUT_PATH="$tmp_dir/input"
+    STATE_FILE="$tmp_dir/state.json"
+    command mkdir -p "$INPUT_PATH"
+    print -r -- "notes" >"$INPUT_PATH/print notes.txt"
+    command mkdir -p "$INPUT_PATH/files/stls"
+    print -r -- "model" >"$INPUT_PATH/files/stls/model.stl"
+    command jq -n '{
+        metadata: {duplicates: []},
+        files: [
+            {
+                id: 0,
+                relativePath: "print notes.txt",
+                proposed: {
+                    path: null,
+                    folder: ".",
+                    filename: "Print Notes.txt"
+                }
+            },
+            {
+                id: 1,
+                relativePath: "files/stls/model.stl",
+                proposed: {
+                    path: "files/STLs/Model.stl",
+                    folder: null,
+                    filename: null
+                }
+            }
+        ]
+    }' >"$STATE_FILE"
+
+    apply_rename_plan
+
+    assert_equal "case-only rename records the desired casing" \
+        "Print Notes.txt" \
+        "$(command jq -r '.files[0].appliedPath' "$STATE_FILE")"
+    assert_equal "case-only rename updates the on-disk basename" \
+        "Print Notes.txt" \
+        "$(command find "$INPUT_PATH" -maxdepth 1 -type f -exec basename {} \;)"
+    assert_equal "case-only rename records parent-directory casing" \
+        "files/STLs/Model.stl" \
+        "$(command jq -r '.files[1].appliedPath' "$STATE_FILE")"
+    assert_equal "case-only rename updates parent-directory casing on disk" \
+        "./Print Notes.txt
+./files/STLs/Model.stl" \
+        "$(cd "$INPUT_PATH" && command find . -type f | LC_ALL=C command sort)"
+
+    command rm -rf "$tmp_dir"
+}
+
+test_malformed_archive_cache_rebuild() {
+    local tmp_dir prior_cache_dir cache_key cache_file structure
+    tmp_dir=$(command mktemp -d)
+    prior_cache_dir="$CACHE_DIR"
+    CACHE_DIR="$tmp_dir/cache"
+    command mkdir -p "$CACHE_DIR" "$tmp_dir/archive/Category/Subcategory"
+    print -r -- "model" >"$tmp_dir/archive/Category/Subcategory/model.stl"
+    cache_key=$(printf '%s' "$tmp_dir/archive" | command cksum | command awk '{print $1}')
+    cache_file="$CACHE_DIR/archive-structure-$cache_key.json"
+    print -r -- '{"categories":[7]}' >"$cache_file"
+
+    structure=$(get_folder_structure "$tmp_dir/archive")
+
+    if command jq -e '
+        .categories == [{
+            name: "Category",
+            subcategories: [{name: "Subcategory", itemCount: 1}]
+        }]
+    ' <<<"$structure" >/dev/null; then
+        pass "malformed archive cache is rebuilt from disk"
+    else
+        fail "malformed archive cache is rebuilt from disk"
+    fi
+
+    CACHE_DIR="$prior_cache_dir"
+    command rm -rf "$tmp_dir"
+}
+
 test_model_capabilities() {
     log_info() { :; }
     LOGGING_INITIALIZED=1
@@ -260,6 +360,8 @@ ORGANIZE_3D_LIBRARY_ONLY=1 source "$ORGANIZER"
 
 test_agent_plan_boundary
 test_deterministic_normalization_and_taxonomy
+test_case_only_rename
+test_malformed_archive_cache_rebuild
 test_external_recovery_and_relative_state
 test_model_capabilities
 
