@@ -16,7 +16,7 @@ DEFAULT_STATE_FILENAME="agentic-plan.json"
 SUMMARY_FILENAME="SUMMARY.md"
 readonly BASE_PATH="${ORGANIZE_3D_BASE_PATH:-$HOME/Documents/3D Prints}"
 readonly RECOVERY_ROOT="${ORGANIZE_3D_RECOVERY_DIR:-$BASE_PATH/_recovery}"
-readonly AI_PROMPT_VERSION="3d-import-v2"
+readonly AI_PROMPT_VERSION="3d-import-v3"
 DRY_RUN=0
 SKIP_AI=0
 SKIP_BACKUP=0
@@ -35,6 +35,7 @@ IMPORT_ID=""
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/organize-3d-imports"
 ARCHIVE_CACHE_TTL=${ARCHIVE_CACHE_TTL:-900}
 typeset -A WEBLOC_URL_REGISTRY=()
+typeset -A CONTENT_HASH_REGISTRY=()
 
 
 typeset -a IGNORE_PATTERNS=(
@@ -210,6 +211,8 @@ validate_environment() {
     require_command find
     require_command stat
     require_command cmp
+    require_command shasum
+    require_command sort
     require_command curl
     require_command xmllint
 
@@ -309,11 +312,13 @@ initialize_state_document() {
 classify_extension() {
     local ext="${1:l}"
     case "$ext" in
-        stl|obj|3mf|step|stp|f3d|blend|scad|shapr) echo "3d-model" ;;
-        gcode) echo "print-export" ;;
-        jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff) echo "image" ;;
-        pdf|md|txt|rtf|html|htm|doc|docx) echo "documentation" ;;
+        stl|obj|3mf|amf|ply|glb|gltf|dae|3ds|wrl|vrml|x3d) echo "3d-model" ;;
+        step|stp|iges|igs|brep|sat|x_t|x_b|f3d|f3z|sldprt|sldasm|ipt|iam|catpart|catproduct|fcstd|blend|scad|shapr|skp|dwg|dxf) echo "3d-model" ;;
+        gcode|bgcode|gx|x3g|ufp|nc) echo "print-export" ;;
+        jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff|svg) echo "image" ;;
+        pdf|md|txt|rtf|html|htm|doc|docx|odt|pages|webloc|url) echo "documentation" ;;
         json|csv|yaml|yml) echo "data" ;;
+        zip|7z|rar|tar|gz|bz2|xz) echo "archive" ;;
         *) echo "other" ;;
     esac
 }
@@ -329,8 +334,15 @@ append_file_entry() {
     fi
     local size_bytes
     size_bytes=$(stat -f%z "$file_path" 2>/dev/null || stat -c%s "$file_path" 2>/dev/null || echo 0)
-    local category
+    local category sha256 content_duplicate_of
     category=$(classify_extension "$extension")
+    sha256=$(command shasum -a 256 "$file_path" | command awk '{print $1}')
+    content_duplicate_of=""
+    if [[ -n "${CONTENT_HASH_REGISTRY[$sha256]-}" ]]; then
+        content_duplicate_of="${CONTENT_HASH_REGISTRY[$sha256]}"
+    else
+        CONTENT_HASH_REGISTRY[$sha256]="$rel_path"
+    fi
     local file_id=$FILE_INDEX
     FILE_INDEX=$((FILE_INDEX + 1))
 
@@ -356,20 +368,24 @@ append_file_entry() {
         --arg name "$filename" \
         --arg ext "${extension:l}" \
         --arg size "$size_bytes" \
+        --arg sha256 "$sha256" \
         --arg category "$category" \
         --arg source "$source_url" \
         --arg preview "$link_preview" \
         --arg duplicate "$url_duplicate_of" \
+        --arg content_duplicate "$content_duplicate_of" \
         '{
             id: ($id|tonumber),
             relativePath: $relative,
             filename: $name,
             extension: $ext,
             sizeBytes: ($size|tonumber),
+            sha256: $sha256,
             category: $category,
             sourceUrl: (if $source == "" then null else $source end),
             linkPreview: (if $preview == "" then null else $preview end),
             urlDuplicateOf: (if $duplicate == "" then null else $duplicate end),
+            contentDuplicateOf: (if $content_duplicate == "" then null else $content_duplicate end),
             proposed: {
                 folder: null,
                 filename: null,
@@ -395,6 +411,7 @@ finalize_file_inventory() {
     mv "$tmp" "$WORK_STATE_FILE"
 
     record_url_duplicates
+    record_content_duplicates
 }
 
 record_url_duplicates() {
@@ -416,11 +433,33 @@ record_url_duplicates() {
     mv "$tmp" "$WORK_STATE_FILE"
 }
 
+record_content_duplicates() {
+    local tmp=$(mktemp)
+    jq '
+        .metadata.duplicates += (
+            [ .files[]
+              | select(.contentDuplicateOf != null)
+              | {
+                    fileId: .id,
+                    relativePath: .relativePath,
+                    duplicateOf: .contentDuplicateOf,
+                    sha256: .sha256,
+                    type: "content"
+                }
+            ]
+        )
+    ' "$WORK_STATE_FILE" >"$tmp"
+    mv "$tmp" "$WORK_STATE_FILE"
+}
+
 build_file_inventory() {
     log_divider "DISCOVERY"
     log_info "Scanning directory tree for files"
 
     : >"$FILE_ENTRIES_BUFFER"
+    FILE_INDEX=0
+    WEBLOC_URL_REGISTRY=()
+    CONTENT_HASH_REGISTRY=()
     local found_any=0
     local file base skip pattern
     while IFS= read -r -d '' file; do
@@ -436,7 +475,7 @@ build_file_inventory() {
 
         append_file_entry "$file"
         found_any=1
-    done < <(find "$INPUT_PATH" -type f -print0)
+    done < <(find "$INPUT_PATH" -type f -print0 | LC_ALL=C command sort -z)
 
     if (( ! found_any )); then
         log_error "No files discovered in $INPUT_PATH"
@@ -542,10 +581,20 @@ canonical_folder_for_extension() {
         scad) echo "files/SCADs" ;;
         shapr) echo "files/Shaprs" ;;
         3mf) echo "files" ;;
-        gcode) echo "exports" ;;
-        jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff) echo "images" ;;
-        pdf|md|txt|rtf|html|htm|doc|docx) echo "" ;;
+        amf|ply|glb|gltf|dae|3ds|wrl|vrml|x3d) echo "files/Meshes" ;;
+        iges|igs) echo "files/IGES" ;;
+        f3z) echo "files/F3Ds" ;;
+        sldprt|sldasm) echo "files/SOLIDWORKS" ;;
+        ipt|iam) echo "files/Autodesk Inventor" ;;
+        catpart|catproduct) echo "files/CATIA" ;;
+        fcstd) echo "files/FreeCAD" ;;
+        skp) echo "files/SketchUp" ;;
+        brep|sat|x_t|x_b|dwg|dxf) echo "files/CAD" ;;
+        gcode|bgcode|gx|x3g|ufp|nc) echo "exports" ;;
+        jpg|jpeg|png|heic|heif|bmp|gif|webp|tif|tiff|svg) echo "images" ;;
+        pdf|md|txt|rtf|html|htm|doc|docx|odt|pages|webloc|url) echo "" ;;
         json|csv|yaml|yml) echo "data" ;;
+        zip|7z|rar|tar|gz|bz2|xz) echo "source" ;;
         *) echo "misc" ;;
     esac
 }
@@ -558,15 +607,90 @@ sanitize_folder_component() {
     value=$(echo "$value" | sed -E 's/ +- +/ - /g')
     value=$(echo "$value" | tr -s ' ' ' ')
     value=$(echo "$value" | sed 's/^ *//;s/ *$//')
-    [[ -z "$value" ]] && value="Unsorted Project"
+    [[ -z "$value" || "$value" == "." || "$value" == ".." ]] && value="Unsorted Project"
     echo "$value"
+}
+
+sanitize_existing_folder_component() {
+    local value="$1"
+    value=$(printf '%s' "$value" | tr '\r\n\t' '   ')
+    value=$(printf '%s' "$value" | sed 's#[/:*?"<>|]#-#g')
+    value=$(printf '%s' "$value" | sed -E 's/-{2,}/-/g; s/^ +//; s/ +$//')
+    [[ -z "$value" || "$value" == "." || "$value" == ".." ]] && value="Unsorted Project"
+    printf '%s\n' "$value"
+}
+
+taxonomy_alias_key() {
+    local value="${1:l}"
+    value="${value//&/ and }"
+    value=$(printf '%s' "$value" | sed -E 's/[^[:alnum:]]+//g')
+    printf '%s\n' "$value"
+}
+
+canonical_category_alias() {
+    local value="$1"
+    local key
+    key=$(taxonomy_alias_key "$value")
+    case "$key" in
+        artsandcrafts|artscrafts) printf '%s\n' "Arts and Crafts" ;;
+        computerandgameconsoleparts|computersandgameconsoleparts) printf '%s\n' "Computer and Game Console Parts" ;;
+        printerscuttersandmediamachinespartsandtools) printf '%s\n' "Printers, Cutters, and Media Machines Parts and Tools" ;;
+        rccarsandcyberbrick) printf '%s\n' "RC Cars and CyberBrick" ;;
+        sportsandrecreation) printf '%s\n' "Sports and Recreation" ;;
+        toysgamesandcharacters|toysandgamesandcharacters) printf '%s\n' "Toys, Games, and Characters" ;;
+        *) printf '%s\n' "$value" ;;
+    esac
+}
+
+canonicalize_archive_category() {
+    local candidate="$1"
+    local structure_json="$2"
+    local preferred candidate_key existing existing_canonical exact
+    local -a existing_names
+    preferred=$(canonical_category_alias "$candidate")
+    exact=$(command jq -r --arg preferred "$preferred" \
+        '[.categories[].name | select(. == $preferred)][0] // empty' <<<"$structure_json")
+    if [[ -n "$exact" ]]; then
+        printf '%s\n' "$exact"
+        return
+    fi
+
+    candidate_key=$(taxonomy_alias_key "$preferred")
+    existing_names=("${(@f)$(command jq -r '.categories[].name' <<<"$structure_json")}")
+    for existing in "${existing_names[@]}"; do
+        existing_canonical=$(canonical_category_alias "$existing")
+        if [[ "$existing_canonical" == "$preferred" ||
+            "$(taxonomy_alias_key "$existing_canonical")" == "$candidate_key" ]]; then
+            printf '%s\n' "$existing"
+            return
+        fi
+    done
+    sanitize_folder_component "$preferred"
+}
+
+canonicalize_archive_subcategory() {
+    local candidate="$1"
+    local category="$2"
+    local structure_json="$3"
+    local candidate_key existing
+    local -a existing_names
+    candidate_key=$(taxonomy_alias_key "$candidate")
+    existing_names=("${(@f)$(command jq -r --arg category "$category" \
+        '.categories[] | select(.name == $category) | .subcategories[].name' <<<"$structure_json")}")
+    for existing in "${existing_names[@]}"; do
+        if [[ "$(taxonomy_alias_key "$existing")" == "$candidate_key" ]]; then
+            printf '%s\n' "$existing"
+            return
+        fi
+    done
+    sanitize_folder_component "$candidate"
 }
 
 normalize_readable_token() {
     local value="$1"
     value="${value//+/ }"
     value="${value//_/ }"
-    value=$(printf '%s' "$value" | sed -E 's/[^[:alnum:]-]+/ /g')
+    value=$(printf '%s' "$value" | sed -E 's/[^[:alnum:].-]+/ /g')
     value=$(printf '%s' "$value" | tr -s ' ')
     value=$(printf '%s' "$value" | sed -E 's/^ +//;s/ +$//')
     [[ -z "$value" ]] && value="Untitled"
@@ -574,32 +698,100 @@ normalize_readable_token() {
     printf '%s\n' "$value"
 }
 
+normalize_word_piece() {
+    local piece="$1"
+    local lower_piece="${piece:l}"
+    case "$lower_piece" in
+        ipad) printf '%s' "iPad"; return ;;
+        iphone) printf '%s' "iPhone"; return ;;
+        imac) printf '%s' "iMac"; return ;;
+        ios) printf '%s' "iOS"; return ;;
+        macos) printf '%s' "macOS"; return ;;
+        makerworld) printf '%s' "MakerWorld"; return ;;
+        bambulab) printf '%s' "Bambu Lab"; return ;;
+        bambustudio) printf '%s' "Bambu Studio"; return ;;
+        orcaslicer) printf '%s' "OrcaSlicer"; return ;;
+        prusaslicer) printf '%s' "PrusaSlicer"; return ;;
+        myminifactory) printf '%s' "MyMiniFactory"; return ;;
+        openscad) printf '%s' "OpenSCAD"; return ;;
+        shapr3d) printf '%s' "Shapr3D"; return ;;
+        freecad) printf '%s' "FreeCAD"; return ;;
+        onshape) printf '%s' "Onshape"; return ;;
+        solidworks) printf '%s' "SOLIDWORKS"; return ;;
+        sketchup) printf '%s' "SketchUp"; return ;;
+        thingiverse) printf '%s' "Thingiverse"; return ;;
+        printables) printf '%s' "Printables"; return ;;
+        gridfinity) printf '%s' "Gridfinity"; return ;;
+        gopro) printf '%s' "GoPro"; return ;;
+        youtube) printf '%s' "YouTube"; return ;;
+        cyberbrick) printf '%s' "CyberBrick"; return ;;
+        nfc|qr|rfid|usb|hdmi|led|rgb|tpu|pla|petg|abs|asa|cad|cnc|rc|vr|ar|gps|stl|obj|step|iges|3mf)
+            printf '%s' "${lower_piece:u}"
+            return
+            ;;
+    esac
+
+    if [[ "$lower_piece" == <->(|.<->)mah ]]; then
+        printf '%smAh' "${lower_piece%mah}"
+        return
+    fi
+    if [[ "$lower_piece" == <->(|.<->)ma ]]; then
+        printf '%smA' "${lower_piece%ma}"
+        return
+    fi
+    if [[ "$lower_piece" == <->(|.<->)ah ]]; then
+        printf '%sAh' "${lower_piece%ah}"
+        return
+    fi
+    if [[ "$lower_piece" == <->(|.<->)(v|w|a) ]]; then
+        printf '%s%s' "${lower_piece[1,-2]}" "${lower_piece[-1]:u}"
+        return
+    fi
+    if [[ "$lower_piece" == <->(|.<->)(mm|cm|in|ft|g|kg|oz|lb|ml) ]]; then
+        printf '%s' "$lower_piece"
+        return
+    fi
+    if [[ "$piece" == "${piece:u}" && "$piece" != "${piece:l}" ]]; then
+        printf '%s' "$piece"
+        return
+    fi
+    if [[ "$piece" == [[:lower:]]* && "$piece" == *[[:upper:]]* ]]; then
+        printf '%s' "$piece"
+        return
+    fi
+    local interior="${piece[2,-1]-}"
+    if [[ "$piece" == [[:upper:]]* && "$piece" == *[[:lower:]]* && "$interior" == *[[:upper:]]* ]]; then
+        printf '%s' "$piece"
+        return
+    fi
+    local first_char="${lower_piece%${lower_piece#?}}"
+    local rest="${lower_piece#?}"
+    printf '%s' "${first_char:u}${rest}"
+}
+
 title_case_word() {
     local token="$1"
     [[ -z "$token" ]] && { printf '%s' "$token"; return; }
 
-    local lower_token="${token:l}"
     local saved_ifs="$IFS"
     IFS='-'
     local -a pieces
-    read -r -A pieces <<< "$lower_token"
+    read -r -A pieces <<< "$token"
     IFS="$saved_ifs"
 
     if (( ${#pieces[@]} == 0 )); then
-        printf '%s' "$lower_token"
+        printf '%s' "$token"
         return
     fi
 
     local -a processed=()
-    local piece first_char rest
+    local piece
     for piece in "${pieces[@]}"; do
         if [[ -z "$piece" ]]; then
             processed+=("$piece")
             continue
         fi
-        first_char="${piece%${piece#?}}"
-        rest="${piece#?}"
-        processed+=("${first_char:u}${rest}")
+        processed+=("$(normalize_word_piece "$piece")")
     done
 
     printf '%s' "${(j:-:)processed}"
@@ -648,7 +840,7 @@ normalize_filename() {
 
     base=$(normalize_readable_token "$base")
     if [[ -n "$ext" ]]; then
-        printf '%s.%s\n' "$base" "$ext"
+        printf '%s.%s\n' "$base" "${ext:l}"
     else
         printf '%s\n' "$base"
     fi
@@ -673,6 +865,13 @@ resolve_unique_archive_destination() {
         fi
         counter=$((counter + 1))
     done
+}
+
+is_safe_archive_destination() {
+    local candidate="$1"
+    local root="${BASE_PATH:A}"
+    local resolved="${candidate:A}"
+    [[ "$resolved" == "$root"/* ]]
 }
 
 get_folder_structure() {
@@ -883,7 +1082,7 @@ run_agentic_cycle() {
     log_divider "AI CYCLE"
     ensure_ai_helpers_loaded
 
-    local system_message="You are an expert 3D printing archivist. Return only rename and relative-folder suggestions keyed by the supplied immutable file IDs. Never emit absolute paths or parent-directory traversal. Translate non-English names to clear English and normalize punctuation."
+    local system_message="You are an expert 3D printing archivist. Return only rename and relative-folder suggestions keyed by the supplied immutable file IDs. Never emit absolute paths or parent-directory traversal. Translate non-English names to clear English and normalize punctuation while preserving established brand capitalization, technical acronyms, dimensions, and units."
     local state_blob
     state_blob=$(jq '{
         folderName: .metadata.folderName,
@@ -894,9 +1093,11 @@ run_agentic_cycle() {
             filename,
             extension,
             sizeBytes,
+            sha256,
             category,
             sourceUrl,
-            linkPreview
+            linkPreview,
+            contentDuplicateOf
         }]
     }' "$WORK_STATE_FILE")
     local user_message="Analyze this immutable file catalog. For every file ID, return proposed folder, filename, combined relative path, and rationale. Use null for unchanged fields. Respond with valid JSON only.\n\n$state_blob"
@@ -1216,8 +1417,8 @@ plan_archive_destination() {
         [[ -z "$rationale" ]] && rationale="AI response missing rationale; used defaults where necessary"
     fi
 
-    archive_category=$(sanitize_folder_component "$archive_category")
-    archive_subcategory=$(sanitize_folder_component "$archive_subcategory")
+    archive_category=$(canonicalize_archive_category "$archive_category" "$folder_structure_json")
+    archive_subcategory=$(canonicalize_archive_subcategory "$archive_subcategory" "$archive_category" "$folder_structure_json")
     archive_folder=$(sanitize_folder_component "$archive_folder")
 
     local tmp=$(mktemp)
@@ -1242,9 +1443,9 @@ apply_archive_destination() {
     archive_subcategory=$(jq -r '.metadata.archivePlan.subcategory // "Needs Review"' "$STATE_FILE")
     archive_folder=$(jq -r '.metadata.archivePlan.folderName // .metadata.folderName' "$STATE_FILE")
 
-    archive_category=$(sanitize_folder_component "$archive_category")
-    archive_subcategory=$(sanitize_folder_component "$archive_subcategory")
-    archive_folder=$(sanitize_folder_component "$archive_folder")
+    archive_category=$(sanitize_existing_folder_component "$archive_category")
+    archive_subcategory=$(sanitize_existing_folder_component "$archive_subcategory")
+    archive_folder=$(sanitize_existing_folder_component "$archive_folder")
 
     local category_dir="$BASE_PATH/$archive_category"
     local target_dir="$category_dir/$archive_subcategory"
@@ -1252,6 +1453,10 @@ apply_archive_destination() {
 
     if (( DRY_RUN )); then
         resolved_destination=$(resolve_unique_archive_destination "$target_dir" "$archive_folder")
+        if ! is_safe_archive_destination "$resolved_destination"; then
+            log_error "Unsafe archive destination rejected: $resolved_destination"
+            return 1
+        fi
         relative_destination="${resolved_destination#$BASE_PATH/}"
         log_info "Dry-run: folder would be moved to $resolved_destination"
         local tmp=$(mktemp)
@@ -1260,8 +1465,12 @@ apply_archive_destination() {
         return
     fi
 
-    mkdir -p "$target_dir"
     resolved_destination=$(resolve_unique_archive_destination "$target_dir" "$archive_folder")
+    if ! is_safe_archive_destination "$resolved_destination"; then
+        log_error "Unsafe archive destination rejected: $resolved_destination"
+        return 1
+    fi
+    mkdir -p "$target_dir"
     relative_destination="${resolved_destination#$BASE_PATH/}"
 
     log_info "Moving organized folder to archive: $resolved_destination"

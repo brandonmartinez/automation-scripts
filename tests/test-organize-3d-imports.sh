@@ -52,11 +52,21 @@ assert_jq() {
     fi
 }
 
+assert_equal() {
+    local description="$1"
+    local expected="$2"
+    local actual="$3"
+    if [[ "$actual" == "$expected" ]]; then
+        pass "$description"
+    else
+        fail "$description (expected '$expected', got '$actual')"
+    fi
+}
+
 test_agent_plan_boundary() {
     local tmp_dir
     tmp_dir=$(command mktemp -d)
 
-    ORGANIZE_3D_LIBRARY_ONLY=1 source "$ORGANIZER"
     INPUT_PATH="$tmp_dir/input"
     command mkdir -p "$INPUT_PATH"
     WORK_STATE_FILE="$tmp_dir/state.json"
@@ -101,6 +111,10 @@ test_external_recovery_and_relative_state() {
     recovery="$tmp_dir/recovery"
     command mkdir -p "$input/nested"
     print -r -- "solid fixture" >"$input/nested/model.stl"
+    print -r -- "solid fixture" >"$input/nested/copy.stl"
+    print -r -- "cad fixture" >"$input/nested/bracket.SLDPRT"
+    print -r -- "print export" >"$input/nested/plate.bgcode"
+    print -r -- "vector preview" >"$input/nested/preview.svg"
     print -r -- "generated" >"$input/SUMMARY.md"
     print -r -- '{}' >"$input/agentic-plan.json"
     print -r -- "old backup" >"$input/Fixture Import_backup_20200101.zip"
@@ -120,6 +134,20 @@ test_external_recovery_and_relative_state() {
     assert_jq "schema v2 state persisted" '.metadata.schemaVersion == "2.0"' "$state"
     assert_jq "state records relative file paths" 'all(.files[]; (.relativePath | startswith("/") | not))' "$state"
     assert_jq "generated artifacts excluded from inventory" 'all(.files[]; (.filename != "SUMMARY.md" and .filename != "agentic-plan.json" and (.filename | endswith("_backup_20200101.zip") | not)))' "$state"
+    assert_jq "inventory records SHA-256 for every file" 'all(.files[]; (.sha256 | test("^[0-9a-f]{64}$")))' "$state"
+    assert_jq "within-import duplicate uses deterministic first path" '
+        any(.metadata.duplicates[];
+            .type == "content" and
+            .relativePath == "nested/model.stl" and
+            .duplicateOf == "nested/copy.stl" and
+            (.sha256 | test("^[0-9a-f]{64}$"))
+        )
+    ' "$state"
+    assert_jq "expanded formats receive deterministic categories" '
+        (.files[] | select(.filename == "bracket.SLDPRT") | .category) == "3d-model" and
+        (.files[] | select(.filename == "plate.bgcode") | .category) == "print-export" and
+        (.files[] | select(.filename == "preview.svg") | .category) == "image"
+    ' "$state"
 
     local zip_listing
     zip_listing=$(command unzip -Z1 "$recovery_zip")
@@ -137,6 +165,87 @@ test_external_recovery_and_relative_state() {
     command rm -rf "$tmp_dir"
 }
 
+test_deterministic_normalization_and_taxonomy() {
+    local structure
+    structure='{
+        "categories": [
+            {
+                "name": "Arts and Crafts",
+                "subcategories": [{"name": "Cardboard Tools"}]
+            },
+            {
+                "name": "Personal Accessories",
+                "subcategories": [{"name": "Keyrings & Keychains"}]
+            },
+            {
+                "name": "Toys Games And Characters",
+                "subcategories": []
+            },
+            {
+                "name": "Toys, Games, and Characters",
+                "subcategories": []
+            }
+        ]
+    }'
+
+    assert_equal "filename normalization preserves brands, acronyms, and units" \
+        "iPad NFC Mount 240mm.stl" \
+        "$(normalize_filename "ipad_NFC_mount_240MM.STL")"
+    assert_equal "mixed-case brands and technical tokens retain casing" \
+        "MakerWorld USB-C Holder M3x10mm.stl" \
+        "$(normalize_filename "MakerWorld_USB-C_holder_M3x10mm.STL")"
+    assert_equal "known slicer and material names normalize canonically" \
+        "Bambu Lab X1-C PETG 500g.3mf" \
+        "$(normalize_filename "bambulab_x1-c_PETG_500g.3MF")"
+    assert_equal "decimal dimensions retain their numeric meaning" \
+        "Spacer 2.5mm M3x0.5mm.stl" \
+        "$(normalize_filename "spacer_2.5mm_M3x0.5mm.STL")"
+    assert_equal "unlisted uppercase technical acronyms are preserved" \
+        "24V PSU PCB Mount.stl" \
+        "$(normalize_filename "24V_PSU_PCB_mount.STL")"
+    assert_equal "hyphenated material acronyms retain casing" \
+        "PETG-CF Bracket.stl" \
+        "$(normalize_filename "PETG-CF_bracket.STL")"
+
+    assert_equal "SOLIDWORKS files use a canonical folder" \
+        "files/SOLIDWORKS" \
+        "$(canonical_folder_for_extension "SLDPRT")"
+    assert_equal "binary G-code files use exports" \
+        "exports" \
+        "$(canonical_folder_for_extension "bgcode")"
+    assert_equal "mesh interchange files use a canonical folder" \
+        "files/Meshes" \
+        "$(canonical_folder_for_extension "GLB")"
+
+    assert_equal "category punctuation aliases resolve to the preferred taxonomy" \
+        "Toys, Games, and Characters" \
+        "$(canonicalize_archive_category "Toys Games And Characters" "$structure")"
+    assert_equal "ampersand category aliases reuse existing taxonomy" \
+        "Arts and Crafts" \
+        "$(canonicalize_archive_category "Arts & Crafts" "$structure")"
+    assert_equal "subcategory aliases reuse existing punctuation" \
+        "Keyrings & Keychains" \
+        "$(canonicalize_archive_subcategory "Keyrings and Keychains" "Personal Accessories" "$structure")"
+    local alias_only_structure
+    alias_only_structure='{
+        "categories": [{
+            "name": "Toys & Games & Characters",
+            "subcategories": []
+        }]
+    }'
+    assert_equal "alias-only taxonomies are reused instead of duplicated" \
+        "Toys & Games & Characters" \
+        "$(canonicalize_archive_category "Toys Games And Characters" "$alias_only_structure")"
+    assert_equal "dot traversal is rejected as a folder component" \
+        "Unsorted Project" \
+        "$(sanitize_folder_component "..")"
+    assert_equal "persisted dot traversal is rejected as a folder component" \
+        "Unsorted Project" \
+        "$(sanitize_existing_folder_component "..")"
+    assert_false "archive destinations cannot escape the archive root" \
+        is_safe_archive_destination "$BASE_PATH/../escaped-project"
+}
+
 test_model_capabilities() {
     log_info() { :; }
     LOGGING_INITIALIZED=1
@@ -147,7 +256,10 @@ test_model_capabilities() {
     assert_false "legacy gpt-4 model uses json_object fallback" model-supports-json-schema "gpt-4-turbo"
 }
 
+ORGANIZE_3D_LIBRARY_ONLY=1 source "$ORGANIZER"
+
 test_agent_plan_boundary
+test_deterministic_normalization_and_taxonomy
 test_external_recovery_and_relative_state
 test_model_capabilities
 
