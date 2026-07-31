@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for sync-obsidian-mobile.sh — keeps the Obsidian iCloud mirror in
+  step with the git vault at ~/src/brandonmartinez-secondbrain, so the vault is
+  usable from Obsidian on iOS (which cannot consume a git remote directly).
+
+  This file is the canonical source in the repo. Install it by symlinking it
+  into ~/Library/LaunchAgents/ and bootstrapping it:
+
+    ln -sf "$HOME/src/automation-scripts/obsidian/com.brandonmartinez.sync-obsidian-mobile.plist" \
+           "$HOME/Library/LaunchAgents/com.brandonmartinez.sync-obsidian-mobile.plist"
+    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.brandonmartinez.sync-obsidian-mobile.plist"
+
+  Reload after edits:
+    launchctl bootout  gui/$(id -u)/com.brandonmartinez.sync-obsidian-mobile 2>/dev/null || true
+    launchctl bootstrap gui/$(id -u) "$HOME/Library/LaunchAgents/com.brandonmartinez.sync-obsidian-mobile.plist"
+
+  Run once on demand (bypassing the timer):
+    launchctl kickstart -k gui/$(id -u)/com.brandonmartinez.sync-obsidian-mobile
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.brandonmartinez.sync-obsidian-mobile</string>
+
+    <!-- --apply is required; without it the script is a no-op dry run. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/brandonmartinez/src/automation-scripts/obsidian/sync-obsidian-mobile.sh</string>
+        <string>--apply</string>
+    </array>
+
+    <!-- Run at load, then every 5 minutes. A full pass over an already-synced
+         vault costs ~1s; the initial 268 MB seed is already done. The script
+         takes a lock dir, so a slow run can never overlap the next tick. -->
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <!-- The script self-logs to a rotating file via utilities/logging.sh and is
+         quiet on stdout/stderr for routine runs. Discard both streams so
+         nothing accumulates; launchd (unlike cron) never generates mail. -->
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+
+    <!-- Minimal, explicit PATH. rsync/git/date live in the system paths; the
+         nix and homebrew paths are appended so the script can prefer a GNU
+         rsync 3.x (which supports --backup-dir) when one is installed. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin:/run/current-system/sw/bin:/opt/homebrew/bin</string>
+    </dict>
+
+    <!-- Keep the agent lightweight; do not relaunch on nonzero exit (the next
+         StartInterval tick will run it again in ~5 min anyway). -->
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <!-- Don't fight the user for I/O while they're working. -->
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>5</integer>
+</dict>
+</plist>
