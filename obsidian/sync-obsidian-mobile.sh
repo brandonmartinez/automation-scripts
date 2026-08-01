@@ -15,6 +15,16 @@
 # Importing mobile changes first means Leg A's --delete can never mistake a
 # phone-created note for an orphan and destroy it before you've seen it.
 #
+# NOTES ARE TWO-WAY; CONFIG IS ONE-WAY. `.obsidian/` rides Leg A only, so the
+# desktop is authoritative for vault settings (daily-note folder + date format,
+# attachment folder, template folder, enabled plugins, theme). Obsidian mobile
+# writes a much sparser config than the desktop app and rewrites it on launch,
+# so letting it back through Leg B would silently strip those settings. The
+# practical consequence: change vault settings on the desktop. A settings change
+# made on the phone is reverted on the next run. Per-device UI state
+# (workspace*, graph.json) is excluded in both directions and each device keeps
+# its own.
+#
 # DELETION ARBITRATION: because Leg B never deletes, a naive implementation
 # would resurrect every file you delete on the desktop. git is used as the
 # arbiter — a path git tracks that is now missing from disk is a real deletion
@@ -24,8 +34,8 @@
 # SAFETY PROPERTIES
 #   * Dry run by default. Nothing is written unless --apply is passed.
 #   * Excluded paths are protected from --delete (we deliberately do NOT use
-#     --delete-excluded), so mobile keeps its own lightweight .obsidian/ config
-#     instead of having the desktop's 15 MB plugin set wiped over it.
+#     --delete-excluded). That is what keeps the phone's workspace-mobile.json
+#     alive even though no such file exists on the desktop.
 #   * A GNU rsync (nix/homebrew), if present, gets --backup-dir so overwrites
 #     are recoverable. macOS's bundled openrsync lacks that flag; on the repo
 #     side git is the safety net regardless.
@@ -121,7 +131,6 @@ done
 EXCLUDES=(
   --exclude '.git/'              # never let iCloud near git metadata
   --exclude '/.github/'          # agent/skill tooling, not notes
-  --exclude '/.obsidian/'        # mobile keeps its own lightweight config
   --exclude '/_private/'         # gitignored raw pulls (1.4 GB)
   --exclude '/_Meta/Hydration/'  # gitignored scratch (477 MB)
   --exclude '.DS_Store'
@@ -130,6 +139,25 @@ EXCLUDES=(
 if [[ $WITH_ARCHIVES -eq 0 ]]; then
   EXCLUDES+=(--exclude '_archive/')   # only when ADP is off — see header
 fi
+
+# --- vault config (.obsidian/) --------------------------------------------
+# Config is DESKTOP-AUTHORITATIVE and flows one way. Obsidian mobile writes a
+# much sparser config than the desktop app (its app.json had only
+# strictLineBreaks, and its daily-notes.json was missing the date format), and
+# it rewrites those files on launch — so if config were allowed back through
+# Leg B, mobile's stub would clobber the real settings. Excluding .obsidian/
+# from Leg B entirely is what keeps daily-note paths, the attachment folder,
+# and the template folder identical on both ends.
+CONFIG_EXCLUDES_LEGB=(--exclude '/.obsidian/')
+
+# Going out, everything in .obsidian/ is shared EXCEPT per-device UI state.
+# workspace* covers the desktop's workspace.json AND the phone's separate
+# workspace-mobile.json; because these are excluded (and --delete-excluded is
+# never used) Leg A's --delete cannot destroy the phone's saved layout.
+CONFIG_EXCLUDES_LEGA=(
+  --exclude '/.obsidian/workspace*'    # per-device pane layout
+  --exclude '/.obsidian/graph.json'    # per-device graph view state
+)
 
 DRY=(--dry-run)
 [[ $APPLY -eq 1 ]] && DRY=()
@@ -157,7 +185,7 @@ fi
 #   * git tracks the path but it is gone from disk -> a real deletion -> do NOT
 #     re-import; let Leg A remove it from the mirror instead.
 LEGB_PREVIEW=$("$RSYNC" -a --dry-run --itemize-changes --update \
-  "${EXCLUDES[@]}" "$DST/" "$SRC/" 2>/dev/null || true)
+  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGB[@]}" "$DST/" "$SRC/" 2>/dev/null || true)
 
 DELETION_EXCLUDES=()
 while IFS= read -r relpath; do
@@ -172,7 +200,7 @@ done < <(printf '%s\n' "$LEGB_PREVIEW" | grep '^>f' | sed 's/^[^ ]* //')
 LEGB=$("$RSYNC" -a "${DRY[@]}" --itemize-changes --update \
   ${BACKUP_ARGS[@]+"${BACKUP_ARGS[@]}"} \
   ${DELETION_EXCLUDES[@]+"${DELETION_EXCLUDES[@]}"} \
-  "${EXCLUDES[@]}" "$DST/" "$SRC/" 2>/dev/null || true)
+  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGB[@]}" "$DST/" "$SRC/" 2>/dev/null || true)
 IMPORTED=$(printf '%s\n' "$LEGB" | grep -c '^>f' || true)
 if [[ "$IMPORTED" -gt 0 ]]; then
   log_info "⬅️  imported $IMPORTED file(s) from mobile into the repo:"
@@ -186,7 +214,7 @@ fi
 
 # --- Leg A: repo -> iCloud (publish; deletes orphans) ---------------------
 LEGA=$("$RSYNC" -a "${DRY[@]}" --itemize-changes --delete \
-  "${EXCLUDES[@]}" "$SRC/" "$DST/" 2>/dev/null || true)
+  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGA[@]}" "$SRC/" "$DST/" 2>/dev/null || true)
 SENT=$(printf '%s\n'    "$LEGA" | grep -c '^>f' || true)
 DELETED=$(printf '%s\n' "$LEGA" | grep -c '^\*deleting' || true)
 
