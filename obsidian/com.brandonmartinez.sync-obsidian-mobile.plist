@@ -47,13 +47,14 @@
     <key>StandardErrorPath</key>
     <string>/dev/null</string>
 
-    <!-- Minimal, explicit PATH. rsync/git/date live in the system paths; the
-         nix and homebrew paths are appended so the script can prefer a GNU
-         rsync 3.x (which supports --backup-dir) when one is installed. -->
+    <!-- Prefer a user-space shell so macOS can grant it File Provider access;
+         platform /bin/zsh jobs are denied without a consent prompt. System
+         paths remain available, and the script can still prefer GNU rsync 3.x
+         from nix or Homebrew when one is installed. -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key>
-        <string>/usr/bin:/bin:/usr/sbin:/sbin:/run/current-system/sw/bin:/opt/homebrew/bin</string>
+        <string>/run/current-system/sw/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <!-- Keep the agent lightweight; do not relaunch on nonzero exit (the next

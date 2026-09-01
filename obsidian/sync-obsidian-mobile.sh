@@ -26,10 +26,11 @@
 # its own.
 #
 # DELETION ARBITRATION: because Leg B never deletes, a naive implementation
-# would resurrect every file you delete on the desktop. git is used as the
-# arbiter — a path git tracks that is now missing from disk is a real deletion
-# and is withheld from Leg B, so Leg A can clear it from the mirror. A path git
-# has never seen is a genuine phone capture and is imported.
+# would resurrect every file you delete on the desktop. git handles tracked
+# paths; a private ledger of paths seen in any successful sync handles untracked
+# files and delayed iCloud resurrection. A mirror-only path known to either
+# source is withheld from Leg B so Leg A can delete it. A path neither has seen
+# is a genuine phone capture and is imported.
 #
 # SAFETY PROPERTIES
 #   * Dry run by default. Nothing is written unless --apply is passed.
@@ -68,7 +69,10 @@
 # Configuration (environment overrides):
 #   OBSIDIAN_VAULT_SRC   repo path        (default: ~/src/brandonmartinez-secondbrain)
 #   OBSIDIAN_VAULT_DST   iCloud mirror    (default: the Obsidian iCloud container)
+#   OBSIDIAN_SYNC_STATE_DIR deletion state (default: <repo>/_private/mobile-sync-state)
 #   OBSIDIAN_SYNC_LOG_LEVEL  log verbosity (default: INFO)
+# To intentionally recreate a previously deleted path from mobile, remove its
+# line from <state-dir>/seen-paths.txt before the next run.
 # ---------------------------------------------------------------------------
 
 set -o errexit -o nounset -o pipefail
@@ -85,6 +89,8 @@ set_log_level "${OBSIDIAN_SYNC_LOG_LEVEL:-INFO}"
 # --- configuration ---------------------------------------------------------
 SRC="${OBSIDIAN_VAULT_SRC:-$HOME/src/brandonmartinez-secondbrain}"
 DST="${OBSIDIAN_VAULT_DST:-$HOME/Library/Mobile Documents/iCloud~md~obsidian/Documents/Second Brain}"
+STATE_DIR="${OBSIDIAN_SYNC_STATE_DIR:-$SRC/_private/mobile-sync-state}"
+STATE_FILE="$STATE_DIR/seen-paths.txt"
 
 APPLY=0
 WITH_ARCHIVES=1
@@ -105,10 +111,26 @@ done
 # this, a second run would race the first and rsync would fight itself.
 LOCK_DIR="${TMPDIR:-/tmp}/sync-obsidian-mobile.lock"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-  log_debug "another sync is already running (lock: $LOCK_DIR); exiting"
-  exit 0
+  LOCK_PID=""
+  [[ -f "$LOCK_DIR/pid" ]] && LOCK_PID=$(<"$LOCK_DIR/pid")
+
+  if [[ "$LOCK_PID" == <-> ]] && kill -0 "$LOCK_PID" 2>/dev/null; then
+    log_debug "another sync is already running (pid=$LOCK_PID); exiting"
+    exit 0
+  fi
+
+  log_warn "removing stale sync lock: $LOCK_DIR"
+  command rm -f "$LOCK_DIR/pid"
+  if ! rmdir "$LOCK_DIR" 2>/dev/null || ! mkdir "$LOCK_DIR" 2>/dev/null; then
+    log_error "could not recover stale sync lock: $LOCK_DIR"
+    exit 1
+  fi
 fi
-cleanup() { rmdir "$LOCK_DIR" 2>/dev/null || true; }
+print -r -- "$$" > "$LOCK_DIR/pid"
+cleanup() {
+  command rm -f "$LOCK_DIR/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null || true
+}
 trap cleanup EXIT INT TERM
 
 # --- pick an rsync ---------------------------------------------------------
@@ -123,6 +145,29 @@ for cand in /run/current-system/sw/bin/rsync /opt/homebrew/bin/rsync; do
     break
   fi
 done
+
+run_rsync() {
+  local phase="$1"
+  shift
+
+  local error_file output exit_code
+  error_file=$(command mktemp -t sync-obsidian-mobile.XXXXXX)
+
+  if output=$("$RSYNC" "$@" 2>"$error_file"); then
+    command rm -f "$error_file"
+    printf '%s' "$output"
+    return 0
+  else
+    exit_code=$?
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && log_error "$phase: $line"
+  done < "$error_file"
+  command rm -f "$error_file"
+  log_error "$phase failed (rsync exit $exit_code)"
+  return "$exit_code"
+}
 
 # --- what never leaves the repo -------------------------------------------
 # Leading slash = anchored at the transfer root. No leading slash = matches at
@@ -159,6 +204,47 @@ CONFIG_EXCLUDES_LEGA=(
   --exclude '/.obsidian/graph.json'    # per-device graph view state
 )
 
+is_legb_path() {
+  local relpath="$1"
+
+  case "$relpath" in
+    .git/*|.github/*|_private/*|_Meta/Hydration/*|.obsidian/*|.trash/*|.DS_Store|*/.DS_Store)
+      return 1
+      ;;
+  esac
+
+  if [[ $WITH_ARCHIVES -eq 0 ]] && {
+    [[ "$relpath" == _archive/* ]] || [[ "$relpath" == */_archive/* ]]
+  }; then
+    return 1
+  fi
+
+  return 0
+}
+
+state_contains() {
+  local relpath="$1"
+  [[ -f "$STATE_FILE" ]] && grep -Fqx -- "$relpath" "$STATE_FILE"
+}
+
+write_sync_state() {
+  local temp_file absolute relpath
+  mkdir -p "$STATE_DIR"
+  temp_file=$(command mktemp "$STATE_DIR/seen-paths.XXXXXX")
+
+  {
+    [[ -f "$STATE_FILE" ]] && cat "$STATE_FILE"
+    while IFS= read -r absolute; do
+      relpath="${absolute#$SRC/}"
+      is_legb_path "$relpath" && print -r -- "$relpath"
+    done < <(find "$SRC" -type f -print)
+    true
+  } | LC_ALL=C sort -u > "$temp_file"
+
+  mv "$temp_file" "$STATE_FILE"
+  log_debug "recorded mobile sync state: $STATE_FILE"
+}
+
 DRY=(--dry-run)
 [[ $APPLY -eq 1 ]] && DRY=()
 
@@ -182,25 +268,30 @@ fi
 # desktop. Plain rsync cannot tell the difference and would resurrect every
 # desktop deletion forever. git settles it:
 #   * git has never tracked the path  -> genuinely phone-created -> import it.
-#   * git tracks the path but it is gone from disk -> a real deletion -> do NOT
-#     re-import; let Leg A remove it from the mirror instead.
-LEGB_PREVIEW=$("$RSYNC" -a --dry-run --itemize-changes --update \
-  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGB[@]}" "$DST/" "$SRC/" 2>/dev/null || true)
+#   * git tracks the path but it is gone from disk -> a real deletion.
+#   * the prior successful sync recorded the path but it is now gone -> a real
+#     deletion, including files git never tracked.
+#   * neither git nor prior state knows the path -> genuinely phone-created.
+LEGB_PREVIEW=$(run_rsync "mobile preview" -a --dry-run --itemize-changes --update \
+  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGB[@]}" "$DST/" "$SRC/")
 
 DELETION_EXCLUDES=()
 while IFS= read -r relpath; do
   [[ -z "$relpath" ]] && continue
   [[ -e "$SRC/$relpath" ]] && continue          # already present: an edit, not a resurrection
   if git -C "$SRC" ls-files --error-unmatch -- "$relpath" >/dev/null 2>&1; then
-    DELETION_EXCLUDES+=(--exclude "/$relpath")  # tracked + absent = deleted on purpose
+    DELETION_EXCLUDES+=(--exclude "/$relpath")
     log_info "🗑️  honoring desktop deletion: $relpath"
+  elif state_contains "$relpath"; then
+    DELETION_EXCLUDES+=(--exclude "/$relpath")
+    log_info "🗑️  honoring prior-sync deletion: $relpath"
   fi
 done < <(printf '%s\n' "$LEGB_PREVIEW" | grep '^>f' | sed 's/^[^ ]* //')
 
-LEGB=$("$RSYNC" -a "${DRY[@]}" --itemize-changes --update \
+LEGB=$(run_rsync "mobile import" -a "${DRY[@]}" --itemize-changes --update \
   ${BACKUP_ARGS[@]+"${BACKUP_ARGS[@]}"} \
   ${DELETION_EXCLUDES[@]+"${DELETION_EXCLUDES[@]}"} \
-  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGB[@]}" "$DST/" "$SRC/" 2>/dev/null || true)
+  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGB[@]}" "$DST/" "$SRC/")
 IMPORTED=$(printf '%s\n' "$LEGB" | grep -c '^>f' || true)
 if [[ "$IMPORTED" -gt 0 ]]; then
   log_info "⬅️  imported $IMPORTED file(s) from mobile into the repo:"
@@ -213,8 +304,8 @@ else
 fi
 
 # --- Leg A: repo -> iCloud (publish; deletes orphans) ---------------------
-LEGA=$("$RSYNC" -a "${DRY[@]}" --itemize-changes --delete \
-  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGA[@]}" "$SRC/" "$DST/" 2>/dev/null || true)
+LEGA=$(run_rsync "mirror publish" -a "${DRY[@]}" --itemize-changes --delete \
+  "${EXCLUDES[@]}" "${CONFIG_EXCLUDES_LEGA[@]}" "$SRC/" "$DST/")
 SENT=$(printf '%s\n'    "$LEGA" | grep -c '^>f' || true)
 DELETED=$(printf '%s\n' "$LEGA" | grep -c '^\*deleting' || true)
 
@@ -230,4 +321,6 @@ fi
 
 if [[ $APPLY -eq 0 ]]; then
   log_info "dry run complete — re-run with --apply to write"
+else
+  write_sync_state
 fi
