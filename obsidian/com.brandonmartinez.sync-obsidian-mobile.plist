@@ -1,9 +1,11 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent for sync-obsidian-mobile.sh — keeps the Obsidian iCloud mirror in
-  step with the git vault at ~/src/brandonmartinez-secondbrain, so the vault is
-  usable from Obsidian on iOS (which cannot consume a git remote directly).
+  LaunchAgent for sync-obsidian-mobile.sh — publishes the git vault at
+  ~/src/brandonmartinez-secondbrain out to the Obsidian iCloud mirror, so the
+  vault is readable from Obsidian on iOS (which cannot consume a git remote
+  directly). The sync is ONE WAY: the repo is authoritative and mobile edits are
+  overwritten or deleted on the next tick. Treat the phone as read-only.
 
   This file is the canonical source in the repo. Install it by symlinking it
   into ~/Library/LaunchAgents/ and bootstrapping it:
