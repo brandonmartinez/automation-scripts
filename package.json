@@ -4,8 +4,8 @@
   "description": "Shell automation scripts for macOS using zsh",
   "main": "README.md",
   "scripts": {
-    "lint": "shellcheck -s zsh **/*.sh",
-    "format": "shfmt -i 4 -ln zsh -w **/*.sh",
+    "lint": "zsh -f -c 'for script in **/*.sh; do IFS= read -r shebang < \"$script\"; case \"$shebang\" in \"#!/usr/bin/env zsh\") zsh -f -n \"$script\" ;; \"#!/usr/bin/env bash\"|\"#!/bin/bash\") bash -n \"$script\" ;; *) print -u2 \"Unsupported shell shebang: $script\"; exit 1 ;; esac || exit; done'",
+    "format": "shfmt -w media/photo-multicrop2.sh",
     "test:3d": "zsh tests/test-organize-3d-imports.sh && zsh tests/test-3d-import-jobs.sh && zsh tests/test-3d-print-catalog.sh"
   },
   "keywords": [

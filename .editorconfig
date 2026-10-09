@@ -10,11 +10,23 @@ end_of_line = lf
 insert_final_newline = true
 trim_trailing_whitespace = true
 
-# Shell scripts
-[*.sh]
+# Project .sh files default to zsh, which shfmt does not support.
+[*.{sh,zsh}]
 indent_style = space
 indent_size = 4
-shell_variant = zsh
+ignore = true
+
+[*.{bash,bats}]
+indent_style = space
+indent_size = 4
+
+[media/photo-multicrop2.sh]
+shell_variant = bash
+ignore = false
+
+[.squad/templates/skills/distributed-mesh/sync-mesh.sh]
+shell_variant = bash
+ignore = false
 
 # Markdown files
 [*.md]
