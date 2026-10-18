@@ -1,4 +1,6 @@
 .DS_Store
+__pycache__/
+*.py[cod]
 # Squad: ignore runtime state (logs, inbox, sessions)
 # Note: .squad/casting/* is identity and MUST be committed to main, not ignored
 .squad/orchestration-log/
