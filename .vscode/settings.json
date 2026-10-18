@@ -1,12 +1,25 @@
 {
-    "shellcheck.customArgs": [
-        "-s", "zsh"
+    "shellformat.path": null,
+    "shellformat.flag": null,
+    "shellformat.effectLanguages": [
+        "shellscript",
+        "bats"
     ],
-    "shellcheck.executablePath": "/opt/homebrew/bin/shellcheck",
-    "shellformat.path": "/opt/homebrew/bin/shfmt",
-    "shellformat.flag": "-i 4 -ln zsh",
+    "shellformat.useEditorConfig": true,
+    "zshcheck.enable": false,
     "files.associations": {
-        "*.sh": "shellscript"
+        "*.sh": "zsh",
+        "*.zsh": "zsh",
+        "**/media/photo-multicrop2.sh": "shellscript",
+        "**/.squad/templates/skills/distributed-mesh/sync-mesh.sh": "shellscript"
     },
-    "shellformat.useEditorConfig": true
+    "[shellscript]": {
+        "editor.defaultFormatter": "foxundermoon.shell-format"
+    },
+    "[zsh]": {
+        "editor.defaultFormatter": null,
+        "editor.formatOnSave": false,
+        "editor.formatOnPaste": false,
+        "editor.formatOnType": false
+    }
 }
